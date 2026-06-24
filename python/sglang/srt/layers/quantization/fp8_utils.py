@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from enum import Enum
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
 
 import torch
 
@@ -75,22 +75,6 @@ def materialize_bpreshuffle_fp8_scale(scale: torch.Tensor) -> torch.Tensor:
     if scale.dim() != 2:
         return scale
     return scale.t().contiguous().t()
-
-
-def materialize_bpreshuffle_fp8_scale_tuple(value: Any) -> Any:
-    """Materialize the scale slot in FP8 ``(q_input, x_scale, ...)`` tuples."""
-    if (
-        isinstance(value, tuple)
-        and len(value) >= 2
-        and torch.is_tensor(value[0])
-        and torch.is_tensor(value[1])
-    ):
-        return (
-            value[0],
-            materialize_bpreshuffle_fp8_scale(value[1]),
-            *value[2:],
-        )
-    return value
 
 
 def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
@@ -847,10 +831,6 @@ def aiter_w8a8_block_fp8_linear(
         x_scale = input_scale
         if _use_aiter_bpreshuffle_gfx95 and not use_triton:
             x_scale = materialize_bpreshuffle_fp8_scale(x_scale)
-        # On ROCm >= 7.2, scale is in bpreshuffle's transposed layout.
-        # Triton needs a row-major view, so adjust strides only. No copy.
-        elif use_triton and _use_aiter_bpreshuffle_gfx95:
-            x_scale = torch.as_strided(x_scale, x_scale.shape, (1, x_scale.shape[0]))
     else:
         materialize_bpreshuffle_scale = _use_aiter_bpreshuffle_gfx95 and not use_triton
         q_input, x_scale = aiter_per1x128_quant(

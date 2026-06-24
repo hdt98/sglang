@@ -106,9 +106,6 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
 )
-from sglang.srt.layers.quantization.fp8_utils import (
-    materialize_bpreshuffle_fp8_scale,
-)
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     maybe_fuse_routed_scale_and_shared_add,
 )
@@ -162,7 +159,6 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_npu,
     _is_xpu,
     _use_aiter,
-    _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -379,8 +375,6 @@ class DeepseekV2MLP(nn.Module):
                     dtype_quant=dtypes.fp8,
                     transpose_scale=False,
                 )
-                if _use_aiter_bpreshuffle_gfx95:
-                    x_scale = materialize_bpreshuffle_fp8_scale(x_scale)
                 x = (x_fp8, x_scale)
             else:
                 x = fused_clamp_act_mul(
