@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from enum import Enum
 from functools import lru_cache
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import torch
 
@@ -68,6 +68,29 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 # ROCm 7.0 hipcc miscompiles gemm_a8w8_blockscale_bpreshuffle on gfx95 (#23319).
 _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
+
+
+def materialize_bpreshuffle_fp8_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Materialize the physical scale layout consumed by gfx95 bpreshuffle GEMM."""
+    if scale.dim() != 2:
+        return scale
+    return scale.t().contiguous().t()
+
+
+def materialize_bpreshuffle_fp8_scale_tuple(value: Any) -> Any:
+    """Materialize the scale slot in FP8 ``(q_input, x_scale, ...)`` tuples."""
+    if (
+        isinstance(value, tuple)
+        and len(value) >= 2
+        and torch.is_tensor(value[0])
+        and torch.is_tensor(value[1])
+    ):
+        return (
+            value[0],
+            materialize_bpreshuffle_fp8_scale(value[1]),
+            *value[2:],
+        )
+    return value
 
 
 def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
@@ -822,16 +845,21 @@ def aiter_w8a8_block_fp8_linear(
     if input_scale is not None:
         q_input = input_2d
         x_scale = input_scale
+        if _use_aiter_bpreshuffle_gfx95 and not use_triton:
+            x_scale = materialize_bpreshuffle_fp8_scale(x_scale)
         # On ROCm >= 7.2, scale is in bpreshuffle's transposed layout.
         # Triton needs a row-major view, so adjust strides only. No copy.
-        if use_triton and _use_aiter_bpreshuffle_gfx95:
+        elif use_triton and _use_aiter_bpreshuffle_gfx95:
             x_scale = torch.as_strided(x_scale, x_scale.shape, (1, x_scale.shape[0]))
     else:
+        materialize_bpreshuffle_scale = _use_aiter_bpreshuffle_gfx95 and not use_triton
         q_input, x_scale = aiter_per1x128_quant(
             input_2d,
             quant_dtype=aiter.dtypes.fp8,
-            transpose_scale=(_use_aiter_bpreshuffle_gfx95 and not use_triton),
+            transpose_scale=False,
         )
+        if materialize_bpreshuffle_scale:
+            x_scale = materialize_bpreshuffle_fp8_scale(x_scale)
 
     if use_triton:
         gemm_a8w8_blockscale_op = triton_gemm_a8w8_blockscale

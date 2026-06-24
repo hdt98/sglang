@@ -71,6 +71,9 @@ from sglang.srt.layers.mhc import mhc_fused_post_pre, npu_hc_pre
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
+from sglang.srt.layers.quantization.fp8_utils import (
+    materialize_bpreshuffle_fp8_scale_tuple,
+)
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
@@ -176,8 +179,10 @@ def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps):
         dtype_quant=torch.float8_e4m3fn,
         res1=None,
         output_unquantized_inp1=True,
-        transpose_scale=_use_aiter_bpreshuffle_gfx95,
+        transpose_scale=False,
     )
+    if _use_aiter_bpreshuffle_gfx95:
+        x_quant = materialize_bpreshuffle_fp8_scale_tuple(x_quant)
     return x_quant, x_bf16
 
 
