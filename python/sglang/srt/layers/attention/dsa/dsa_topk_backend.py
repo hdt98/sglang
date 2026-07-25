@@ -112,6 +112,12 @@ class DSATopKBackend(Enum):
             == logits.shape[0]
             == attn_metadata.real_page_table.shape[0]
         ):
+            # On ROCm, the v2 JIT kernel's kHasStreaming is false: the
+            # Register2 and Register4 paths (C4-domain seq_len <= 16384)
+            # are fully functional, and the kernel writes -1 to all output
+            # slots as a defense-in-depth fallback for longer sequences.
+            # The server initialization (dsa_backend.py) warns when the
+            # configured context length would exceed this limit.
             return _topk_transform_v2_paged(logits, lengths, topk, attn_metadata)
 
         # The legacy transforms below read attn_metadata.page_table_1 (page_size=1),

@@ -5373,15 +5373,17 @@ class ServerArgs:
             run_post_process_pass(self, _deepseek_moe_quant_resolution)
             if is_hip():
                 if is_deepseek_dsa(hf_config):
-                    # The fused top-k v2 kernel (topk_transform_512_v2) is a
-                    # CUDA/Hopper-only path: its JIT source includes
-                    # <cooperative_groups.h> and uses cg::this_cluster()
-                    # (thread-block clusters), neither of which exists on ROCm,
-                    # so it fails to JIT-compile on gfx9xx during CUDA-graph
-                    # capture. DeepSeek-V4 already disables it on HIP; mirror that
-                    # here for the rest of the DSA family (DeepSeek-V3.2 /
-                    # GLM-5.x) that shares the same decode top-k path.
-                    envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+                    # The fused top-k v2 kernel (topk_transform_512_v2) now
+                    # supports ROCm: the JIT source guards
+                    # <cooperative_groups.h> behind USE_ROCM, stubs
+                    # TopKCluster, fixes __ballot_sync/__shfl_up for 64-wide
+                    # wavefronts, and uses direct <<<>>> launches instead of
+                    # cudaLaunchKernelEx. The Register2 and Register4 paths
+                    # (C4-domain seq_len <= 16384, i.e. original seq_len <=
+                    # 65536) are fully functional; longer sequences fall back
+                    # to the v1 kernel since the Streaming path is not yet
+                    # supported on ROCm (VGPR pressure on gfx950).
+                    pass
                 if not self._resolved().enable_dp_attention and self.nnodes == 1:
                     # TODO (Hubert): Put this back later
                     # self.enable_aiter_allreduce_fusion = True
@@ -5434,7 +5436,6 @@ class ServerArgs:
                 envs.SGLANG_OPT_USE_FUSED_COMPRESS.set(True)
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
                 envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.set(False)
-                envs.SGLANG_OPT_USE_TOPK_V2.set(False)
                 envs.SGLANG_OPT_USE_AITER_INDEXER.set(True)
                 envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
                 envs.SGLANG_OPT_USE_TILELANG_MHC_POST.set(False)

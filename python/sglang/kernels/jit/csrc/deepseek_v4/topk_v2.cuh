@@ -40,8 +40,26 @@ constexpr uint32_t kClusterSize = Cluster::kClusterSize;
 constexpr uint32_t kReg2MaxSeqLen = Register2::kMaxSeqLen;  // 8192
 constexpr uint32_t kReg4MaxSeqLen = Register4::kMaxSeqLen;  // 16384
 
+// On ROCm, the Streaming path (seq_len > 16384 in the C4 domain) is not yet
+// supported: the additional code raises VGPR pressure enough to crash gfx950
+// even when the path is never executed at runtime.  The Register2 and Register4
+// paths (seq_len <= 16384, i.e. original seq_len <= 65536) are fully functional.
+#ifdef USE_ROCM
+inline constexpr bool kHasStreaming = false;
+#else
+inline constexpr bool kHasStreaming = true;
+#endif
+
+#ifndef USE_ROCM
 #define TOPK_KERNEL __global__ __launch_bounds__(kBlockSize, kOccupancy)
+#else
+#define TOPK_KERNEL __global__ __launch_bounds__(kBlockSize)
+#endif
+#ifndef USE_ROCM
 #define CLUSTER_TOPK_KERNEL TOPK_KERNEL __cluster_dims__(1, kClusterSize, 1)
+#else
+#define CLUSTER_TOPK_KERNEL TOPK_KERNEL
+#endif
 
 constexpr uint32_t kClusterFloor = 65536;
 constexpr uint32_t kClusterMaxBatch = 512;
@@ -105,6 +123,7 @@ struct TopKLaunchParams {
  * \brief Persistent cluster kernel for the long items. It will handle long inputs.
  * The short items are handled by the separate topk_kernel.
  */
+#ifndef USE_ROCM
 template <bool kPDL>
 CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const __grid_constant__ TopKLaunchParams params) {
   device::enable_smem_spilling();
@@ -120,6 +139,7 @@ CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const __grid_constant__ 
     __syncthreads();
   }
 }
+#endif  // !USE_ROCM
 
 template <typename F>
 SGL_DEVICE void for_each_item(uint32_t topk, const F& f) {
@@ -186,10 +206,22 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
     constexpr bool kPDLFinal = kPDL && kHandleCluster;
     if (problem.seq_len <= kReg4MaxSeqLen) {
       Register4::forward<kPDLEarly>(problem, &smem);
-    } else if (problem.seq_len <= cluster_threshold) {
-      Streaming::forward<kPDLEarly>(problem, &smem);
-    } else {  // cluster path do nothing here
-      problem.out = params.get_output_ptr(blockIdx.x);
+    } else if constexpr (kHasStreaming) {
+      if (problem.seq_len <= cluster_threshold) {
+        Streaming::forward<kPDLEarly>(problem, &smem);
+      } else {
+        problem.out = params.get_output_ptr(blockIdx.x);
+      }
+    } else {
+      // ROCm: Streaming path is not available (kHasStreaming == false).
+      // seq_len > kReg4MaxSeqLen (16384 in the C4 domain) is not yet
+      // supported.  Server init (dsa_backend.py) disables v2 for configs
+      // whose max context length could exceed this limit; as a
+      // defense-in-depth fallback, write -1 to all output slots instead of
+      // crashing the GPU.
+      auto* out = params.get_output_ptr(blockIdx.x);
+      for_each_item(params.topk, [&](uint32_t tx, uint32_t) { out[tx] = -1; });
+      return;
     }
     device::PDLWaitPrimary<kPDLFinal>();
   }
@@ -201,6 +233,7 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
   problem_transform(problem, params.get_output_ptr(blockIdx.x));
 }
 
+#ifndef USE_ROCM
 template <bool kPDL>
 CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLaunchParams params) {
   device::enable_smem_spilling();
@@ -242,6 +275,7 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLau
   __builtin_assume(problem.out == topk_indices);
   problem_transform(problem, params.get_output_ptr(blockIdx.x));
 }
+#endif  // !USE_ROCM
 
 // --- Plan: choose cluster_threshold from the seq_len distribution -----------
 __global__ __launch_bounds__(kBlockSize, 1) void topk_plan(
@@ -335,7 +369,7 @@ struct TopKKernel {
     auto B = SymbolicSize{"batch_size"};
     auto Bp1 = SymbolicSize{"batch_size_plus_1"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({B})  // seq_lens
         .with_dtype<int32_t>()
@@ -349,12 +383,25 @@ struct TopKKernel {
     const auto batch_size = static_cast<uint32_t>(B.unwrap());
     RuntimeCheck(Bp1.unwrap() == B.unwrap() + 1, "invalid metadata shape");
     const auto device = device_.unwrap();
+#ifndef USE_ROCM
     LaunchKernel(1, kBlockSize, device)(  //
         topk_plan,
         static_cast<const uint32_t*>(seq_lens.data_ptr()),
         static_cast<PlanItem*>(metadata.data_ptr()),
         batch_size,
         static_cluster_threshold);
+#else
+    // clang-format off
+    // clang-format splits the >>> launch close into "> > >", which hipcc (ROCm
+    // 7.2, gfx950) rejects: keep the chevrons un-split inside this guard.
+    topk_plan<<<dim3(1), dim3(kBlockSize), 0, host::LaunchKernel::resolve_device(device)>>>(
+        static_cast<const uint32_t*>(seq_lens.data_ptr()),
+        static_cast<PlanItem*>(metadata.data_ptr()),
+        batch_size,
+        static_cluster_threshold);
+    // clang-format on
+    host::RuntimeDeviceCheck();
+#endif
   }
 
   static void transform(
@@ -373,7 +420,7 @@ struct TopKKernel {
     auto P = SymbolicSize{"page_table_stride"};
     auto K = SymbolicSize{"topk"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({B, L})  // score
         .with_strides({S, 1})
@@ -433,11 +480,21 @@ struct TopKKernel {
         .page_table_stride = P.unwrap(),
         .topk = topk,
         .page_bits = page_bits,
+#ifdef USE_ROCM
+        // ROCm has no CUDA clusters; route all sequences through the Streaming path.
+        .cluster_floor = std::numeric_limits<uint32_t>::max(),
+#else
         .cluster_floor = (batch_size <= kSmallBatchLowFloor) ? kClusterFloorSmall : kClusterFloor,
+#endif
     };
 
+#ifndef USE_ROCM
     const bool use_cluster = (max_seq_len > params.cluster_floor) && (batch_size <= kClusterMaxBatch);
+#else
+    const bool use_cluster = false;
+#endif
     constexpr bool kUsePDL = true;
+#ifndef USE_ROCM
     if (use_cluster) {
       if (batch_size <= kNumPersistentClusters) {
         LaunchKernel({batch_size, kClusterSize}, kBlockSize, device)
@@ -465,6 +522,23 @@ struct TopKKernel {
           .config({.use_pdl = kUsePDL})
           .launch(topk_main_kernel<kUsePDL, /*kLevel=*/2>, params);
     }
+#else
+    // clang-format off
+    // clang-format splits the >>> launch close into "> > >", which hipcc (ROCm
+    // 7.2, gfx950) rejects: keep the chevrons un-split inside this guard.
+    {
+      const auto stream = host::LaunchKernel::resolve_device(device);
+      if (max_seq_len <= kReg2MaxSeqLen) {
+        topk_main_kernel<kUsePDL, 0><<<dim3(batch_size), dim3(kBlockSize), 0, stream>>>(params);
+      } else if (max_seq_len <= kReg4MaxSeqLen) {
+        topk_main_kernel<kUsePDL, 1><<<dim3(batch_size), dim3(kBlockSize), 0, stream>>>(params);
+      } else {
+        topk_main_kernel<kUsePDL, 2><<<dim3(batch_size), dim3(kBlockSize), 0, stream>>>(params);
+      }
+      host::RuntimeDeviceCheck();
+    }
+    // clang-format on
+#endif
   }
 };
 

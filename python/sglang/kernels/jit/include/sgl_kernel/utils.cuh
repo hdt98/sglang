@@ -341,14 +341,9 @@ struct LaunchKernel {
   }
 
   template <typename T, typename... Args>
-  auto operator()(T&& kernel, Args&&... args) const -> void {
+  auto operator()(T kernel, Args&&... args) const -> void {
 #ifdef USE_ROCM
-    hipLaunchKernelGGL(
-        std::forward<T>(kernel),
-        m_config.gridDim,
-        m_config.blockDim,
-        m_config.dynamicSmemBytes,
-        m_config.stream,
+    kernel<<<m_config.gridDim, m_config.blockDim, m_config.dynamicSmemBytes, m_config.stream>>>(
         std::forward<Args>(args)...);
     RuntimeDeviceCheck(m_location);
 #else
@@ -357,8 +352,8 @@ struct LaunchKernel {
   }
 
   template <typename T, typename... Args>
-  auto launch(T&& kernel, Args&&... args) const -> void {
-    return (*this)(std::forward<T>(kernel), std::forward<Args>(args)...);
+  auto launch(T kernel, Args&&... args) const -> void {
+    return (*this)(kernel, std::forward<Args>(args)...);
   }
 
  private:

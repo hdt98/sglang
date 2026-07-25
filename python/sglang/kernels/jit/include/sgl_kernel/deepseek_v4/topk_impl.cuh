@@ -24,7 +24,9 @@
 #include <sgl_kernel/warp.cuh>
 
 #include <cfloat>
+#ifndef USE_ROCM
 #include <cooperative_groups.h>
+#endif
 #include <cstdint>
 #include <limits>
 
@@ -32,7 +34,9 @@ namespace sglang {
 
 namespace device::topk {
 
+#ifndef USE_ROCM
 namespace cg = cooperative_groups;
+#endif
 
 /// sgl_kernel names the warp size `kWarpThreads`; alias it locally as `kWarpSize`.
 inline constexpr uint32_t kWarpSize = kWarpThreads;
@@ -139,15 +143,25 @@ SGL_DEVICE float coarse_bin_lower_bound(uint32_t bin) {
 SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
 #pragma unroll
   for (uint32_t offset = 1; offset < 32; offset *= 2) {
+#ifndef USE_ROCM
     uint32_t n = __shfl_up_sync(0xFFFFFFFF, val, offset);
+#else
+    uint32_t n = __shfl_up(val, offset, 32);
+#endif
     if (lane_id >= offset) val += n;
   }
   return val;
 }
 
+#ifndef USE_ROCM
 SGL_DEVICE uint32_t warp_sum_bool(bool pred, uint32_t mask = 0xFFFFFFFF) {
   return __popc(__ballot_sync(mask, pred));
 }
+#else
+SGL_DEVICE uint32_t warp_sum_bool(bool pred, uint64_t mask = 0xFFFFFFFFFFFFFFFFULL) {
+  return static_cast<uint32_t>(__popcll(__ballot_sync(mask, pred)));
+}
+#endif
 
 struct alignas(8) TieValue {
   float value;
@@ -696,6 +710,7 @@ struct TopKStreaming : TopKRegister<2> {
 // Cluster path: very long seq_len, small batch. `kClusterSize` blocks cooperate
 // on one batch element via distributed shared memory (one cluster per element).
 // ---------------------------------------------------------------------------
+#ifndef USE_ROCM
 
 template <uint32_t kClusterSize_>
 struct TopKCluster : TopKRadixBase<10> {
@@ -863,6 +878,23 @@ struct TopKCluster : TopKRadixBase<10> {
     }
   }
 };
+#else
+// On ROCm, CUDA clusters (cooperative_groups::this_cluster, distributed shared
+// memory) are unavailable.  Long sequences use the Streaming path instead,
+// which reads global memory twice but needs no cross-CTA cooperation.
+// This stub provides the same type interface so topk_v2.cuh compiles unchanged.
+template <uint32_t kClusterSize_>
+struct TopKCluster {
+  static constexpr uint32_t kClusterSize = kClusterSize_;
+  static constexpr uint32_t kMaxSeqLen = std::numeric_limits<uint32_t>::max();
+  using Base = TopKRadixBase<10>;
+  struct Smem : Base::Smem {};
+  template <bool kUsePDL>
+  SGL_DEVICE static void forward(TopKProblem /*problem*/, void* /*smem*/) {
+    // Never called on ROCm — cluster kernels are not launched.
+  }
+};
+#endif  // USE_ROCM
 
 }  // namespace device::topk
 

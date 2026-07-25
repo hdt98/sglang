@@ -30,15 +30,18 @@ import pytest
 import torch
 
 from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2, topk_transform_512_v2
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-
+register_amd_ci(est_time=90, stage="jit-kernel-unit", runner_config="amd")
 PAGE_SIZE = 64  # c4 page size = 256 // 4
 PAGE_BITS = PAGE_SIZE.bit_length() - 1
 PAGE_MASK = PAGE_SIZE - 1
 MAX_PERMIT_ERROR = 5
 FLOOR = 65536  # kClusterFloor
+
+_IS_HIP = torch.version.hip is not None
+_ROCM_MAX_SEQ = 16384  # kReg4MaxSeqLen; Streaming path not yet available on ROCm
 
 # (batch, seq) chosen to land on each template and each dispatch boundary.
 FIXED_CONFIGS = [
@@ -74,6 +77,9 @@ FIXED_CONFIGS = [
     (129, 131072),
     (200, 262144),
 ]
+
+if _IS_HIP:
+    FIXED_CONFIGS = [(b, s) for b, s in FIXED_CONFIGS if s <= _ROCM_MAX_SEQ]
 
 
 def _assert_topk_close(scores_cpu, ref_raw, our_raw, bs, seq_lens, k):
@@ -195,6 +201,9 @@ def test_topk_v2(batch: int, seq: int, k: int, page_mode: str) -> None:
     ],
 )
 @pytest.mark.parametrize("per_row_pt", [False, True])
+@pytest.mark.skipif(
+    _IS_HIP, reason="Uses cluster paths (seq > 16384) not available on ROCm"
+)
 @torch.inference_mode()
 def test_topk_v2_ragged(batch: int, shape: str, k: int, per_row_pt: bool) -> None:
     """Ragged lengths spanning trivial..cluster in one launch, both dispatch shapes.
@@ -229,16 +238,23 @@ def test_topk_v2_ragged(batch: int, shape: str, k: int, per_row_pt: bool) -> Non
     _assert_topk_close(scores.cpu(), ref_raw, our_raw, batch, lengths.cpu(), k)
 
 
+_RAW_INDICES_CONFIGS = [
+    (8, 256),  # trivial
+    (8, 4096),  # register
+    (4, 131072),  # fused small-batch cluster
+    (64, 131072),  # persistent cluster + main<3> epilogue
+    (256, 131072),  # non-cluster streaming
+]
+if _IS_HIP:
+    _RAW_INDICES_CONFIGS = [
+        (b, s) for b, s in _RAW_INDICES_CONFIGS if s <= _ROCM_MAX_SEQ
+    ]
+
+
 @pytest.mark.parametrize("page_mode", ["identity", "perm"])
 @pytest.mark.parametrize(
     "batch,seq",
-    [
-        (8, 256),  # trivial
-        (8, 4096),  # register
-        (4, 131072),  # fused small-batch cluster
-        (64, 131072),  # persistent cluster + main<3> epilogue
-        (256, 131072),  # non-cluster streaming
-    ],
+    [(b, s) for b, s in _RAW_INDICES_CONFIGS],
 )
 @torch.inference_mode()
 def test_topk_v2_raw_indices(batch: int, seq: int, page_mode: str) -> None:

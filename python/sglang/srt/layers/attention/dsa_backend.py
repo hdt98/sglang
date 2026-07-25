@@ -1190,6 +1190,27 @@ class DeepseekSparseAttnBackend(
             and 0 < self.dsa_index_topk <= 2048
         )
 
+        # The v2 JIT kernel's Streaming path is not yet supported on ROCm
+        # (VGPR pressure on gfx950). Register2/Register4 paths support
+        # C4-domain seq_len <= 16384 (original seq_len <= 65536). Auto-
+        # disable v2 when the configured context length exceeds this limit
+        # to avoid the defense-in-depth -1 fallback for long sequences.
+        # The limit applies to the real sequence length (bounded by the
+        # model context length), not the wider req_to_token row, which is
+        # over-allocated with spec-reserve headroom.
+        if (
+            _is_hip
+            and self.max_context_len > 65536
+            and envs.SGLANG_OPT_USE_TOPK_V2.get()
+        ):
+            envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+            logger.warning(
+                "topk v2 disabled on ROCm: context length %d exceeds "
+                "65536 (Register4 path max). Use --context-length up to "
+                "65536 to enable topk v2.",
+                self.max_context_len,
+            )
+
         max_ctx_len = self.req_to_token.shape[1]
         self.decode_cuda_graph_metadata: Dict = {
             "cache_seqlens": torch.ones(
