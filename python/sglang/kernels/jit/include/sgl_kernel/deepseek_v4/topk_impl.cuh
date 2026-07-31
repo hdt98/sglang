@@ -266,6 +266,27 @@ struct TopKConfig {
       for (uint32_t t = num_ties + tx; t < topk; t += kBlockSize) {
         problem.emit(base + t, base + t);
       }
+#ifdef USE_ROCM
+    } else if (num_ties <= kBlockSize) {
+      // gfx950 wavefront is 64 wide, but this kernel models 32-wide logical
+      // warps (kWarpSize). The kWarpSize/{2,4} branches below pass positional
+      // lane masks to __ballot_sync() and skip lanes with early returns/breaks,
+      // which on wave64 lets threads participate in a ballot whose mask does
+      // not cover them -- undefined behaviour that manifests as a hardware
+      // exception (HSA 0x1016).  Use an intrinsics-free exact rank instead:
+      // is_greater() is a strict total order, so each candidate's rank (the
+      // number of strictly-greater candidates) is unique and computable per
+      // thread with no cross-lane communication.  kBlockSize threads stride the
+      // num_ties candidates; early-returned lanes never call a warp intrinsic,
+      // so this is safe for any wavefront width.
+      for (uint32_t i = tx; i < num_ties; i += kBlockSize) {
+        const auto mine = tie_buffer[i];
+        uint32_t rank = 0;
+        for (uint32_t j = 0; j < num_ties; ++j)
+          rank += is_greater(tie_buffer[j], mine) ? 1u : 0u;
+        if (rank < topk) problem.emit(base + rank, mine.idx);
+      }
+#else
     } else if (num_ties <= kWarpSize) {
       if (lane_id >= num_ties || warp_id >= num_ties) return;  // some threads are idle
       /// NOTE: use long long to avoid mask overflow when num_tie == 32
@@ -324,6 +345,7 @@ struct TopKConfig {
     } else if (num_ties <= kBlockSize) {
       // Common case: one candidate per thread.
       radix_tie_select<1>(tie_buffer, problem, base, num_ties, topk, smem);
+#endif
     } else {
       // Rare overflow case (kBlockSize < num_ties <= kMaxNumTie), kept out of
       // the common path so it alone pays the multi-item register cost.
