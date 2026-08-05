@@ -1211,6 +1211,25 @@ class DeepseekSparseAttnBackend(
                 self.max_context_len,
             )
 
+        # On ROCm the v2 kernel is correct but performs poorly for the
+        # multi-token decode batches produced by speculative decoding
+        # (MTP/EAGLE).  CUDA handles this by gating dsa_drop_wide_page_table
+        # on !speculative_num_draft_tokens; on ROCm we additionally disable
+        # v2 itself to avoid a 5x tpot regression observed at ISL >=
+        # chunked_prefill_size.  Non-MTP decode is unaffected.
+        if (
+            _is_hip
+            and self.speculative_num_draft_tokens
+            and envs.SGLANG_OPT_USE_TOPK_V2.get()
+        ):
+            envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+            logger.warning(
+                "topk v2 disabled on ROCm: speculative decoding "
+                "(MTP/EAGLE) is active. The v2 kernel is correct but "
+                "slow for multi-token decode batches on gfx950. "
+                "Non-speculative decode retains the full v2 speedup."
+            )
+
         max_ctx_len = self.req_to_token.shape[1]
         self.decode_cuda_graph_metadata: Dict = {
             "cache_seqlens": torch.ones(
