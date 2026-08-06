@@ -267,18 +267,10 @@ struct TopKConfig {
         problem.emit(base + t, base + t);
       }
 #ifdef USE_ROCM
-    } else if (num_ties <= kBlockSize) {
-      // gfx950 wavefront is 64 wide, but this kernel models 32-wide logical
-      // warps (kWarpSize). The kWarpSize/{2,4} branches below pass positional
-      // lane masks to __ballot_sync() and skip lanes with early returns/breaks,
-      // which on wave64 lets threads participate in a ballot whose mask does
-      // not cover them -- undefined behaviour that manifests as a hardware
-      // exception (HSA 0x1016).  Use an intrinsics-free exact rank instead:
-      // is_greater() is a strict total order, so each candidate's rank (the
-      // number of strictly-greater candidates) is unique and computable per
-      // thread with no cross-lane communication.  kBlockSize threads stride the
-      // num_ties candidates; early-returned lanes never call a warp intrinsic,
-      // so this is safe for any wavefront width.
+    } else if (num_ties <= kWarpSize) {
+      // Small case: O(n^2) exact rank is fast for n <= kWarpSize.
+      // gfx950 wavefront is 64 wide; __ballot_sync branches below are unsafe
+      // on wave64, so use an intrinsics-free exact rank instead.
       for (uint32_t i = tx; i < num_ties; i += kBlockSize) {
         const auto mine = tie_buffer[i];
         uint32_t rank = 0;
@@ -286,6 +278,11 @@ struct TopKConfig {
           rank += is_greater(tie_buffer[j], mine) ? 1u : 0u;
         if (rank < topk) problem.emit(base + rank, mine.idx);
       }
+    } else if (num_ties <= kBlockSize) {
+      // Common case: radix_tie_select is O(n) instead of O(n^2).
+      // radix_tie_select uses only atomicAdd and warp shuffle primitives
+      // (__shfl_xor, __shfl_up_sync) which work correctly on ROCm.
+      radix_tie_select<1>(tie_buffer, problem, base, num_ties, topk, smem);
 #else
     } else if (num_ties <= kWarpSize) {
       if (lane_id >= num_ties || warp_id >= num_ties) return;  // some threads are idle
@@ -599,6 +596,42 @@ struct TopKRegister : TopKRadixBase<12> {
       if (vi >= num_full) break;
       local_vecs[i].load(problem.in, vi);
     }
+#ifdef USE_ROCM
+    // Register-cached histogram: aggregate duplicate bins in registers before
+    // flushing to shared memory, reducing LDS atomicAdd contention.
+    constexpr uint32_t kHistCache = 4;
+    uint32_t hc_bin[kHistCache] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+    uint32_t hc_cnt[kHistCache] = {};
+    auto hc_add = [&](uint32_t bin) {
+#pragma unroll
+      for (int c = 0; c < kHistCache; ++c) {
+        if (hc_bin[c] == bin) { ++hc_cnt[c]; return; }
+      }
+#pragma unroll
+      for (int c = 0; c < kHistCache; ++c) {
+        if (hc_bin[c] == 0xFFFFFFFFu) { hc_bin[c] = bin; hc_cnt[c] = 1; return; }
+      }
+      atomicAdd(&smem->histogram[hc_bin[0]], hc_cnt[0]);
+      hc_bin[0] = bin; hc_cnt[0] = 1;
+    };
+#pragma unroll
+    for (uint32_t i = 0; i < kLocalVecs; ++i) {
+      const auto vi = tx + kBlockSize * i;
+      if (vi >= num_full) break;
+#pragma unroll
+      for (uint32_t j = 0; j < kVecSize; ++j)
+        hc_add(extract_coarse_bin<kHistBits>(local_vecs[i][j]));
+    }
+    if (tx >= kBlockSize - tail) {
+      const uint32_t idx = tail_start + tx - (kBlockSize - tail);
+      hc_add(extract_coarse_bin<kHistBits>(problem.in[idx]));
+    }
+#pragma unroll
+    for (int c = 0; c < kHistCache; ++c) {
+      if (hc_bin[c] != 0xFFFFFFFFu)
+        atomicAdd(&smem->histogram[hc_bin[c]], hc_cnt[c]);
+    }
+#else
 #pragma unroll
     for (uint32_t i = 0; i < kLocalVecs; ++i) {
       const auto vi = tx + kBlockSize * i;
@@ -611,6 +644,7 @@ struct TopKRegister : TopKRadixBase<12> {
       const uint32_t idx = tail_start + tx - (kBlockSize - tail);
       atomicAdd(&smem->histogram[extract_coarse_bin<kHistBits>(problem.in[idx])], 1);
     }
+#endif
     __syncthreads();
 
     // Phase 2: Find the threshold bin
