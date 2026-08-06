@@ -90,6 +90,7 @@ struct TopKLaunchParams {
   uint32_t topk;
   uint32_t page_bits;
   uint32_t cluster_floor;  // seq_len > this routes to the cluster path (batch-aware, host-set)
+  uint8_t* cluster_ws;  // ROCm: per-batch cluster workspace
 
   SGL_DEVICE const GlobalMetadata& global() const {
     return *reinterpret_cast<const GlobalMetadata*>(metadata);
@@ -252,6 +253,30 @@ TOPK_KERNEL void topk_streaming_kernel(const __grid_constant__ TopKLaunchParams 
   problem_transform(problem, params.get_output_ptr(blockIdx.x));
 }
 #endif  // USE_ROCM
+
+#ifdef USE_ROCM
+template <bool kPDL>
+TOPK_KERNEL void topk_cluster_kernel(const __grid_constant__ TopKLaunchParams params) {
+  device::enable_smem_spilling();
+  auto problem = params.problem(blockIdx.x);
+  if (problem.seq_len <= problem.topk) {
+    if (blockIdx.y == 0) trivial_transform<kPDL>(problem);
+    return;
+  }
+  __shared__ int32_t topk_indices[kMaxTopK];
+  __shared__ impl::MaxSmem<Cluster::Smem> smem;
+  const auto this_rank = blockIdx.y;
+  if (this_rank == 0) problem.out = topk_indices;
+  auto* ws = reinterpret_cast<Cluster::Workspace*>(
+      params.cluster_ws + blockIdx.x * sizeof(Cluster::Workspace));
+  Cluster::forward<kPDL>(problem, &smem, ws, this_rank);
+  if (this_rank == 0) {
+    device::PDLTriggerSecondary<kPDL>();
+    __syncthreads();
+    problem_transform(problem, params.get_output_ptr(blockIdx.x));
+  }
+}
+#endif
 
 #ifndef USE_ROCM
 template <bool kPDL>
@@ -431,7 +456,8 @@ struct TopKKernel {
       const tvm::ffi::TensorView page_indices,
       const uint32_t page_size,
       const tvm::ffi::TensorView metadata,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices) {
+      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices,
+    const tvm::ffi::Optional<tvm::ffi::TensorView> cluster_ws) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto Bp1 = SymbolicSize{"batch_size_plus_1"};
@@ -466,6 +492,10 @@ struct TopKKernel {
         .verify(metadata);
 
     int32_t* raw_indices_ptr = nullptr;
+    uint8_t* cluster_ws_ptr = nullptr;
+    if (cluster_ws.has_value()) {
+      cluster_ws_ptr = static_cast<uint8_t*>(cluster_ws.value().data_ptr());
+    }
     if (raw_indices.has_value()) {
       TensorMatcher({B, K}).with_dtype<int32_t>().with_device(device_).verify(raw_indices.value());
       raw_indices_ptr = static_cast<int32_t*>(raw_indices.value().data_ptr());
@@ -501,8 +531,9 @@ struct TopKKernel {
         .topk = topk,
         .page_bits = page_bits,
 #ifdef USE_ROCM
-        // ROCm has no CUDA clusters; route all sequences through the Streaming path.
-        .cluster_floor = std::numeric_limits<uint32_t>::max(),
+        // ROCm: enable cluster path for long sequences.
+        .cluster_floor = kClusterFloor,
+        .cluster_ws = cluster_ws_ptr,
 #else
         .cluster_floor = (batch_size <= kSmallBatchLowFloor) ? kClusterFloorSmall : kClusterFloor,
 #endif
@@ -548,7 +579,11 @@ struct TopKKernel {
     // 7.2, gfx950) rejects: keep the chevrons un-split inside this guard.
     {
       const auto stream = host::LaunchKernel::resolve_device(device);
-      if (max_seq_len <= kReg2MaxSeqLen) {
+      const bool use_cluster_rocm =
+          (max_seq_len > params.cluster_floor) && (batch_size <= kClusterMaxBatch);
+      if (use_cluster_rocm) {
+        topk_cluster_kernel<kUsePDL><<<dim3(batch_size, kClusterSize), dim3(kBlockSize), 0, stream>>>(params);
+      } else if (max_seq_len <= kReg2MaxSeqLen) {
         topk_main_kernel<kUsePDL, 0><<<dim3(batch_size), dim3(kBlockSize), 0, stream>>>(params);
       } else if (max_seq_len <= kReg4MaxSeqLen) {
         topk_main_kernel<kUsePDL, 1><<<dim3(batch_size), dim3(kBlockSize), 0, stream>>>(params);

@@ -263,6 +263,21 @@ def _topk_unfused(
 
     return topk_indices
 
+# Cluster workspace cache for ROCm topk v2 cluster path.
+_cluster_ws_cache = {}
+
+
+def _get_cluster_ws(num_rows: int, device: torch.device) -> torch.Tensor:
+    """Allocate (or reuse) a zeroed workspace for the ROCm cluster path."""
+    ws_bytes = 65536  # upper bound for sizeof(Cluster::Workspace)
+    needed = num_rows * ws_bytes
+    key = (num_rows, str(device))
+    if key not in _cluster_ws_cache:
+        _cluster_ws_cache[key] = torch.zeros(needed, dtype=torch.uint8, device=device)
+    else:
+        _cluster_ws_cache[key].zero_()
+    return _cluster_ws_cache[key]
+
 
 def _topk_transform_v2_paged(
     logits: torch.Tensor,
@@ -328,7 +343,10 @@ def _topk_transform_v2_paged(
 
     page_size = attn_metadata.page_size
     out = logits.new_full((num_rows, topk), -1, dtype=torch.int32)
-    topk_transform_512_v2(logits, lengths_i32, page_table, out, page_size, plan)
+    ws = None
+    if lengths_i32.numel() > 0 and int(lengths_i32.max()) > 65536:
+        ws = _get_cluster_ws(num_rows, logits.device)
+    topk_transform_512_v2(logits, lengths_i32, page_table, out, page_size, plan, cluster_ws=ws)
     return out
 
 

@@ -52,6 +52,7 @@ def topk_transform_512(
     out_page_indices: torch.Tensor,
     page_size: int,
     out_raw_indices: Optional[torch.Tensor] = None,
+    cluster_ws: Optional[torch.Tensor] = None,
 ) -> None:
     if is_hip_runtime():
         torch.ops.sgl_kernel.deepseek_v4_topk_transform_512(
@@ -94,6 +95,7 @@ def topk_transform_512_v2(
     page_size: int,
     metadata: torch.Tensor,
     out_raw_indices: Optional[torch.Tensor] = None,
+    cluster_ws: Optional[torch.Tensor] = None,
 ) -> None:
     """Fused top-k + page-table transform (DeepSeek-V4 top-k v2 kernel).
 
@@ -115,4 +117,5 @@ def topk_transform_512_v2(
         page_size,
         metadata,
         out_raw_indices,
+        cluster_ws,
     )

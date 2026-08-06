@@ -694,7 +694,7 @@ struct TopKRegister : TopKRadixBase<12> {
 // Streaming path: seq_len > 8192 -- two vectorized passes over global memory
 // ---------------------------------------------------------------------------
 
-struct TopKStreaming : TopKRegister<2> {
+struct TopKStreaming : TopKRadixBase<12> {
  public:
   static constexpr uint32_t kMaxSeqLen = std::numeric_limits<uint32_t>::max();
 
@@ -935,19 +935,128 @@ struct TopKCluster : TopKRadixBase<10> {
   }
 };
 #else
-// On ROCm, CUDA clusters (cooperative_groups::this_cluster, distributed shared
-// memory) are unavailable.  Long sequences use the Streaming path instead,
-// which reads global memory twice but needs no cross-CTA cooperation.
-// This stub provides the same type interface so topk_v2.cuh compiles unchanged.
+// ROCm Cluster path: kClusterSize blocks cooperate on one batch element via
+// global-memory atomics + an atomic-counter barrier (replacing NVIDIA's DSMEM
+// cluster). Each block processes a contiguous chunk, builds a local histogram
+// in LDS, writes it to global memory, then all blocks reduce locally and find
+// the same threshold. Collection uses atomicAdd to global counters. The
+// primary block (rank 0) does the final tie-breaking and page-table transform.
+// The host must zero the workspace before each launch.
 template <uint32_t kClusterSize_>
-struct TopKCluster {
+struct TopKCluster : TopKRadixBase<10> {
+ public:
   static constexpr uint32_t kClusterSize = kClusterSize_;
   static constexpr uint32_t kMaxSeqLen = std::numeric_limits<uint32_t>::max();
   using Base = TopKRadixBase<10>;
-  struct Smem : Base::Smem {};
+  using Smem = Base::Smem;
+
+  // Per-batch-element workspace in global memory.
+  struct Workspace {
+    uint32_t partial_hist[kClusterSize][kHistSize];  // each block's local histogram
+    uint32_t barrier;                                  // atomic counter (2 phases)
+    uint32_t global_count_gt;                          // above-threshold atomic counter
+    uint32_t global_count_eq;                          // tie-candidate atomic counter
+    int32_t global_out[kMaxTopK];                      // above-threshold raw indices
+    TieValue global_tie[kMaxNumTie];                   // tie candidates from all blocks
+  };
+
   template <bool kUsePDL>
-  SGL_DEVICE static void forward(TopKProblem /*problem*/, void* /*smem*/) {
-    // Never called on ROCm — cluster kernels are not launched.
+  SGL_DEVICE static void forward(TopKProblem problem, void* _smem,
+                                  Workspace* ws, uint32_t this_rank) {
+    const auto tx = threadIdx.x;
+    const auto smem = static_cast<Smem*>(_smem);
+    const bool is_primary = (this_rank == 0);
+
+    // Chunk: each block processes a contiguous, vector-aligned slice.
+    constexpr uint32_t kAlignElems = kVecSize;
+    const uint32_t chunk_size =
+        div_ceil(problem.seq_len, kClusterSize * kAlignElems) * kAlignElems;
+    const uint32_t chunk_start = min(this_rank * chunk_size, problem.seq_len);
+    const uint32_t chunk_finish = min(chunk_start + chunk_size, problem.seq_len);
+    const uint32_t local_seq_len = chunk_finish - chunk_start;
+
+    // Phase 1: Build local histogram in LDS (identical to Streaming).
+    {
+      Smem::kHistVec hist_vec;
+      hist_vec.fill(0);
+      smem->hist_vecs[tx] = hist_vec;
+    }
+    if (tx == 0) { smem->count_eq = 0; smem->count_gt = 0; }
+    __syncthreads();
+    PDLWaitPrimary<kUsePDL>();
+
+    for_each_input(problem.in + chunk_start, local_seq_len,
+                    [&](float val, uint32_t) {
+                      atomicAdd(&smem->histogram[extract_coarse_bin<kHistBits>(val)], 1);
+                    });
+    __syncthreads();
+
+    // Phase 1.5: Write local histogram to global memory, then global barrier.
+    for (uint32_t i = tx; i < kHistSize; i += kBlockSize)
+      ws->partial_hist[this_rank][i] = smem->histogram[i];
+    __syncthreads();
+    __threadfence();
+    if (tx == 0) {
+      atomicAdd(&ws->barrier, 1u);
+      while (*reinterpret_cast<volatile uint32_t*>(&ws->barrier) < kClusterSize) {}
+    }
+    __syncthreads();
+
+    // Phase 2: Reduce all partial histograms locally and find threshold.
+    // Every block computes the same threshold -- no broadcast needed.
+    for (uint32_t i = tx; i < kHistSize; i += kBlockSize) {
+      uint32_t sum = 0;
+#pragma unroll
+      for (uint32_t r = 0; r < kClusterSize; ++r)
+        sum += ws->partial_hist[r][i];
+      smem->histogram[i] = sum;
+    }
+    __syncthreads();
+    find_threshold(problem.topk, problem.seq_len, smem);
+
+    // Phase 3: Collect candidates from this block's chunk.
+    const auto topk = problem.topk;
+    const auto threshold_bin = smem->threshold_bin;
+    const float v_hi = coarse_bin_lower_bound<kHistBits>(threshold_bin + 1);
+    const float v_lo = coarse_bin_lower_bound<kHistBits>(threshold_bin);
+    for_each_input(problem.in + chunk_start, local_seq_len,
+                    [&](float val, uint32_t local_idx) {
+                      const auto idx = chunk_start + local_idx;
+                      if (val >= v_hi) {
+                        const auto pos = atomicAdd(&ws->global_count_gt, 1);
+                        if (pos < topk) [[likely]]
+                          ws->global_out[pos] = static_cast<int32_t>(idx);
+                      } else if (val >= v_lo) {
+                        const auto eq = atomicAdd(&ws->global_count_eq, 1);
+                        if (eq < kMaxNumTie) [[likely]]
+                          ws->global_tie[eq] = {val, idx};
+                      }
+                    });
+
+    // Phase 3.5: Barrier -- wait for all blocks to finish collection.
+    __syncthreads();
+    __threadfence();
+    if (tx == 0) {
+      atomicAdd(&ws->barrier, 1u);
+      while (*reinterpret_cast<volatile uint32_t*>(&ws->barrier) < 2 * kClusterSize) {}
+    }
+    __syncthreads();
+
+    // Phase 4: Primary block copies above-threshold indices to LDS, does
+    // tie-breaking, and leaves the result in problem.out for the kernel's
+    // page-table transform pass.
+    if (!is_primary) return;
+    const auto above_count = min(ws->global_count_gt, topk);
+    for (uint32_t i = tx; i < above_count; i += kBlockSize)
+      problem.out[i] = ws->global_out[i];
+    for (uint32_t i = above_count + tx; i < topk; i += kBlockSize)
+      problem.out[i] = -1;
+    __syncthreads();
+    const auto equal_count = min(ws->global_count_eq, kMaxNumTie);
+    const auto remain_topk = above_count < topk ? topk - above_count : 0;
+    const auto tie_count = min(equal_count, kMaxNumTie);
+    handle_tie(ws->global_tie, problem, above_count, tie_count,
+               remain_topk, &smem->tie.handle);
   }
 };
 #endif  // USE_ROCM
