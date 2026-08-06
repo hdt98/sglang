@@ -40,10 +40,11 @@ constexpr uint32_t kClusterSize = Cluster::kClusterSize;
 constexpr uint32_t kReg2MaxSeqLen = Register2::kMaxSeqLen;  // 8192
 constexpr uint32_t kReg4MaxSeqLen = Register4::kMaxSeqLen;  // 16384
 
-// On ROCm, the Streaming path (seq_len > 16384 in the C4 domain) is not yet
-// supported: the additional code raises VGPR pressure enough to crash gfx950
-// even when the path is never executed at runtime.  The Register2 and Register4
-// paths (seq_len <= 16384, i.e. original seq_len <= 65536) are fully functional.
+// On ROCm, the Streaming path is compiled in a separate kernel function
+// (topk_streaming_kernel) to isolate its VGPR pressure from the Register
+// paths.  The main kernel (topk_main_kernel) never includes Streaming code
+// on ROCm, so kHasStreaming = false here.  The host dispatch launches
+// topk_streaming_kernel directly when max_seq_len > kReg4MaxSeqLen.
 #ifdef USE_ROCM
 inline constexpr bool kHasStreaming = false;
 #else
@@ -232,6 +233,25 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
   __syncthreads();
   problem_transform(problem, params.get_output_ptr(blockIdx.x));
 }
+
+#ifdef USE_ROCM
+/// ROCm-only streaming kernel: isolates the Streaming path's VGPR pressure
+/// from the Register kernels.  Launched when max_seq_len > kReg4MaxSeqLen
+/// (16384 in the C4 domain, i.e. original seq_len > 65536 tokens).
+template <bool kPDL>
+TOPK_KERNEL void topk_streaming_kernel(const __grid_constant__ TopKLaunchParams params) {
+  device::enable_smem_spilling();
+  auto problem = params.problem(blockIdx.x);
+  if (problem.seq_len <= problem.topk) return trivial_transform<kPDL>(problem);
+  __shared__ int32_t topk_indices[kMaxTopK];
+  problem.out = topk_indices;
+  __shared__ impl::MaxSmem<Streaming::Smem> smem;
+  Streaming::forward<kPDL>(problem, &smem);
+  device::PDLTriggerSecondary<kPDL>();
+  __syncthreads();
+  problem_transform(problem, params.get_output_ptr(blockIdx.x));
+}
+#endif  // USE_ROCM
 
 #ifndef USE_ROCM
 template <bool kPDL>
@@ -533,7 +553,7 @@ struct TopKKernel {
       } else if (max_seq_len <= kReg4MaxSeqLen) {
         topk_main_kernel<kUsePDL, 1><<<dim3(batch_size), dim3(kBlockSize), 0, stream>>>(params);
       } else {
-        topk_main_kernel<kUsePDL, 2><<<dim3(batch_size), dim3(kBlockSize), 0, stream>>>(params);
+        topk_streaming_kernel<kUsePDL><<<dim3(batch_size), dim3(kBlockSize), 0, stream>>>(params);
       }
       host::RuntimeDeviceCheck();
     }
