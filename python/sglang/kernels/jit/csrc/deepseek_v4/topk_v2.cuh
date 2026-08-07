@@ -264,12 +264,32 @@ TOPK_KERNEL void topk_cluster_kernel(const __grid_constant__ TopKLaunchParams pa
     return;
   }
   __shared__ int32_t topk_indices[kMaxTopK];
-  __shared__ impl::MaxSmem<Cluster::Smem> smem;
+  __shared__ impl::MaxSmem<Register4::Smem, Cluster::Smem> smem;
   const auto this_rank = blockIdx.y;
   if (this_rank == 0) problem.out = topk_indices;
-  auto* ws = reinterpret_cast<Cluster::Workspace*>(
-      params.cluster_ws + blockIdx.x * sizeof(Cluster::Workspace));
-  Cluster::forward<kPDL>(problem, &smem, ws, this_rank);
+  // Per-row path selection, mirroring CUDA's topk_small_batch_kernel.
+  //
+  // The launch is chosen host-side from the score tensor's row width, which is
+  // the (padded) page-table extent rather than any row's real length. Without a
+  // per-row branch every row therefore pays the 8-block cooperative algorithm,
+  // including rows short enough to be register-resident -- measured as the
+  // cluster kernel running even at ISL 49152, where the C4-domain length is
+  // ~12K and Register4 applies.
+  //
+  // All kClusterSize ranks of a row observe the same problem.seq_len, so the
+  // branch cannot diverge across the blocks that cooperate on that row.
+  //
+  // Streaming is deliberately NOT inlined here: it lives in topk_streaming_kernel
+  // because its VGPR pressure crashes gfx950 when it shares a kernel with the
+  // register paths (see kHasStreaming and topk_streaming_kernel above). Rows in
+  // (kReg4MaxSeqLen, cluster_floor] keep taking the cluster path.
+  if (problem.seq_len <= kReg4MaxSeqLen) {
+    if (this_rank == 0) Register4::forward<kPDL>(problem, &smem);
+  } else {
+    auto* ws = reinterpret_cast<Cluster::Workspace*>(
+        params.cluster_ws + blockIdx.x * sizeof(Cluster::Workspace));
+    Cluster::forward<kPDL>(problem, &smem, ws, this_rank);
+  }
   if (this_rank == 0) {
     device::PDLTriggerSecondary<kPDL>();
     __syncthreads();
