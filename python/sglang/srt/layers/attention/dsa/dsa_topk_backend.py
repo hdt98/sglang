@@ -264,6 +264,17 @@ def _topk_unfused(
     return topk_indices
 
 # Cluster workspace cache for ROCm topk v2 cluster path.
+#
+# The two constants mirror the kernel's own host-side cluster dispatch in
+# topk_v2.cuh:
+#     use_cluster_rocm = (max_seq_len > kClusterFloor) && (batch_size <= kClusterMaxBatch)
+# where ``max_seq_len`` is the score tensor's row width. Deciding from the score
+# shape keeps the workspace gate host-side and byte-for-byte identical to the
+# kernel's; reading the lengths tensor instead (``lengths.max()``) would be a
+# device->host sync, which is illegal under CUDA graph capture and stalls the
+# decode pipeline outside it.
+_CLUSTER_FLOOR = 65536  # kClusterFloor in topk_v2.cuh
+_CLUSTER_MAX_BATCH = 512  # kClusterMaxBatch in topk_v2.cuh
 _cluster_ws_cache = {}
 
 
@@ -344,7 +355,7 @@ def _topk_transform_v2_paged(
     page_size = attn_metadata.page_size
     out = logits.new_full((num_rows, topk), -1, dtype=torch.int32)
     ws = None
-    if lengths_i32.numel() > 0 and int(lengths_i32.max()) > 65536:
+    if logits.shape[1] > _CLUSTER_FLOOR and num_rows <= _CLUSTER_MAX_BATCH:
         ws = _get_cluster_ws(num_rows, logits.device)
     topk_transform_512_v2(logits, lengths_i32, page_table, out, page_size, plan, cluster_ws=ws)
     return out
