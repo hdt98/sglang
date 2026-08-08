@@ -405,6 +405,36 @@ class DeepseekSparseAttnBackend(
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
+        # DCP: latent KV interleaved across ranks (slot % dcp); indexer K
+        # cache replicated so all ranks compute identical top-k.
+        parallel = get_parallel()
+        self.dcp_enabled = parallel.dcp_enabled
+        self.dcp_size = parallel.attn_dcp_size if self.dcp_enabled else 1
+        self.dcp_rank = parallel.attn_dcp_rank if self.dcp_enabled else 0
+        if self.dcp_enabled:
+            assert (
+                self.dsa_decode_impl in ("trtllm", "tilelang")
+                and self.dsa_prefill_impl in ("trtllm", "tilelang")
+            ), (
+                "DCP requires trtllm or tilelang DSA backends; "
+                f"got decode={self.dsa_decode_impl}, "
+                f"prefill={self.dsa_prefill_impl}."
+            )
+            assert not model_runner.server_args.enable_prefill_cp, (
+                "DCP does not compose with prefill CP yet: the DCP extend "
+                "recipe assumes every rank in a DCP group holds the same "
+                "extend rows, and prefill CP splits rows across ranks."
+            )
+            assert self.hisparse_coordinator is None, "DCP does not support hisparse."
+            if self.use_fused_topk:
+                print_warning_once("Disabling fused DSA top-k under DCP.")
+                self.use_fused_topk = False
+            if model_runner.server_args.enable_dp_attention:
+                assert parallel.attn_tp_size % self.dcp_size == 0, (
+                    f"dcp_size ({self.dcp_size}) must divide attn_tp_size "
+                    f"({parallel.attn_tp_size}) under dp-attention."
+                )
+
         # `flashmla_sparse_q8` = the native FP8 SM90 sparse-prefill kernel. It always
         # runs FP8 (requires fp8_e4m3 KV) and is SM90-only, so validate both at
         # construction: an unsupported config must fail at launch rather than
@@ -725,10 +755,20 @@ class DeepseekSparseAttnBackend(
             self.dsa_topk_backend.is_sgl_kernel()
             or self.dsa_topk_backend.is_flashinfer()
         ):
+            if self.dcp_enabled:
+                return self._dcp_global_slots_to_local_rows(topk_indices)
             return topk_indices
         raise RuntimeError(
             f"Unsupported {self.dsa_topk_backend = } for SGLANG_DSA_FUSE_TOPK."
         )
+
+    def _dcp_global_slots_to_local_rows(
+        self, page_table_1: torch.Tensor
+    ) -> torch.Tensor:
+        # Global KV slots -> this rank's local rows (unowned become -1).
+        # Returns a new tensor: the input is shared across layers (IndexShare).
+        owned = (page_table_1 >= 0) & (page_table_1 % self.dcp_size == self.dcp_rank)
+        return torch.where(owned, page_table_1 // self.dcp_size, -1)
 
     def get_device_int32_arange(self, length: int) -> torch.Tensor:
         if length > len(self._arange_buf):
@@ -1970,7 +2010,7 @@ class DeepseekSparseAttnBackend(
             forward_batch.forward_mode
         )
 
-        if self.use_fused_topk:
+        if self.use_fused_topk and not self.dcp_enabled:
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
@@ -2000,10 +2040,12 @@ class DeepseekSparseAttnBackend(
                     output_num_tokens=q_nope.shape[0],
                     page_table_is_expanded=(
                         forward_batch.forward_mode.is_target_verify()
-                        or forward_batch.forward_mode.is_draft_extend_v2()
-                    ),
-                    cu_seqlens_q=metadata.cu_seqlens_q,
-                )
+                    or forward_batch.forward_mode.is_draft_extend_v2()
+                ),
+                cu_seqlens_q=metadata.cu_seqlens_q,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
+            )
 
         # todo hisparse: to cover more backends
         if self.hisparse_coordinator is not None:
@@ -2271,6 +2313,8 @@ class DeepseekSparseAttnBackend(
                 page_table=metadata.page_table_1,
                 topk_indices=topk_indices,
                 page_size=1,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
             )
 
         if self.dsa_decode_impl == "flashmla_sparse":
@@ -2927,15 +2971,27 @@ class DeepseekSparseAttnBackend(
         page_table_1: torch.Tensor,
         sm_scale: float,
     ) -> torch.Tensor:
-        from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
-
-        return tilelang_sparse_fwd(
-            q=q_all,
-            kv=kv_cache,
-            indices=page_table_1.unsqueeze(1),
-            sm_scale=sm_scale,
-            d_v=v_head_dim,
-        )
+        if self.dcp_enabled:
+            from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+                tilelang_sparse_fwd_with_lse,
+            )
+            out, lse = tilelang_sparse_fwd_with_lse(
+                q=q_all,
+                kv=kv_cache,
+                indices=page_table_1.unsqueeze(1),
+                sm_scale=sm_scale,
+                d_v=v_head_dim,
+            )
+            return (out, lse)
+        else:
+            from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
+            return tilelang_sparse_fwd(
+                q=q_all,
+                kv=kv_cache,
+                indices=page_table_1.unsqueeze(1),
+                sm_scale=sm_scale,
+                d_v=v_head_dim,
+            )
 
     def _forward_aiter(
         self,
@@ -3209,6 +3265,8 @@ class DeepseekSparseAttnBackend(
                     or forward_batch.forward_mode.is_draft_extend_v2()
                 ),
                 cu_seqlens_q=metadata.cu_seqlens_q,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
             )
         else:
             if topk_indices is not None:
@@ -3217,6 +3275,8 @@ class DeepseekSparseAttnBackend(
                 page_table=metadata.page_table_1,
                 topk_indices=topk_indices,
                 page_size=1,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
             )
 
         q_scale = 1.0
@@ -3334,6 +3394,7 @@ class DeepseekSparseAttnBackend(
                 and sum_seq_lens
                 <= forward_batch.get_max_chunk_capacity()  # Fits in chunk
                 and (not is_dsa_enable_prefill_cp())  # CP not enabled
+                and (not self.dcp_enabled)  # DCP extend uses the sparse MLA path
                 and (self.hisparse_coordinator is None)
             )
         else:
@@ -3383,9 +3444,13 @@ class DeepseekSparseAttnBackend(
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> DSAIndexerMetadata:
-        force_unfused = not self.use_fused_topk or (
-            self.hisparse_coordinator is not None
-            and forward_batch.forward_mode.is_decode_or_idle()
+        force_unfused = (
+            not self.use_fused_topk
+            or (
+                self.hisparse_coordinator is not None
+                and forward_batch.forward_mode.is_decode_or_idle()
+            )
+            or (self.dcp_enabled and not forward_batch.forward_mode.is_decode_or_idle())
         )
         return DSAIndexerMetadata(
             attn_metadata=self.forward_metadata,

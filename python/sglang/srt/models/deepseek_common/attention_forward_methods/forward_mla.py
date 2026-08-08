@@ -23,6 +23,7 @@ from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
+    alloc_dcp_q_combine_buf,
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
 )
@@ -314,6 +315,10 @@ class DeepseekMLAForwardMixin:
         q_pe = None
         k_pe = None
         fusion_plan: Optional[MlaBmmFusionPlan] = None
+        # Set when the plain-bf16 bmm writes q_nope_out directly into the DCP
+        # Q-gather's combine buffer; passed to all_gather_q_for_mla_decode so
+        # it can skip its torch.cat. Always None on AMD (no symmetric memory).
+        combined_q_buf: Optional[torch.Tensor] = None
         if self.q_lora_rank is not None:
             q, latent_cache = (
                 get_attn_tp_context()
@@ -544,15 +549,30 @@ class DeepseekMLAForwardMixin:
             else:
                 q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
-            q_nope_out = q_nope_out.transpose(0, 1)
-            if _SGLANG_EXPERIMENTAL_LORA_OPTI:
-                from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
-                    kv_b_lora_q_apply,
+            defer_q_nope_transpose = (
+                get_parallel().dcp_enabled
+                and not _SGLANG_EXPERIMENTAL_LORA_OPTI
+                and not is_kv_b_lora_active(self)
+                and (
+                    forward_batch.forward_mode.is_decode()
+                    or (
+                        self.use_dsa
+                        and forward_batch.forward_mode.is_extend(
+                            include_draft_extend_v2=True
+                        )
+                    )
                 )
+            )
+            if not defer_q_nope_transpose:
+                q_nope_out = q_nope_out.transpose(0, 1)
+                if _SGLANG_EXPERIMENTAL_LORA_OPTI:
+                    from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
+                        kv_b_lora_q_apply,
+                    )
 
-                q_nope_out = kv_b_lora_q_apply(self, q_nope, q_nope_out, _kvb_q)
-            elif is_kv_b_lora_active(self):
-                q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
+                    q_nope_out = kv_b_lora_q_apply(self, q_nope, q_nope_out, _kvb_q)
+                elif is_kv_b_lora_active(self):
+                    q_nope_out = apply_kv_b_lora_q_correction(self, q_nope, q_nope_out)
 
         fuse_rope_for_trtllm_mla = self._fuse_rope_for_trtllm_mla(forward_batch)
         if (
@@ -626,20 +646,32 @@ class DeepseekMLAForwardMixin:
                     q_nope_out, q_pe = all_gather_q_for_mla_decode(
                         q_nope_out=q_nope_out,
                         q_pe=q_pe,
+                        combined_buf=combined_q_buf,
                     )
-            elif forward_batch.forward_mode.is_extend():
-                # for extend, gather kv
-                all_gather_kv_cache_for_mla_extend(
-                    get_token_to_kv_pool(),
-                    self.attn_mqa,
-                    forward_batch.extend_prefix_lens_cpu,
-                    forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
-                    forward_batch.attn_dcp_metadata.dcp_extend_prefix_lens_sum,
-                    forward_batch.attn_dcp_metadata.dcp_kv_buffer,
-                    self.kv_lora_rank,
-                    k_nope,
-                    k_pe,
-                )
+            elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+                if self.use_dsa:
+                    # DSA extend mirrors the decode recipe: gather q across
+                    # the DCP group, attend the local KV shard with all
+                    # gathered heads, LSE-combine in forward_absorb_core.
+                    q_nope_out, q_pe = all_gather_q_for_mla_decode(
+                        q_nope_out=q_nope_out,
+                        q_pe=q_pe,
+                        combined_buf=combined_q_buf,
+                    )
+                elif forward_batch.forward_mode.is_extend():
+                    # Dense MLA gathers KV instead; its draft-extend path is
+                    # not implemented.
+                    all_gather_kv_cache_for_mla_extend(
+                        get_token_to_kv_pool(),
+                        self.attn_mqa,
+                        forward_batch.extend_prefix_lens_cpu,
+                        forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
+                        forward_batch.attn_dcp_metadata.dcp_extend_prefix_lens_sum,
+                        forward_batch.attn_dcp_metadata.dcp_kv_buffer,
+                        self.kv_lora_rank,
+                        k_nope,
+                        k_pe,
+                    )
             else:
                 logger.warning(
                     f"not supported forward_mode {forward_batch.forward_mode}"
@@ -672,6 +704,9 @@ class DeepseekMLAForwardMixin:
         fusion_plan: Optional[MlaBmmFusionPlan] = None,
     ):
         save_kv_cache = True
+        # Set only by the DCP attention branches; the combine below asserts on
+        # it so a fusion path silently skipping the LSE fails loudly.
+        lse = None
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             extra_args = {}
@@ -721,20 +756,78 @@ class DeepseekMLAForwardMixin:
                     ),
                 )
             else:
-                attn_output = self.attn_mqa(
-                    q_nope_out,
-                    k_nope,
-                    k_nope,
-                    forward_batch,
-                    q_rope=q_pe,
-                    k_rope=k_pe,
-                    **extra_args,
-                    **(
-                        dict(topk_indices=topk_indices)
-                        if topk_indices is not None
-                        else {}
-                    ),
-                )
+                extra_args = {}
+                if self._fuse_rope_for_trtllm_mla(forward_batch):
+                    extra_args = {
+                        "cos_sin_cache": self.rotary_emb.cos_sin_cache,
+                        "is_neox": self.rotary_emb.is_neox_style,
+                        "llama_4_scaling": llama_4_scaling,
+                    }
+                if fusion_plan is not None:
+                    bmm_attention_fn = (
+                        bcg_mla_bmm_then_unified_attention
+                        if is_in_breakable_cuda_graph()
+                        else mla_bmm_then_unified_attention
+                    )
+                    bmm_attention_fn(
+                        fusion_plan.q_nope_t,
+                        self.w_kc,
+                        fusion_plan.q_nope_out_buf,
+                        q_nope_out,
+                        k_nope,
+                        fusion_plan.attn_output_buf,
+                        save_kv_cache,
+                        self.layer_id,
+                        q_pe,
+                        k_pe,
+                        cos_sin_cache=extra_args.get("cos_sin_cache"),
+                        is_neox=extra_args.get("is_neox"),
+                        llama_4_scaling=extra_args.get("llama_4_scaling"),
+                        topk_indices=topk_indices,
+                    )
+                    attn_output = fusion_plan.attn_output_buf
+                elif get_parallel().dcp_enabled and (
+                    forward_batch.forward_mode.is_decode()
+                    or forward_batch.forward_mode.is_target_verify()
+                    or (
+                        self.use_dsa
+                        and forward_batch.forward_mode.is_extend(
+                            include_draft_extend_v2=True
+                        )
+                    )
+                ):
+                    # set return_lse=True to correct attn_output. DSA extend
+                    # takes this path too: q was head-widened in prepare and
+                    # each rank runs the sparse kernels over its KV shard.
+                    attn_output, lse = self.attn_mqa_for_dcp_decode(
+                        q_nope_out,
+                        k_nope,
+                        k_nope,
+                        forward_batch,
+                        q_rope=q_pe,
+                        k_rope=k_pe,
+                        **extra_args,
+                        **(
+                            dict(topk_indices=topk_indices)
+                            if topk_indices is not None
+                            else {}
+                        ),
+                    )
+                else:
+                    attn_output = self.attn_mqa(
+                        q_nope_out,
+                        k_nope,
+                        k_nope,
+                        forward_batch,
+                        q_rope=q_pe,
+                        k_rope=k_pe,
+                        **extra_args,
+                        **(
+                            dict(topk_indices=topk_indices)
+                            if topk_indices is not None
+                            else {}
+                        ),
+                    )
         else:
             q = torch.cat([q_nope_out, q_pe], dim=-1)
             k = torch.cat([k_nope, k_pe], dim=-1)
@@ -753,7 +846,18 @@ class DeepseekMLAForwardMixin:
             )
 
         # correct attn_output with respect to lse from other ranks
-        if is_dcp_mla_decode_phase(forward_batch):
+        if get_parallel().dcp_enabled and (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+            or (
+                self.use_dsa
+                and forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+            )
+        ):
+            assert lse is not None, (
+                "DCP LSE combine reached without an LSE -- the attention call "
+                "above must go through the attn_mqa_for_dcp_decode branch."
+            )
             attn_output = attn_output.view(
                 -1,
                 self.num_local_heads * get_parallel().attn_dcp_size,

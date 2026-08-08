@@ -847,8 +847,8 @@ def sparse_mla_fwd_decode_partial(
 
     head_kv = heads // kv_group
     padded_H = max(tilelang.math.next_power_of_2(head_kv), 16)
-    REPLICATE_H = (head_kv // 64) if head_kv > 64 else 1
-    H_per_block = padded_H if REPLICATE_H == 1 else 64
+    REPLICATE_H = (head_kv // 16) if head_kv > 16 else 1
+    H_per_block = padded_H if REPLICATE_H == 1 else 16
     N_GROUPS = topk // (block_I * inner_iter)
     BI = block_I
     D = dim
@@ -901,7 +901,7 @@ def sparse_mla_fwd_decode_partial(
             b_i, g_i = 0, 0
             s_i = bx if REPLICATE_H == 1 else (bx // REPLICATE_H)
             group_i = by
-            H0 = 0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64
+            H0 = 0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * H_per_block
             H1 = H0 + H_per_block
 
             T.copy(Q[b_i, s_i, H0:H1, :D], Q_buf)
@@ -1385,6 +1385,78 @@ def tilelang_sparse_fwd(
         )
         out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
     return out
+
+
+def tilelang_sparse_fwd_with_lse(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Same as tilelang_sparse_fwd but also returns the final base-2 LSE
+    # computed from partial_lse_batched. Used by the DCP decode/extend path
+    # where the cross-rank LSE combine needs the per-rank LSE.
+    assert q.dim() == 3 and kv.dim() == 3 and indices.dim() == 3
+    num_heads = q.shape[1]
+    dim = q.shape[2]
+    tail_dim = dim - d_v
+    topk = indices.shape[-1]
+    assert topk == 2048
+
+    assert _is_hip, "tilelang_sparse_fwd_with_lse is only supported on HIP"
+    is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    if is_fp8_kv:
+        if q.dtype != kv.dtype:
+            q = q.to(kv.dtype)
+        if _is_gfx95_supported:
+            block_I, threads, block_per_cu, cu = 64, 256, 2, 256
+        else:
+            block_I, threads, block_per_cu, cu = 64, 256, 1, 304
+    else:
+        if _is_gfx95_supported:
+            block_I, threads, block_per_cu, cu = 64, 256, 2, 256
+        else:
+            block_I, threads, block_per_cu, cu = 32, 128, 1, 304
+    ni = topk // block_I
+    inner_iter = _pick_inner_iter(q.shape[0], ni, cu, block_per_cu)
+
+    if is_fp8_kv:
+        kernel_partial = sparse_mla_fwd_decode_partial_fp8(
+            num_heads, d_v, tail_dim, topk,
+            sm_scale=sm_scale, block_I=block_I,
+            inner_iter=inner_iter, threads=threads,
+        )
+    else:
+        kernel_partial = sparse_mla_fwd_decode_partial(
+            num_heads, d_v, tail_dim, topk,
+            sm_scale=sm_scale, block_I=block_I,
+            inner_iter=inner_iter, threads=threads,
+        )
+    partial_o_batched, partial_lse_batched = kernel_partial(
+        q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0)
+    )
+    n_groups = ni // inner_iter
+    kernel_combine = sparse_mla_fwd_decode_combine(
+        num_heads, d_v, n_groups * block_I,
+        head_per_block=4, block_I=block_I, threads=threads,
+    )
+    out = kernel_combine(partial_o_batched, partial_lse_batched)
+
+    # Compute final base-2 LSE from partial_lse_batched.
+    # partial_lse_batched shape: [1, S, NI, H]
+    # The combine kernel does: lse = max + log2(sum(exp2(lse - max))) over NI dim.
+    # We replicate that reduction here in Python.
+    # partial_lse_batched: [1, S, NI, H] -> reduce over dim=2 (NI)
+    lse_max = partial_lse_batched.max(dim=2).values  # [1, S, H]
+    lse_sum = torch.exp2(
+        partial_lse_batched - lse_max.unsqueeze(2)
+    ).sum(dim=2)  # [1, S, H]
+    final_lse = lse_max + torch.log2(lse_sum)  # [1, S, H]
+    # Squeeze batch dim -> [S, H]
+    final_lse = final_lse.squeeze(0)  # [S, H]
+
+    return out, final_lse
 
 
 @functools.cache

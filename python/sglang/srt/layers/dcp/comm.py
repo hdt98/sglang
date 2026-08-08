@@ -246,17 +246,42 @@ def all_gather_kv_cache_for_mha_extend(
     return kv_a.contiguous(), k_pe.contiguous()
 
 
+def alloc_dcp_q_combine_buf(
+    q_nope: torch.Tensor,
+    num_heads: int,
+    d_pe: int,
+    d_nope: int,
+) -> torch.Tensor:
+    # Pre-allocate the [H, B, d_pe + d_nope] buffer an upcoming
+    # all_gather_q_for_mla_decode will gather, from the symmetric-memory
+    # pool. Callers write the q_nope bmm's output directly into the returned
+    # buffer's [..., d_pe:] slice via out=, so only q_pe still needs
+    # copying in later -- no separate concat of the two.
+    group = get_parallel().dcp_group
+    with use_symmetric_memory(group):
+        return q_nope.new_empty((num_heads, q_nope.shape[0], d_pe + d_nope))
+
+
 def all_gather_q_for_mla_decode(
     q_nope_out: torch.Tensor,
     q_pe: torch.Tensor,
+    combined_buf: Optional[torch.Tensor] = None,
 ):
+    # q_nope_out arrives as [H, B, L] (its bmm's native layout; callers skip
+    # transposing it to [B, H, L] and back just to undo that here). q_pe is
+    # [B, H, L] and needs the transpose.
     group = get_parallel().dcp_group
-    with use_symmetric_memory(group):
-        # transpose q_pe and q_nope_out from [B, H, L] to [H, B, L]
-        combined = torch.cat([q_pe.transpose(0, 1), q_nope_out.transpose(0, 1)], dim=-1)
-    gathered = group.all_gather(combined, dim=0)
     d_pe = q_pe.size(-1)
     d_nope = q_nope_out.size(-1)
+    if combined_buf is not None:
+        # q_nope_out is already this buffer's [..., d_pe:] slice (written by
+        # the caller's bmm out=); only q_pe needs to land in the pool.
+        combined_buf[..., :d_pe].copy_(q_pe.transpose(0, 1))
+        combined = combined_buf
+    else:
+        with use_symmetric_memory(group):
+            combined = torch.cat([q_pe.transpose(0, 1), q_nope_out], dim=-1)
+    gathered = group.all_gather(combined, dim=0)
     q_pe, q_nope_out = gathered.split([d_pe, d_nope], dim=-1)
     q_pe = q_pe.transpose(0, 1)
     q_nope_out = q_nope_out.transpose(0, 1)
@@ -274,21 +299,28 @@ def all_gather_kv_cache_for_mla_extend(
     k_nope,
     k_pe,
 ):
-    cache_k_nope, cache_k_rope = token_to_kv_pool.get_mla_kv_buffer(
-        attn_mqa,
-        dcp_local_prefix_kv_indices,
-    )
-    extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
-    # all gather kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
-    gathered_kv = all_gather_kv_cache_for_dcp(
-        cache_k_nope,
-        cache_k_rope,
-        extend_prefix_lens_cpu,
-        prefix_starts_cpu=torch.zeros_like(extend_prefix_lens_cpu),
-    )
-    dcp_kv_buffer[:dcp_extend_prefix_lens_sum] = gathered_kv
+    # Gather the cached prefix shard across dcp ranks into the front of
+    # dcp_kv_buffer. Skip the collective entirely when there is no cached prefix
+    # (dcp_extend_prefix_lens_sum == 0, batch-consistent across ranks): an empty
+    # all-gather launches a 0-sized kernel (HIP invalid configuration), and there
+    # is nothing to gather. The new-token copy below still runs so dcp_kv_buffer
+    # holds the full sequence even in the no-prefix case.
+    if dcp_extend_prefix_lens_sum > 0:
+        cache_k_nope, cache_k_rope = token_to_kv_pool.get_mla_kv_buffer(
+            attn_mqa,
+            dcp_local_prefix_kv_indices,
+        )
+        extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
+        # all gather kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
+        gathered_kv = all_gather_kv_cache_for_dcp(
+            cache_k_nope,
+            cache_k_rope,
+            extend_prefix_lens_cpu,
+            prefix_starts_cpu=torch.zeros_like(extend_prefix_lens_cpu),
+        )
+        dcp_kv_buffer[:dcp_extend_prefix_lens_sum] = gathered_kv
 
-    # copy local kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
+    # copy local (in-hand) new-token kv cache into dcp_kv_buffer
     dcp_kv_buffer[
         dcp_extend_prefix_lens_sum:,
         ...,
