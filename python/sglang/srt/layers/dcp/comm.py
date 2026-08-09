@@ -503,13 +503,20 @@ def dcp_a2a_lse_reduce(
     if cp_group.world_size == 1:
         return cp_attn_out
 
-    # Try Mori SHMEM P2P first (decode only, small batch)
-    from sglang.srt.layers.dcp.mori_dcp import mori_lse_combine_if_available
-    mori_result = mori_lse_combine_if_available(
-        cp_attn_out, cp_attn_lse, is_lse_base_on_e=is_lse_base_on_e
-    )
-    if mori_result is not None:
-        return mori_result
+    # Try Mori SHMEM P2P first (decode only, small batch).  The new
+    # shared_output.py path uses zero-copy peer writes + atomic flag
+    # signaling, replacing NCCL all-gather + reduce-scatter.  Gated
+    # behind is_mori_dcp_available() -- NCCL remains the fallback.
+    from sglang.srt.layers.dcp.mori_dcp import is_mori_dcp_available
+    if is_mori_dcp_available():
+        from sglang.srt.layers.dcp.shared_output import dcp_output_mori_lse_reduce
+        return dcp_output_mori_lse_reduce(
+            cp_attn_out,
+            cp_attn_lse,
+            cp_group,
+            is_lse_base_on_e=is_lse_base_on_e,
+            workspace_slot=0,
+        )
     if comm_backend == "fi_a2a":
         return _dcp_fi_a2a_lse_reduce(
             cp_attn_out, cp_attn_lse, cp_group, is_lse_base_on_e

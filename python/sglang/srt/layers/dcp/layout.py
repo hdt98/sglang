@@ -51,6 +51,28 @@ def filter_dcp_local_kv_indices(kv_indices: torch.Tensor):
     return kv_indices
 
 
+def build_dcp_indexer_local_page_table(
+    page_table_1: torch.Tensor,
+    page_size: int,
+    dcp_size: int,
+    dcp_rank: int,
+) -> torch.Tensor:
+    """Map a global token-slot table to owner-local Indexer page ids."""
+    logical_page_size = page_size * dcp_size
+    local_page_table = (
+        page_table_1[:, dcp_rank::logical_page_size] // logical_page_size
+    ).to(
+        dtype=torch.int32,
+        memory_format=torch.contiguous_format,
+        copy=True,
+    )
+    if local_page_table.shape[1] == 0:
+        local_page_table = page_table_1.new_zeros(
+            (page_table_1.shape[0], 1), dtype=torch.int32
+        )
+    return local_page_table
+
+
 def update_local_kv_lens_for_dcp(kv_len_arr):
     """In-place per-rank KV length: the start=0 case of get_dcp_lens.
 
