@@ -280,12 +280,6 @@ def all_gather_q_for_mla_decode(
     q_nope_out: torch.Tensor,
     q_pe: torch.Tensor,
 ):
-    # Try Mori SHMEM P2P first (decode only, small batch)
-    from sglang.srt.layers.dcp.mori_dcp import mori_all_gather_q_if_available
-    mori_result = mori_all_gather_q_if_available(q_nope_out, q_pe)
-    if mori_result is not None:
-        return mori_result
-
     group = get_parallel().dcp_group
     with use_symmetric_memory(group):
         # transpose q_pe and q_nope_out from [B, H, L] to [H, B, L]
@@ -310,22 +304,24 @@ def all_gather_kv_cache_for_mla_extend(
     k_nope,
     k_pe,
 ):
-    # Gather the cached prefix shard across dcp ranks. Skip the collective
-    # entirely when there is no cached prefix (dcp_extend_prefix_lens_sum == 0):
-    # an empty all-gather launches a 0-sized kernel (HIP invalid configuration).
-    if dcp_extend_prefix_lens_sum > 0:
-        cache_k_nope, cache_k_rope = token_to_kv_pool.get_mla_kv_buffer(
-            attn_mqa,
-            dcp_local_prefix_kv_indices,
-        )
-        extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
-        gathered_kv = all_gather_kv_cache_for_dcp(
-            cache_k_nope,
-            cache_k_rope,
-            extend_prefix_lens_cpu,
-            prefix_starts_cpu=torch.zeros_like(extend_prefix_lens_cpu),
-        )
-        dcp_kv_buffer[:dcp_extend_prefix_lens_sum] = gathered_kv
+    if dcp_extend_prefix_lens_sum == 0:
+        dcp_kv_buffer[0:, ..., :kv_lora_rank] = k_nope
+        dcp_kv_buffer[0:, ..., kv_lora_rank:] = k_pe
+        return
+
+    cache_k_nope, cache_k_rope = token_to_kv_pool.get_mla_kv_buffer(
+        attn_mqa,
+        dcp_local_prefix_kv_indices,
+    )
+    extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
+    # all gather kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
+    gathered_kv = all_gather_kv_cache_for_dcp(
+        cache_k_nope,
+        cache_k_rope,
+        extend_prefix_lens_cpu,
+        prefix_starts_cpu=torch.zeros_like(extend_prefix_lens_cpu),
+    )
+    dcp_kv_buffer[:dcp_extend_prefix_lens_sum] = gathered_kv
 
     # copy local kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
     dcp_kv_buffer[
@@ -503,13 +499,6 @@ def dcp_a2a_lse_reduce(
     if cp_group.world_size == 1:
         return cp_attn_out
 
-    # Try Mori SHMEM P2P first (decode only, small batch)
-    from sglang.srt.layers.dcp.mori_dcp import mori_lse_combine_if_available
-    mori_result = mori_lse_combine_if_available(
-        cp_attn_out, cp_attn_lse, is_lse_base_on_e=is_lse_base_on_e
-    )
-    if mori_result is not None:
-        return mori_result
     if comm_backend == "fi_a2a":
         return _dcp_fi_a2a_lse_reduce(
             cp_attn_out, cp_attn_lse, cp_group, is_lse_base_on_e
@@ -519,8 +508,6 @@ def dcp_a2a_lse_reduce(
     B, H, D = cp_attn_out.shape
     assert H % N == 0, f"num_heads ({H}) must be divisible by dcp_size ({N})"
     H_per_rank = H // N
-    # Cast to FP32 to reduce per-layer rounding error in LSE combine (fixes MTP AL)
-    cp_attn_out = cp_attn_out.to(torch.float32)
     out_dtype = cp_attn_out.dtype
     lpd = _lse_pack_dim(out_dtype)  # 2 for bf16/fp16
 
@@ -587,14 +574,6 @@ def dcp_a2a_lse_reduce(
         )
         recv_lse = recv_lse_stg
 
-    import os
-    if os.environ.get("SGLANG_DCP_LSE_DEBUG") and not torch.cuda.is_current_stream_capturing():
-        _mode = "decode" if B <= 2 else "verify"
-        for _ri in range(N):
-            _rl = recv_lse[_ri, :B, :]
-            print(f"[DCP_LSE_DBG] {_mode} B={B} rank={_ri} lse_mean={_rl.mean().item():.4f} lse_max={_rl.max().item():.4f} lse_min={_rl.min().item():.4f}", flush=True)
-        _lse_diff = (recv_lse[:N, :B, :].max(dim=0).values - recv_lse[:N, :B, :].min(dim=0).values).max().item()
-        print(f"[DCP_LSE_DBG] {_mode} B={B} max_lse_diff={_lse_diff:.4f}", flush=True)
     combined, _ = dcp_lse_combine_triton(
         recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e
     )
@@ -624,8 +603,6 @@ def _dcp_fi_a2a_lse_reduce(
     B, H, D = cp_attn_out.shape
     assert H % N == 0, f"num_heads ({H}) must be divisible by dcp_size ({N})"
     H_per_rank = H // N
-    # Cast to FP32 to reduce per-layer rounding error in LSE combine (fixes MTP AL)
-    cp_attn_out = cp_attn_out.to(torch.float32)
 
     # FlashInfer sends partial_o[..., peer, :] to `peer`; head h -> peer h//H_per_rank,
     # so the peer axis is the outer head split: [B,N,H_pr,D] -> [B,H_pr,N,D].

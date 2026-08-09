@@ -6,40 +6,6 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
-def _compact_page_table_kernel(
-    page_table_ptr,
-    result_ptr,
-    row_stride: tl.constexpr,
-    TOPK: tl.constexpr,
-):
-    """Compact valid (>=0) entries to front of each row using prefix-sum."""
-    row_id = tl.program_id(0)
-    offsets = tl.arange(0, TOPK)
-    ptr_in = page_table_ptr + row_id * row_stride
-    ptr_out = result_ptr + row_id * row_stride
-    loaded = tl.load(ptr_in + offsets)
-    valid = loaded >= 0
-    valid_int = valid.to(tl.int32)
-    compact_pos = tl.cumsum(valid_int, axis=0) - 1
-    tl.store(ptr_out + offsets, -1)
-    tl.store(ptr_out + compact_pos, loaded, mask=valid)
-
-
-def compact_page_table_dcp(page_table):
-    """Compact valid entries to front. Stream-capturable replacement for torch.sort."""
-    num_rows, topk = page_table.shape
-    result = page_table
-    _compact_page_table_kernel[(num_rows,)](
-        page_table,
-        result,
-        page_table.stride(0),
-        TOPK=topk,
-    )
-    return result
-
-
-
 def transform_index_page_table_prefill(**kwargs):
     return transform_index_page_table_prefill_fast(**kwargs)
 
@@ -83,9 +49,8 @@ def transform_index_page_table_decode_kernel(
     result_ptr: torch.Tensor,
     page_size: tl.constexpr,
     page_table_row_stride: tl.constexpr,
-    dcp_size: tl.constexpr,
-    dcp_rank: tl.constexpr,
-    compact_dcp: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
 ):
     TOPK: tl.constexpr = 2048
     req_id = tl.program_id(0)
@@ -97,21 +62,11 @@ def transform_index_page_table_decode_kernel(
     loaded_topk_indices = tl.load(topk_indices_ptr + offset)
     mask = loaded_topk_indices >= 0
     loaded_kv_indices = tl.load(page_table_ptr + loaded_topk_indices, mask=mask)
-    if dcp_size > 1:
-        # Keep slots owned by this rank as local rows; others become -1.
-        mask = mask & (loaded_kv_indices % dcp_size == dcp_rank)
-        loaded_kv_indices = loaded_kv_indices // dcp_size
-    if compact_dcp and dcp_size > 1:
-        # Compact valid entries to the front using prefix-sum (stream-capturable,
-        # unlike torch.sort). This reduces the tilelang kernel's iteration count
-        # from 2048 to 2048//dcp_size, saving 75% of memory bandwidth for DCP4.
-        valid_int = mask.to(tl.int32)
-        compact_pos = tl.cumsum(valid_int, axis=0) - 1
-        tl.store(result_ptr + offset, -1)
-        tl.store(result_ptr + compact_pos, loaded_kv_indices, mask=mask)
-    else:
-        tl.store(result_ptr + offset, loaded_kv_indices, mask=mask)
-        tl.store(result_ptr + offset, -1, mask=~mask)
+    if DCP_SIZE > 1:
+        is_owner = (loaded_kv_indices % DCP_SIZE) == DCP_RANK
+        loaded_kv_indices = tl.where(is_owner, loaded_kv_indices // DCP_SIZE, -1)
+    tl.store(result_ptr + offset, loaded_kv_indices, mask=mask)
+    tl.store(result_ptr + offset, -1, mask=~mask)
 
 
 @triton.jit
@@ -130,8 +85,8 @@ def transform_index_page_table_prefill_kernel(
     TOPK: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
-    dcp_size: tl.constexpr,
-    dcp_rank: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
 ):
     request_id = tl.program_id(0)
     query_offsets = tl.program_id(1) * BLOCK_Q + tl.arange(0, BLOCK_Q)
@@ -165,10 +120,10 @@ def transform_index_page_table_prefill_kernel(
         mask=valid_topk_mask,
         other=-1,
     )
-    if dcp_size > 1:
-        # DCP owner filter: keep slots on this rank, map global -> local row.
-        owned_mask = valid_topk_mask & (loaded_kv_indices % dcp_size == dcp_rank)
-        loaded_kv_indices = tl.where(owned_mask, loaded_kv_indices // dcp_size, -1)
+    if DCP_SIZE > 1:
+        valid_kv = loaded_kv_indices >= 0
+        is_owner = (loaded_kv_indices % DCP_SIZE) == DCP_RANK
+        loaded_kv_indices = tl.where(valid_kv & is_owner, loaded_kv_indices // DCP_SIZE, -1)
     tl.store(
         result_ptr
         + token_indices[:, None] * result_stride_0
@@ -185,7 +140,6 @@ def transform_index_page_table_decode_fast(
     page_size: int = 1,
     dcp_size: int = 1,
     dcp_rank: int = 0,
-    compact_dcp: bool = False,
 ) -> torch.Tensor:
     """
     Transform the page table according to topk indices for sparse topk attention.
@@ -210,9 +164,8 @@ def transform_index_page_table_decode_fast(
         result,
         page_size,
         page_table_row_stride=page_table.stride(0),
-        dcp_size=dcp_size,
-        dcp_rank=dcp_rank,
-        compact_dcp=compact_dcp,
+        DCP_SIZE=dcp_size,
+        DCP_RANK=dcp_rank,
     )
     return result
 
@@ -264,8 +217,8 @@ def transform_index_page_table_prefill_fast(
         TOPK=topk_indices.shape[1],
         BLOCK_Q=block_q,
         BLOCK_TOPK=block_topk,
-        dcp_size=dcp_size,
-        dcp_rank=dcp_rank,
+        DCP_SIZE=dcp_size,
+        DCP_RANK=dcp_rank,
         num_warps=4,
     )
     return result

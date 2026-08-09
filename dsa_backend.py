@@ -25,7 +25,6 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
 )
 from sglang.kernels.ops.attention.dsa.quant_k_cache import quantize_k_cache
 from sglang.kernels.ops.attention.dsa.transform_index import (
-    compact_page_table_dcp,
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
 )
@@ -397,6 +396,16 @@ class DeepseekSparseAttnBackend(
         self.use_fused_topk = should_use_dsa_fused_topk(
             model_runner.server_args, seed_dsa_topk_from_draft_extend
         )
+
+        # DCP support
+        self.dcp_enabled = get_parallel().dcp_enabled
+        self.dcp_size = get_parallel().attn_dcp_size
+        self.dcp_rank = get_parallel().attn_dcp_rank
+        if self.dcp_enabled:
+            assert self.dsa_decode_impl in ("tilelang", "trtllm"), (
+                f"DCP requires tilelang or trtllm decode backend, got {self.dsa_decode_impl}"
+            )
+            self.use_fused_topk = False
         if envs.SGLANG_DSA_FUSE_TOPK.get() and not self.use_fused_topk:
             print_warning_once(
                 "Disabling fused DSA top-k for IndexShare under PD disaggregation."
@@ -405,45 +414,6 @@ class DeepseekSparseAttnBackend(
         self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
-
-        # DCP: latent KV interleaved across ranks (slot % dcp); indexer K
-        # cache replicated so all ranks compute identical top-k.
-        parallel = get_parallel()
-        self.dcp_enabled = parallel.dcp_enabled
-        self.dcp_size = parallel.attn_dcp_size if self.dcp_enabled else 1
-        self.dcp_rank = parallel.attn_dcp_rank if self.dcp_enabled else 0
-        if self.dcp_enabled:
-            assert self.dsa_decode_impl in ("tilelang", "trtllm"), (
-                f"DCP requires tilelang or trtllm decode backend, got {self.dsa_decode_impl}"
-            )
-            if self.use_fused_topk:
-                print_warning_once("Disabling fused DSA top-k under DCP.")
-                self.use_fused_topk = False
-            # Initialize Mori SHMEM for DCP Q all-gather (decode only)
-            try:
-                from sglang.srt.layers.dcp.mori_dcp import (
-                    init_mori_dcp,
-                    init_mori_dcp_output,
-                )
-                _max_bs = model_runner.server_args.cuda_graph_max_bs_decode or 256
-                _num_heads = model_runner.model_config.num_attention_heads // parallel.attn_tp_size
-                init_mori_dcp(
-                    dcp_group=parallel.dcp_group,
-                    max_batch_size=_max_bs,
-                    num_heads=_num_heads,
-                    d_total=self.kv_lora_rank + self.qk_rope_head_dim,
-                    dtype=model_runner.dtype,
-                )
-                # Also init output/LSE symmetric buffers for decode merge
-                init_mori_dcp_output(
-                    dcp_group=parallel.dcp_group,
-                    max_batch_size=_max_bs,
-                    num_heads=_num_heads * parallel.attn_dcp_size,
-                    d_out=self.kv_lora_rank,
-                    dtype=model_runner.dtype,
-                )
-            except Exception as e:
-                print_warning_once(f"Mori DCP init failed, falling back to NCCL: {e}")
 
         # `flashmla_sparse_q8` = the native FP8 SM90 sparse-prefill kernel. It always
         # runs FP8 (requires fp8_e4m3 KV) and is SM90-only, so validate both at
@@ -2083,12 +2053,6 @@ class DeepseekSparseAttnBackend(
                         d_v=layer.v_head_dim,
                     )
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
-            if self.dcp_enabled:
-                # DCP owner filter leaves 3/4 entries as -1.
-                # Compact valid to front (stream-capturable, unlike torch.sort).
-                dcp_topk = page_table_1.shape[1] // self.dcp_size
-                page_table_1 = compact_page_table_dcp(page_table_1)
-                page_table_1 = page_table_1[:, :dcp_topk].contiguous()
             return self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -2321,15 +2285,7 @@ class DeepseekSparseAttnBackend(
                 page_size=1,
                 dcp_size=self.dcp_size,
                 dcp_rank=self.dcp_rank,
-                compact_dcp=self.dcp_enabled,
             )
-            if self.dcp_enabled:
-                # Slice to compacted width — valid entries are at front after compaction.
-                # This reduces tilelang kernel iterations by dcp_size (e.g. 4x for DCP4).
-                # .contiguous() is needed because the slice has stride[0]=2048 (original width)
-                # but tilelang expects stride[0]=dcp_topk. The allocation is captured in CUDA graph.
-                dcp_topk = page_table_1.shape[1] // self.dcp_size
-                page_table_1 = page_table_1[:, :dcp_topk].contiguous()
 
         if self.dsa_decode_impl == "flashmla_sparse":
             if q_rope is not None:
@@ -3370,6 +3326,11 @@ class DeepseekSparseAttnBackend(
         """
         Decide all attention prefill dispatch strategies for this batch.
         """
+        if self.dcp_enabled and is_dsa_enable_prefill_cp():
+            raise NotImplementedError(
+                "Prefill CP + DCP is not yet supported for DSA models on AMD. "
+                "Disable --enable-prefill-cp when using --dcp-size."
+            )
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
             is_in_breakable_cuda_graph,
         )
@@ -3403,7 +3364,6 @@ class DeepseekSparseAttnBackend(
                 and sum_seq_lens
                 <= forward_batch.get_max_chunk_capacity()  # Fits in chunk
                 and (not is_dsa_enable_prefill_cp())  # CP not enabled
-                and (not self.dcp_enabled)  # DCP extend uses the sparse MLA path
                 and (self.hisparse_coordinator is None)
             )
         else:
@@ -3453,16 +3413,12 @@ class DeepseekSparseAttnBackend(
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> DSAIndexerMetadata:
-        force_unfused = (
-            not self.use_fused_topk
-            or (
-                self.hisparse_coordinator is not None
-                and forward_batch.forward_mode.is_decode_or_idle()
-            )
-            or (
-                self.dcp_enabled
-                and not forward_batch.forward_mode.is_decode_or_idle()
-            )
+        force_unfused = not self.use_fused_topk or (
+            self.hisparse_coordinator is not None
+            and forward_batch.forward_mode.is_decode_or_idle()
+        ) or (
+            self.dcp_enabled
+            and not forward_batch.forward_mode.is_decode_or_idle()
         )
         return DSAIndexerMetadata(
             attn_metadata=self.forward_metadata,

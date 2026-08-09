@@ -1326,7 +1326,7 @@ def tilelang_sparse_fwd(
     dim = q.shape[2]
     tail_dim = dim - d_v
     topk = indices.shape[-1]
-    assert topk > 0 and topk % 64 == 0, "topk must be > 0 and divisible by 64, got " + str(topk)
+    assert topk == 2048
 
     if _is_hip:
         is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
@@ -1408,7 +1408,7 @@ def tilelang_sparse_fwd_with_lse(
     dim = q.shape[2]
     tail_dim = dim - d_v
     topk = indices.shape[-1]
-    assert topk > 0 and topk % 64 == 0, "topk must be > 0 and divisible by 64, got " + str(topk)
+    assert topk == 2048
     assert _is_hip, "tilelang_sparse_fwd_with_lse is only supported on HIP"
 
     is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)

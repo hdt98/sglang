@@ -347,12 +347,16 @@ class PyNcclCommunicator:
         )
         chunk_size = input_tensor.numel() // self.world_size
         dtype = ncclDataTypeEnum.from_torch(input_tensor.dtype)
-        # The local (self->self) chunk is a stream-ordered D2D copy rather than a
-        # grouped ncclSend/ncclRecv to self: grouped self-P2P deadlocks RCCL under
-        # high-concurrency CUDA-graph replay on ROCm (sgl-project/sglang#32831).
-        local_input = input_tensor.narrow(0, self.rank * chunk_size, chunk_size)
-        local_output = output_tensor.narrow(0, self.rank * chunk_size, chunk_size)
-        local_output.copy_(local_input)
+
+        # On ROCm/RCCL, ncclSend to self deadlocks under CUDA-graph replay.
+        # Copy the self-chunk with a stream-ordered D2D before the grouped
+        # send/recv loop, then skip rank == self.rank in the loop.
+        # (PR #32796)
+        self_chunk_size = chunk_size
+        self_send_buf = input_tensor.narrow(0, self.rank * self_chunk_size, self_chunk_size)
+        self_recv_buf = output_tensor.narrow(0, self.rank * self_chunk_size, self_chunk_size)
+        self_recv_buf.copy_(self_send_buf, non_blocking=True)
+
         self.nccl.ncclGroupStart()
         for i in range(self.world_size):
             if i == self.rank:
