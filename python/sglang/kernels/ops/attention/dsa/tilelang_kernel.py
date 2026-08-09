@@ -847,8 +847,8 @@ def sparse_mla_fwd_decode_partial(
 
     head_kv = heads // kv_group
     padded_H = max(tilelang.math.next_power_of_2(head_kv), 16)
-    REPLICATE_H = (head_kv // 64) if head_kv > 64 else 1
-    H_per_block = padded_H if REPLICATE_H == 1 else 64
+    REPLICATE_H = (head_kv // 16) if head_kv > 16 else 1
+    H_per_block = padded_H if REPLICATE_H == 1 else 16
     N_GROUPS = topk // (block_I * inner_iter)
     BI = block_I
     D = dim
@@ -870,7 +870,7 @@ def sparse_mla_fwd_decode_partial(
         Q: T.Tensor(q_shape, dtype),
         KV: T.Tensor(kv_shape, dtype),
         Indices: T.Tensor(indices_shape, indices_dtype),
-        Partial_O: T.Tensor(partial_o_shape, dtype),
+        Partial_O: T.Tensor(partial_o_shape, accum_dtype),
         Partial_Lse: T.Tensor(partial_lse_shape, accum_dtype),
     ):
         with T.Kernel(seq_len * REPLICATE_H, N_GROUPS, threads=threads) as (bx, by):
@@ -901,7 +901,7 @@ def sparse_mla_fwd_decode_partial(
             b_i, g_i = 0, 0
             s_i = bx if REPLICATE_H == 1 else (bx // REPLICATE_H)
             group_i = by
-            H0 = 0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64
+            H0 = 0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * H_per_block
             H1 = H0 + H_per_block
 
             T.copy(Q[b_i, s_i, H0:H1, :D], Q_buf)
@@ -1017,7 +1017,7 @@ def sparse_mla_fwd_decode_combine(
 
     @T.prim_func
     def main(
-        Partial_O: T.Tensor(partial_o_shape, dtype),
+        Partial_O: T.Tensor(partial_o_shape, accum_dtype),
         Partial_Lse: T.Tensor(partial_lse_shape, accum_dtype),
         Output: T.Tensor(o_shape, dtype),
     ):
@@ -1128,7 +1128,7 @@ def sparse_mla_fwd_decode_partial_fp8(
         q_fp8: T.Tensor(q_fp8_shape, fp8_dtype),
         kv_fp8: T.Tensor(kv_fp8_shape, fp8_dtype),
         indices: T.Tensor(idx_shape, T.int32),
-        partial_o: T.Tensor(partial_o_shape, dtype_bf16),
+        partial_o: T.Tensor(partial_o_shape, accum_dtype),
         partial_lse: T.Tensor(partial_lse_shape, accum_dtype),
     ):
         with T.Kernel(seq_len * head_blocks_per_seq, n_groups, threads=threads) as (
@@ -1326,7 +1326,7 @@ def tilelang_sparse_fwd(
     dim = q.shape[2]
     tail_dim = dim - d_v
     topk = indices.shape[-1]
-    assert topk == 2048
+    assert topk > 0 and topk % 64 == 0, "topk must be > 0 and divisible by 64, got " + str(topk)
 
     if _is_hip:
         is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
@@ -1385,6 +1385,77 @@ def tilelang_sparse_fwd(
         )
         out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
     return out
+
+
+def tilelang_sparse_fwd_with_lse(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+):
+    """Same as tilelang_sparse_fwd but also returns the final base-2 LSE.
+
+    Used by DCP to combine partial attention outputs across DCP ranks.
+    The LSE is computed from partial_lse_batched after the combine kernel runs:
+    lse = max(partial_lse) + log2(sum(exp2(partial_lse - max))) over N_GROUPS.
+
+    Returns:
+        (out, lse) where out is [seq_len, heads, d_v] and lse is [seq_len, heads]
+    """
+    assert q.dim() == 3 and kv.dim() == 3 and indices.dim() == 3
+    num_heads = q.shape[1]
+    dim = q.shape[2]
+    tail_dim = dim - d_v
+    topk = indices.shape[-1]
+    assert topk > 0 and topk % 64 == 0, "topk must be > 0 and divisible by 64, got " + str(topk)
+    assert _is_hip, "tilelang_sparse_fwd_with_lse is only supported on HIP"
+
+    is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    if is_fp8_kv:
+        if q.dtype != kv.dtype:
+            q = q.to(kv.dtype)
+        if _is_gfx95_supported:
+            block_I, threads, block_per_cu, cu = 64, 256, 2, 256
+        else:
+            block_I, threads, block_per_cu, cu = 64, 256, 1, 304
+        ni = topk // block_I
+        inner_iter = _pick_inner_iter(q.shape[0], ni, cu, block_per_cu)
+        kernel_partial = sparse_mla_fwd_decode_partial_fp8(
+            num_heads, d_v, tail_dim, topk,
+            sm_scale=sm_scale, block_I=block_I, inner_iter=inner_iter, threads=threads,
+        )
+    else:
+        if _is_gfx95_supported:
+            block_I, threads, block_per_cu, cu = 64, 256, 2, 256
+        else:
+            block_I, threads, block_per_cu, cu = 32, 128, 1, 304
+        ni = topk // block_I
+        inner_iter = _pick_inner_iter(q.shape[0], ni, cu, block_per_cu)
+        kernel_partial = sparse_mla_fwd_decode_partial(
+            num_heads, d_v, tail_dim, topk,
+            sm_scale=sm_scale, block_I=block_I, inner_iter=inner_iter, threads=threads,
+        )
+
+    partial_o_batched, partial_lse_batched = kernel_partial(
+        q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0)
+    )
+    n_groups = ni // inner_iter
+    kernel_combine = sparse_mla_fwd_decode_combine(
+        num_heads, d_v, n_groups * block_I,
+        head_per_block=4, block_I=block_I, threads=threads,
+    )
+    out = kernel_combine(partial_o_batched, partial_lse_batched)
+
+    # Compute final base-2 LSE from partial_lse_batched
+    # partial_lse_batched shape: [1, seq_len, N_GROUPS, heads]
+    lse = partial_lse_batched.squeeze(0)  # [seq_len, N_GROUPS, heads]
+    max_lse = lse.max(dim=1, keepdim=True).values  # [seq_len, 1, heads]
+    lse = max_lse.squeeze(1) + torch.log2(
+        torch.exp2(lse - max_lse).sum(dim=1)
+    )  # [seq_len, heads]
+
+    return out, lse
 
 
 @functools.cache

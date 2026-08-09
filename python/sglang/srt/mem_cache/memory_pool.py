@@ -3991,9 +3991,11 @@ class MLATokenToKVPool(KVCache):
                 else nullcontext()
             ):
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                # DCP: +1 dummy row for non-owned tokens in set_mla_kv_buffer
+                buf_rows = self.size + self.page_size
                 self.kv_buffer = [
                     torch.zeros(
-                        (self.size + self.page_size, 1, self.kv_cache_dim),
+                        (buf_rows, 1, self.kv_cache_dim),
                         dtype=self.store_dtype,
                         device=self.device,
                     )
@@ -4125,13 +4127,6 @@ class MLATokenToKVPool(KVCache):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
-        # loc is widened under DCP; the kernel divides by the world size itself.
-        maybe_detect_oob(
-            loc,
-            0,
-            (self.size + self.page_size) * get_parallel().attn_dcp_size,
-            "set_mla_kv_buffer (MLA)",
-        )
         layer_id = layer.layer_id
         self._write_mla_kv_buffer(
             self.kv_buffer[layer_id - self.start_layer],
@@ -4389,6 +4384,12 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self.index_head_dim = index_head_dim
         if index_buf_size is None:
             index_buf_size = size
+            parallel = get_parallel()
+            if parallel.dcp_enabled:
+                # The indexer K cache is not sharded under DCP: every rank
+                # keeps index_k for every token (global-slot addressed) so
+                # all ranks compute identical top-k.
+                index_buf_size = size * parallel.attn_dcp_size
         self.index_buf_size = index_buf_size
         # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128
