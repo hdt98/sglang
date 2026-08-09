@@ -415,7 +415,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             TokenspeedMLABackend,
             FlashInferAttnBackend,
         ]
-        if _is_cuda or _is_musa:
+        if _is_cuda or _is_musa or _is_hip:
             # DSA is CUDA-only; import lazily so non-CUDA builds don't pull in
             # deep_gemm and the rest of the sparse-attention stack at import time.
             from sglang.srt.layers.attention.dsa_backend import (
@@ -440,7 +440,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             tuple(graph_supported_backend_types),
         )
         supports_cuda_draft_extend_graph = (
-            _is_cuda or _is_musa
+            _is_cuda or _is_musa or _is_hip
         ) and graph_supported_backend
         # Capture extend
         # TODO: support draft extend cuda graph for more attention backends

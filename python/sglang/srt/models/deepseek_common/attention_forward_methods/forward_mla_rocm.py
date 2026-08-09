@@ -560,18 +560,28 @@ class DeepseekMLARocmForwardMixin:
                         q_pe=q_pe,
                     )
             elif forward_batch.forward_mode.is_extend():
-                # for extend, gather kv
-                all_gather_kv_cache_for_mla_extend(
-                    get_token_to_kv_pool(),
-                    self.attn_mqa,
-                    forward_batch.extend_prefix_lens_cpu,
-                    forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
-                    forward_batch.attn_dcp_metadata.dcp_extend_prefix_lens_sum,
-                    forward_batch.attn_dcp_metadata.dcp_kv_buffer,
-                    self.kv_lora_rank,
-                    k_nope,
-                    k_pe,
-                )
+                if self.use_dsa:
+                    # DSA extend mirrors the decode recipe: gather q across
+                    # the DCP group, attend the local KV shard with all
+                    # gathered heads, LSE-combine in forward_absorb_rocm_core.
+                    if not q_replicate_active:
+                        q_nope_out, q_pe = all_gather_q_for_mla_decode(
+                            q_nope_out=q_nope_out,
+                            q_pe=q_pe,
+                        )
+                else:
+                    # Dense MLA: gather KV
+                    all_gather_kv_cache_for_mla_extend(
+                        get_token_to_kv_pool(),
+                        self.attn_mqa,
+                        forward_batch.extend_prefix_lens_cpu,
+                        forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
+                        forward_batch.attn_dcp_metadata.dcp_extend_prefix_lens_sum,
+                        forward_batch.attn_dcp_metadata.dcp_kv_buffer,
+                        self.kv_lora_rank,
+                        k_nope,
+                        k_pe,
+                    )
             else:
                 logger.warning(
                     f"not supported forward_mode {forward_batch.forward_mode}"
@@ -602,6 +612,7 @@ class DeepseekMLARocmForwardMixin:
         llama_4_scaling,
     ):
         save_kv_cache = True
+        lse = None  # DCP: will be set if DCP decode/extend path is taken
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             if self._skip_rope_for_dsa_tilelang_fused() and self.rotary_emb is not None:
@@ -671,7 +682,12 @@ class DeepseekMLARocmForwardMixin:
                         "is_neox": self.rotary_emb.is_neox_style,
                         "llama_4_scaling": llama_4_scaling,
                     }
-                if is_dcp_mla_decode_phase(forward_batch):
+                dcp_dsa_extend = (
+                    get_parallel().dcp_enabled
+                    and self.use_dsa
+                    and forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+                )
+                if is_dcp_mla_decode_phase(forward_batch) or dcp_dsa_extend:
                     # set return_lse=True to correct attn_output
                     attn_output, lse = self.attn_mqa_for_dcp_decode(
                         q_nope_out,
@@ -732,7 +748,7 @@ class DeepseekMLARocmForwardMixin:
             )
 
         # correct attn_output with respect to lse from other ranks
-        if is_dcp_mla_decode_phase(forward_batch):
+        if is_dcp_mla_decode_phase(forward_batch) or dcp_dsa_extend:
             attn_output = attn_output.view(
                 -1,
                 self.num_local_heads * get_parallel().attn_dcp_size,
@@ -750,7 +766,7 @@ class DeepseekMLARocmForwardMixin:
                 is_lse_base_on_e = is_mla_dcp_lse_base_on_e(
                     self.current_attention_backend
                 )
-                if dcp_comm_backend in ("a2a", "fi_a2a"):
+                if dcp_comm_backend in ("a2a", "fi_a2a") and is_dcp_mla_decode_phase(forward_batch):
                     # A2A exchange of head partials + LSE, then local Triton combine.
                     attn_output = dcp_a2a_lse_reduce(
                         attn_output.contiguous(),
@@ -760,13 +776,21 @@ class DeepseekMLARocmForwardMixin:
                         comm_backend=dcp_comm_backend,
                     )
                 else:
-                    attn_output = cp_lse_ag_out_rs_mla(
-                        attn_output,
-                        lse,
-                        get_parallel().dcp_group,
-                        is_lse_base_on_e=is_lse_base_on_e,
+                    # Try Mori SHMEM P2P merge first (replaces NCCL all-gather + reduce-scatter)
+                    from sglang.srt.layers.dcp.mori_dcp import mori_lse_combine_if_available
+                    mori_result = mori_lse_combine_if_available(
+                        attn_output, lse, is_lse_base_on_e=is_lse_base_on_e
                     )
-                    attn_output = attn_output.transpose(0, 1)
+                    if mori_result is not None:
+                        attn_output = mori_result
+                    else:
+                        attn_output = cp_lse_ag_out_rs_mla(
+                            attn_output,
+                            lse,
+                            get_parallel().dcp_group,
+                            is_lse_base_on_e=is_lse_base_on_e,
+                        )
+                        attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         _kvb_v = None
