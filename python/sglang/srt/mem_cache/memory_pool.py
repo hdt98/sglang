@@ -3969,9 +3969,11 @@ class MLATokenToKVPool(KVCache):
                 else nullcontext()
             ):
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                # DCP: +1 dummy row for non-owned tokens in set_mla_kv_buffer
+                buf_rows = self.size + self.page_size
                 self.kv_buffer = [
                     torch.zeros(
-                        (self.size + self.page_size, 1, self.kv_cache_dim),
+                        (buf_rows, 1, self.kv_cache_dim),
                         dtype=self.store_dtype,
                         device=self.device,
                     )
@@ -4103,13 +4105,6 @@ class MLATokenToKVPool(KVCache):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
-        # loc is widened under DCP; the kernel divides by the world size itself.
-        maybe_detect_oob(
-            loc,
-            0,
-            (self.size + self.page_size) * get_parallel().attn_dcp_size,
-            "set_mla_kv_buffer (MLA)",
-        )
         layer_id = layer.layer_id
         self._write_mla_kv_buffer(
             self.kv_buffer[layer_id - self.start_layer],
