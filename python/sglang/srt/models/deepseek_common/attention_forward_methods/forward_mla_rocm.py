@@ -20,7 +20,12 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+from sglang.srt.layers.attention.dsa.utils import (
+    cp_dcp_gather_full_rows,
+    cp_dcp_slice_local_rows,
+    dsa_use_cp_dcp_prefill,
+    dsa_use_prefill_cp,
+)
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dcp import (
@@ -527,11 +532,21 @@ class DeepseekMLARocmForwardMixin:
 
         dsa_prefill_cp = dsa_use_prefill_cp(forward_batch)
         mla_prefill_cp = mla_use_prefill_cp(forward_batch)
+        # CP x DCP extend: token rows are CP-sharded but the KV pool is
+        # DCP-slot-sharded, so the CP full-KV materialization below would
+        # read a 1/dcp-complete pool. Instead restore full token rows for
+        # the DCP recipe and keep the current chunk's latent CP-local; the
+        # save path's DCP slot filter owns those writes.
+        cp_dcp_extend = dsa_use_cp_dcp_prefill(forward_batch)
         defer_kv_gather_until_after_rope = should_defer_dsa_cp_kv_gather(
             dsa_prefill_cp=dsa_prefill_cp,
             fuse_rope_for_trtllm_mla=fuse_rope_for_trtllm_mla,
         )
-        if dsa_prefill_cp and not defer_kv_gather_until_after_rope:
+        if (
+            dsa_prefill_cp
+            and not cp_dcp_extend
+            and not defer_kv_gather_until_after_rope
+        ):
             from sglang.srt.layers.attention.dsa_backend import materialize_full_kv_cp
 
             k_nope, k_pe = materialize_full_kv_cp(
@@ -565,6 +580,28 @@ class DeepseekMLARocmForwardMixin:
                     # the DCP group, attend the local KV shard with all
                     # gathered heads, LSE-combine in forward_absorb_rocm_core.
                     if not q_replicate_active:
+                        if cp_dcp_extend:
+                            # Undo the CP row shard first: all q/topk rows must
+                            # be identical across the DCP group (global token
+                            # order) before the head-widening gather below.
+                            total_real = sum(forward_batch.extend_seq_lens_cpu)
+                            q_nope_out = cp_dcp_gather_full_rows(
+                                q_nope_out,
+                                forward_batch.attn_cp_metadata,
+                                total_real,
+                            )
+                            q_pe = cp_dcp_gather_full_rows(
+                                q_pe,
+                                forward_batch.attn_cp_metadata,
+                                total_real,
+                            )
+                            if topk_indices is not None:
+                                topk_indices = cp_dcp_gather_full_rows(
+                                    topk_indices,
+                                    forward_batch.attn_cp_metadata,
+                                    total_real,
+                                    pad_value=-1,
+                                )
                         q_nope_out, q_pe = all_gather_q_for_mla_decode(
                             q_nope_out=q_nope_out,
                             q_pe=q_pe,
@@ -613,6 +650,7 @@ class DeepseekMLARocmForwardMixin:
     ):
         save_kv_cache = True
         lse = None  # DCP: will be set if DCP decode/extend path is taken
+        cp_dcp_extend = dsa_use_cp_dcp_prefill(forward_batch)
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             if self._skip_rope_for_dsa_tilelang_fused() and self.rotary_emb is not None:
@@ -807,6 +845,23 @@ class DeepseekMLARocmForwardMixin:
                         )
                         attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
+
+        if cp_dcp_extend:
+            # Undo the row restore done in prepare: downstream consumes this
+            # rank's CP-sharded rows (real tokens), zero-padded to the padded
+            # physical row count the CP machinery expects.
+            attn_output = cp_dcp_slice_local_rows(
+                attn_output, sum(forward_batch.extend_seq_lens_cpu)
+            )
+            cp_rank = get_parallel().attn_cp_rank
+            padded_local_rows = forward_batch.attn_cp_metadata.per_rank_actual_token[
+                cp_rank
+            ]
+            if attn_output.shape[0] < padded_local_rows:
+                pad_rows = attn_output.new_zeros(
+                    (padded_local_rows - attn_output.shape[0], *attn_output.shape[1:])
+                )
+                attn_output = torch.cat([attn_output, pad_rows], dim=0)
 
         _kvb_v = None
         if _SGLANG_EXPERIMENTAL_LORA_OPTI:

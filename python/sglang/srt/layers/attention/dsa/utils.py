@@ -332,6 +332,59 @@ def dsa_use_prefill_cp(forward_batch, dsa_enable_prefill_cp=None):
         return False
 
 
+def dsa_use_cp_dcp_prefill(forward_batch) -> bool:
+    """True when a DSA prefill-CP extend runs on a DCP-slot-sharded KV pool.
+
+    The DCP extend recipe expects identical token rows on every rank, while
+    prefill CP shards rows round-robin (token i lives on rank i % cp_size).
+    On this path the model restores full rows before the DCP recipe runs and
+    slices its own rows back out afterwards (see cp_dcp_gather_full_rows /
+    cp_dcp_slice_local_rows).
+    """
+    return get_parallel().dcp_enabled and dsa_use_prefill_cp(forward_batch)
+
+
+def cp_dcp_gather_full_rows(
+    x: torch.Tensor,
+    cp_metadata,
+    total_real_tokens: int,
+    pad_value: int = 0,
+) -> torch.Tensor:
+    """Undo the CP row shard of a [tokens, ...] tensor.
+
+    Each rank holds the rows of tokens cp_rank, cp_rank + cp_size, ... padded
+    to max_rank_len rows. Pad + all-gather rank-major, then unshuffle to
+    global sequential order: global row i comes from rank (i % cp_size),
+    shard row (i // cp_size). Returns the first total_real_tokens rows.
+    """
+    parallel = get_parallel()
+    cp_size = parallel.attn_cp_size
+    max_rank_len = cp_metadata.max_rank_len[0]
+    if x.shape[0] < max_rank_len:
+        pad_rows = x.new_full(
+            (max_rank_len - x.shape[0], *x.shape[1:]), pad_value
+        )
+        x = torch.cat([x, pad_rows], dim=0)
+    gathered = parallel.attn_cp_group.all_gather(x.contiguous(), dim=0)
+    token_idx = torch.arange(total_real_tokens, device=x.device)
+    src_idx = (token_idx % cp_size) * max_rank_len + token_idx // cp_size
+    return gathered[src_idx]
+
+
+def cp_dcp_slice_local_rows(
+    x: torch.Tensor, total_real_tokens: int
+) -> torch.Tensor:
+    """Inverse of cp_dcp_gather_full_rows: pick this rank's token rows back."""
+    parallel = get_parallel()
+    local_idx = torch.arange(
+        parallel.attn_cp_rank,
+        total_real_tokens,
+        parallel.attn_cp_size,
+        device=x.device,
+    )
+    return x[local_idx]
+
+
 def fp8_mqa_logits_ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
     return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
 
