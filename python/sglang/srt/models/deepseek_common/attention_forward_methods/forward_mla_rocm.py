@@ -567,6 +567,7 @@ class DeepseekMLARocmForwardMixin:
             )
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
+        cp_local_rows = None
         if get_parallel().dcp_enabled:
             if is_dcp_mla_decode_phase(forward_batch):
                 if not q_replicate_active:
@@ -584,23 +585,20 @@ class DeepseekMLARocmForwardMixin:
                             # Undo the CP row shard first: all q/topk rows must
                             # be identical across the DCP group (global token
                             # order) before the head-widening gather below.
+                            # Capture this rank's real (unpadded) CP-local row
+                            # count now; forward_core slices attn_output back to
+                            # exactly these rows after the DCP LSE combine.
                             total_real = sum(forward_batch.extend_seq_lens_cpu)
+                            cp_local_rows = q_nope_out.shape[0]
                             q_nope_out = cp_dcp_gather_full_rows(
-                                q_nope_out,
-                                forward_batch.attn_cp_metadata,
-                                total_real,
+                                q_nope_out, total_real
                             )
                             q_pe = cp_dcp_gather_full_rows(
-                                q_pe,
-                                forward_batch.attn_cp_metadata,
-                                total_real,
+                                q_pe, total_real
                             )
                             if topk_indices is not None:
                                 topk_indices = cp_dcp_gather_full_rows(
-                                    topk_indices,
-                                    forward_batch.attn_cp_metadata,
-                                    total_real,
-                                    pad_value=-1,
+                                    topk_indices, total_real
                                 )
                         q_nope_out, q_pe = all_gather_q_for_mla_decode(
                             q_nope_out=q_nope_out,
@@ -634,6 +632,7 @@ class DeepseekMLARocmForwardMixin:
             positions,
             topk_indices,
             llama_4_scaling,
+            cp_local_rows,
         )
 
     def forward_absorb_rocm_core(
@@ -647,6 +646,7 @@ class DeepseekMLARocmForwardMixin:
         positions,
         topk_indices,
         llama_4_scaling,
+        cp_local_rows,
     ):
         save_kv_cache = True
         lse = None  # DCP: will be set if DCP decode/extend path is taken
@@ -849,13 +849,14 @@ class DeepseekMLARocmForwardMixin:
         if cp_dcp_extend:
             # Undo the row restore done in prepare: downstream consumes this
             # rank's CP-sharded rows (real tokens), zero-padded to the padded
-            # physical row count the CP machinery expects.
+            # physical row count the CP machinery expects. cp_local_rows was
+            # captured in forward_prepare as this rank's pre-restore q rows,
+            # which is exactly its real (unpadded) CP-local token count.
             attn_output = cp_dcp_slice_local_rows(
                 attn_output, sum(forward_batch.extend_seq_lens_cpu)
-            )
-            cp_rank = get_parallel().attn_cp_rank
+            )[:cp_local_rows]
             padded_local_rows = forward_batch.attn_cp_metadata.per_rank_actual_token[
-                cp_rank
+                get_parallel().attn_cp_rank
             ]
             if attn_output.shape[0] < padded_local_rows:
                 pad_rows = attn_output.new_zeros(

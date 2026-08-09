@@ -333,41 +333,53 @@ def dsa_use_prefill_cp(forward_batch, dsa_enable_prefill_cp=None):
 
 
 def dsa_use_cp_dcp_prefill(forward_batch) -> bool:
-    """True when a DSA prefill-CP extend runs on a DCP-slot-sharded KV pool.
+    """True when a DSA prefill-CP extend runs on a DCP-slot-sharded KV pool
+    with a FLAT interleaved row shard (token i lives on rank i % cp_size).
 
     The DCP extend recipe expects identical token rows on every rank, while
-    prefill CP shards rows round-robin (token i lives on rank i % cp_size).
-    On this path the model restores full rows before the DCP recipe runs and
-    slices its own rows back out afterwards (see cp_dcp_gather_full_rows /
-    cp_dcp_slice_local_rows).
+    prefill CP shards rows round-robin. On this path the model restores full
+    rows before the DCP recipe runs and slices its own rows back out
+    afterwards (see cp_dcp_gather_full_rows / cp_dcp_slice_local_rows).
+
+    Only flat interleave layouts are supported: CP-v2 INTERLEAVE or v1
+    round-robin-split (after batch-level cp-align padding every rank holds
+    exactly batch/cp rows). Zigzag/in-seq-split layouts have different row
+    semantics and must not silently take this path.
     """
-    return get_parallel().dcp_enabled and dsa_use_prefill_cp(forward_batch)
+    parallel = get_parallel()
+    if not (parallel.dcp_enabled and dsa_use_prefill_cp(forward_batch)):
+        return False
+    from sglang.srt.layers.cp.utils import get_cp_strategy, is_cp_v2_active
+
+    if is_cp_v2_active(forward_batch) and get_cp_strategy() is not None:
+        from sglang.srt.layers.cp.base import ContextParallelStrategyKind
+
+        if get_cp_strategy().kind == ContextParallelStrategyKind.INTERLEAVE:
+            return True
+    elif is_dsa_prefill_cp_round_robin_split():
+        return True
+    raise NotImplementedError("DSA prefill CP + DCP supports only the flat interleave layout (--cp-strategy interleave or round-robin-split); this CP layout shards rows differently and would compute garbage.")
 
 
 def cp_dcp_gather_full_rows(
     x: torch.Tensor,
-    cp_metadata,
     total_real_tokens: int,
-    pad_value: int = 0,
 ) -> torch.Tensor:
     """Undo the CP row shard of a [tokens, ...] tensor.
 
-    Each rank holds the rows of tokens cp_rank, cp_rank + cp_size, ... padded
-    to max_rank_len rows. Pad + all-gather rank-major, then unshuffle to
-    global sequential order: global row i comes from rank (i % cp_size),
-    shard row (i // cp_size). Returns the first total_real_tokens rows.
+    Each rank holds exactly local_rows = x.shape[0] rows (batch-level cp-align
+    padding guarantees all ranks hold the same count, required by the
+    collective). Rank r holds global tokens r, r + cp_size, ...; rows past
+    total_real_tokens are batch padding rows. After the rank-major all-gather,
+    global row i is recovered from rank (i % cp_size), shard row (i // cp_size).
+    Returns the first total_real_tokens rows in global token order.
     """
     parallel = get_parallel()
     cp_size = parallel.attn_cp_size
-    max_rank_len = cp_metadata.max_rank_len[0]
-    if x.shape[0] < max_rank_len:
-        pad_rows = x.new_full(
-            (max_rank_len - x.shape[0], *x.shape[1:]), pad_value
-        )
-        x = torch.cat([x, pad_rows], dim=0)
+    local_rows = x.shape[0]
     gathered = parallel.attn_cp_group.all_gather(x.contiguous(), dim=0)
     token_idx = torch.arange(total_real_tokens, device=x.device)
-    src_idx = (token_idx % cp_size) * max_rank_len + token_idx // cp_size
+    src_idx = (token_idx % cp_size) * local_rows + token_idx // cp_size
     return gathered[src_idx]
 
 
