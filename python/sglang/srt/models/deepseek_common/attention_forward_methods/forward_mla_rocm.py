@@ -864,6 +864,9 @@ class DeepseekMLARocmForwardMixin:
                 # LSE-weighted KV union. cp_lse_ag_mla is the in-tree primitive
                 # (all-gather + dcp_lse_combine_triton, no reduce-scatter);
                 # fall back to a local implementation if it import/runs fail.
+                is_lse_base_on_e = is_mla_dcp_lse_base_on_e(
+                    self.current_attention_backend
+                )
                 dcp_group = get_parallel().dcp_group
                 lse_local = lse.view(
                     attn_output.shape[0],
