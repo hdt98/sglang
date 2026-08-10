@@ -867,6 +867,22 @@ class DeepseekMLARocmForwardMixin:
                 is_lse_base_on_e = is_mla_dcp_lse_base_on_e(
                     self.current_attention_backend
                 )
+                if cphc_dump_enabled():
+                    cphc_debug_dump(
+                        "cp_dcp_combine_pre",
+                        {
+                            "out_shape": list(attn_output.shape),
+                            "out4_first": [
+                                float(x)
+                                for x in attn_output.flatten()[:4].float().tolist()
+                            ],
+                            "lse_native_shape": list(lse.shape),
+                            "lse_native_minmax": [
+                                float(lse.min().item()),
+                                float(lse.max().item()),
+                            ],
+                        },
+                    )
                 dcp_group = get_parallel().dcp_group
                 lse_local = lse.view(
                     attn_output.shape[0],
@@ -904,6 +920,17 @@ class DeepseekMLARocmForwardMixin:
                         return_lse=False,
                     )
                     attn_output = combined.to(attn_output.dtype)
+                if cphc_dump_enabled():
+                    cphc_debug_dump(
+                        "cp_dcp_combine_post",
+                        {
+                            "combined_shape": list(attn_output.shape),
+                            "combined4_first": [
+                                float(x)
+                                for x in attn_output.flatten()[:4].float().tolist()
+                            ],
+                        },
+                    )
             else:
                 dcp_comm_backend = get_parallel().dcp_comm_backend
                 is_lse_base_on_e = is_mla_dcp_lse_base_on_e(
