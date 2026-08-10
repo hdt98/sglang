@@ -279,6 +279,32 @@ def _cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
     return _compiled_cat([qk_nope, qk_rope], dim=dim)
 
 
+def _cp_dcp_local_cache_loc(forward_batch, k_rows: int) -> torch.Tensor:
+    # CP x DCP extend: the KV rows in k stay CP-local (interleave shard with
+    # end-of-shard pad rows), while forward_batch.out_cache_loc is still the
+    # full batch. set_mla_kv_buffer iterates n_loc = loc.numel() rows and
+    # reads k[pid], so loc must follow the exact k row layout: this rank's
+    # interleaved slice of the real slots, end-padded to k_rows. Pad entries
+    # get a sentinel that fails the kernel's DCP mod filter on this rank, so
+    # pad rows pass through without being stored.
+    total_real = sum(forward_batch.extend_seq_lens_cpu)
+    loc = forward_batch.out_cache_loc[:total_real]
+    strategy = get_cp_strategy() if is_cp_v2_active(forward_batch) else None
+    if strategy is not None:
+        loc = strategy.shard_local_tokens(loc)
+    else:
+        parallel = get_parallel()
+        loc = loc[parallel.attn_cp_rank :: parallel.attn_cp_size]
+    if loc.shape[0] < k_rows:
+        parallel = get_parallel()
+        sentinel = (parallel.attn_dcp_rank + 1) % parallel.attn_dcp_size
+        pad = loc.new_full((k_rows - loc.shape[0],), sentinel)
+        loc = torch.cat([loc, pad], dim=0)
+    elif loc.shape[0] > k_rows:
+        loc = loc[:k_rows]
+    return loc.contiguous()
+
+
 _DSA_IMPL_T: TypeAlias = Literal[
     "flashmla_sparse",
     "flashmla_sparse_q8",
@@ -1985,6 +2011,11 @@ class DeepseekSparseAttnBackend(
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
+                if metadata.dsa_cp_dcp_full_page_table is not None:
+                    # CP x DCP extend: k rows are CP-local (see
+                    # _cp_dcp_local_cache_loc); the full-batch out_cache_loc
+                    # would over-iterate k and scatter into wrong slots.
+                    cache_loc = _cp_dcp_local_cache_loc(forward_batch, k.shape[0])
                 self.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
                     layer,
                     cache_loc,
