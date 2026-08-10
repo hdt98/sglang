@@ -535,20 +535,25 @@ class DeepseekMLARocmForwardMixin:
 
         dsa_prefill_cp = dsa_use_prefill_cp(forward_batch)
         mla_prefill_cp = mla_use_prefill_cp(forward_batch)
-        # CP x DCP extend: token rows are CP-sharded but the KV pool is
-        # DCP-slot-sharded, so the CP full-KV materialization below would
-        # read a 1/dcp-complete pool. Instead restore full token rows for
-        # the DCP recipe and keep the current chunk's latent CP-local; the
-        # save path's DCP slot filter owns those writes.
+        # CP x DCP extend: the KV rows must be gathered full here too. The
+        # KV pool is DCP-slot-sharded (token KV lives on rank slot % dcp at
+        # row slot // dcp) and the save kernel only stores this rank's owned
+        # slots, while CP shards compute by batch position (token p on rank
+        # p % cp). Position sharding has no relation to slot ownership, so a
+        # CP-local save silently drops the majority of tokens; the prefill
+        # attention then reads never-written pool rows (GSM8K 0.000 class of
+        # corruption). Gather the latents identically to the CP-only path.
         cp_dcp_extend = dsa_use_cp_dcp_prefill(forward_batch)
         defer_kv_gather_until_after_rope = should_defer_dsa_cp_kv_gather(
             dsa_prefill_cp=dsa_prefill_cp,
             fuse_rope_for_trtllm_mla=fuse_rope_for_trtllm_mla,
         )
-        if (
-            dsa_prefill_cp
-            and not cp_dcp_extend
-            and not defer_kv_gather_until_after_rope
+        # gfx95 note: the fused rope+cache path saves through its kernel with
+        # CP-local positions, so CP x DCP keeps the pre-existing (CP-local)
+        # behavior there; the full-KV restore applies to the non-fused path
+        # (e.g. gfx942 tilelang) only.
+        if dsa_prefill_cp and not defer_kv_gather_until_after_rope and not (
+            cp_dcp_extend and self._skip_rope_for_dsa_tilelang_fused()
         ):
             from sglang.srt.layers.attention.dsa_backend import materialize_full_kv_cp
 
@@ -568,6 +573,19 @@ class DeepseekMLARocmForwardMixin:
                 k_nope,
                 k_pe,
             )
+
+        if (
+            cp_dcp_extend
+            and dsa_prefill_cp
+            and not self._skip_rope_for_dsa_tilelang_fused()
+        ):
+            # The gather above restores cp-aligned rows including the trailing
+            # batch-pad tokens; slice to exactly the real tokens so k rows
+            # match the full-row gathers of q/topk below
+            # (cp_dcp_gather_full_rows) and the full-batch out_cache_loc.
+            total_real_kv_rows = int(sum(forward_batch.extend_seq_lens_cpu))
+            k_nope = k_nope[:total_real_kv_rows]
+            k_pe = k_pe[:total_real_kv_rows]
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
         cp_local_rows = None

@@ -282,32 +282,6 @@ def _cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
     return _compiled_cat([qk_nope, qk_rope], dim=dim)
 
 
-def _cp_dcp_local_cache_loc(forward_batch, k_rows: int) -> torch.Tensor:
-    # CP x DCP extend: the KV rows in k stay CP-local (interleave shard with
-    # end-of-shard pad rows), while forward_batch.out_cache_loc is still the
-    # full batch. set_mla_kv_buffer iterates n_loc = loc.numel() rows and
-    # reads k[pid], so loc must follow the exact k row layout: this rank's
-    # interleaved slice of the real slots, end-padded to k_rows. Pad entries
-    # get a sentinel that fails the kernel's DCP mod filter on this rank, so
-    # pad rows pass through without being stored.
-    total_real = sum(forward_batch.extend_seq_lens_cpu)
-    loc = forward_batch.out_cache_loc[:total_real]
-    strategy = get_cp_strategy() if is_cp_v2_active(forward_batch) else None
-    if strategy is not None:
-        loc = strategy.shard_local_tokens(loc)
-    else:
-        parallel = get_parallel()
-        loc = loc[parallel.attn_cp_rank :: parallel.attn_cp_size]
-    if loc.shape[0] < k_rows:
-        parallel = get_parallel()
-        sentinel = (parallel.attn_dcp_rank + 1) % parallel.attn_dcp_size
-        pad = loc.new_full((k_rows - loc.shape[0],), sentinel)
-        loc = torch.cat([loc, pad], dim=0)
-    elif loc.shape[0] > k_rows:
-        loc = loc[:k_rows]
-    return loc.contiguous()
-
-
 _DSA_IMPL_T: TypeAlias = Literal[
     "flashmla_sparse",
     "flashmla_sparse_q8",
@@ -2059,19 +2033,29 @@ class DeepseekSparseAttnBackend(
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
+                save_k, save_k_rope = k, k_rope
                 if metadata.dsa_cp_dcp_full_page_table is not None:
-                    # CP x DCP extend: k rows are CP-local (see
-                    # _cp_dcp_local_cache_loc); the full-batch out_cache_loc
-                    # would over-iterate k and scatter into wrong slots.
-                    cache_loc = _cp_dcp_local_cache_loc(forward_batch, k.shape[0])
+                    # CP x DCP extend: k/k_rope rows were gathered to the full
+                    # batch in the model forward (CP x DCP takes the same
+                    # materialize_full_kv_cp branch as CP-only). Save with the
+                    # full-batch out_cache_loc; the write kernel's DCP owner
+                    # filter (loc % dcp == rank, stored at loc // dcp) places
+                    # each token's KV on its slot-owner rank, so every token
+                    # is written exactly once cluster-wide. A CP-local save
+                    # cannot work here: CP position sharding (token p lives on
+                    # rank p % cp) has no relation to DCP slot ownership
+                    # (slot % dcp), so most rows would silently never land.
+                    total_real = int(sum(forward_batch.extend_seq_lens_cpu))
+                    cache_loc = cache_loc[:total_real]
+                    save_k = k[:total_real]
+                    save_k_rope = k_rope[:total_real]
                     if cphc_dump_enabled():
                         cphc_debug_dump(
                             "extend_save",
                             {
-                                "total_real": int(
-                                    sum(forward_batch.extend_seq_lens_cpu)
-                                ),
-                                "k_rows": int(k.shape[0]),
+                                "total_real": total_real,
+                                "k_rows_in": int(k.shape[0]),
+                                "cache_loc_rows": int(cache_loc.shape[0]),
                                 "cache_loc": cphc_cap(cache_loc, 192),
                                 "extend_seq_lens_cpu": [
                                     int(x) for x in forward_batch.extend_seq_lens_cpu
@@ -2084,8 +2068,8 @@ class DeepseekSparseAttnBackend(
                 self.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
                     layer,
                     cache_loc,
-                    k,
-                    k_rope,
+                    save_k,
+                    save_k_rope,
                 )
 
         # Use MHA kernel if in MHA_ONE_SHOT mode
