@@ -23,15 +23,31 @@ _state: Optional[dict] = None
 _workspace_slot_counter: int = 0
 _v2_failed: bool = False
 
-def is_mori_dcp_available() -> bool:
+def _env_off(name: str) -> bool:
     import os
-    if os.environ.get("SGLANG_DCP_DISABLE_MORI", "0") == "1":
+
+    return os.environ.get(name, "0") == "1"
+
+
+def is_mori_dcp_available() -> bool:
+    if _env_off("SGLANG_DCP_DISABLE_MORI"):
         return False
     try:
         import mori  # noqa: F401
         return True
     except ImportError:
         return False
+
+
+# Independent debug toggles (default on) for the honest 2x2 A/B:
+# Q transport v1 (SGLANG_DCP_DISABLE_MORI_Q) and output/LSE merge v2
+# (SGLANG_DCP_DISABLE_MORI_OUT); SGLANG_DCP_DISABLE_MORI disables both.
+def is_mori_q_available() -> bool:
+    return not _env_off("SGLANG_DCP_DISABLE_MORI_Q") and is_mori_dcp_available()
+
+
+def is_mori_output_available() -> bool:
+    return not _env_off("SGLANG_DCP_DISABLE_MORI_OUT") and is_mori_dcp_available()
 
 
 def init_mori_dcp(

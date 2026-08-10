@@ -281,10 +281,14 @@ def all_gather_q_for_mla_decode(
     q_pe: torch.Tensor,
 ):
     # Try Mori SHMEM P2P first (decode only, small batch)
-    from sglang.srt.layers.dcp.mori_dcp import mori_all_gather_q_if_available
-    mori_result = mori_all_gather_q_if_available(q_nope_out, q_pe)
-    if mori_result is not None:
-        return mori_result
+    from sglang.srt.layers.dcp.mori_dcp import (
+        is_mori_q_available,
+        mori_all_gather_q_if_available,
+    )
+    if is_mori_q_available():
+        mori_result = mori_all_gather_q_if_available(q_nope_out, q_pe)
+        if mori_result is not None:
+            return mori_result
 
     group = get_parallel().dcp_group
     with use_symmetric_memory(group):
@@ -506,8 +510,8 @@ def dcp_a2a_lse_reduce(
     # Try Mori SHMEM v2 P2P first (decode only, small batch).  Route
     # through mori_lse_combine_if_available for dtype casting,
     # contiguity, try/except fallback, and slot cycling.
-    from sglang.srt.layers.dcp.mori_dcp import is_mori_dcp_available, mori_lse_combine_if_available
-    if is_mori_dcp_available():
+    from sglang.srt.layers.dcp.mori_dcp import is_mori_output_available, mori_lse_combine_if_available
+    if is_mori_output_available():
         mori_result = mori_lse_combine_if_available(
             cp_attn_out, cp_attn_lse, is_lse_base_on_e=is_lse_base_on_e
         )
@@ -522,8 +526,6 @@ def dcp_a2a_lse_reduce(
     B, H, D = cp_attn_out.shape
     assert H % N == 0, f"num_heads ({H}) must be divisible by dcp_size ({N})"
     H_per_rank = H // N
-    # Cast to FP32 to reduce per-layer rounding error in LSE combine (fixes MTP AL)
-    cp_attn_out = cp_attn_out.to(torch.float32)
     out_dtype = cp_attn_out.dtype
     lpd = _lse_pack_dim(out_dtype)  # 2 for bf16/fp16
 
@@ -619,9 +621,6 @@ def _dcp_fi_a2a_lse_reduce(
     B, H, D = cp_attn_out.shape
     assert H % N == 0, f"num_heads ({H}) must be divisible by dcp_size ({N})"
     H_per_rank = H // N
-    # Cast to FP32 to reduce per-layer rounding error in LSE combine (fixes MTP AL)
-    cp_attn_out = cp_attn_out.to(torch.float32)
-
     # FlashInfer sends partial_o[..., peer, :] to `peer`; head h -> peer h//H_per_rank,
     # so the peer axis is the outer head split: [B,N,H_pr,D] -> [B,H_pr,N,D].
     partial_o = cp_attn_out.view(B, N, H_per_rank, D).permute(0, 2, 1, 3).contiguous()
