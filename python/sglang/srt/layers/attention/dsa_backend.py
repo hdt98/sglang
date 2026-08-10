@@ -87,6 +87,13 @@ from sglang.srt.utils import (
 _DSA_TRITON_PREFILL = get_bool_env_var("SGLANG_DSA_TRITON_PREFILL")
 _IS_GFX95 = is_gfx95_supported()
 
+# Opt-in (default off): keep the full-width compacted DCP page table instead of
+# slicing it to topk/dcp_size. Equal-truncation drops locally-owned top-k entries
+# when ownership is uneven (the common case); PR #31821 keeps all locally-owned
+# entries (sorted with per-row dcp_local_counts). The tilelang kernel natively
+# ignores -1 entries. Enable with SGLANG_DCP_ENABLE_FULL_TOPK=1.
+_DCP_ENABLE_FULL_TOPK = get_bool_env_var("SGLANG_DCP_ENABLE_FULL_TOPK")
+
 if is_cuda():
     import deep_gemm
 
@@ -2086,9 +2093,10 @@ class DeepseekSparseAttnBackend(
             if self.dcp_enabled:
                 # DCP owner filter leaves 3/4 entries as -1.
                 # Compact valid to front (stream-capturable, unlike torch.sort).
-                dcp_topk = page_table_1.shape[1] // self.dcp_size
                 page_table_1 = compact_page_table_dcp(page_table_1)
-                page_table_1 = page_table_1[:, :dcp_topk].contiguous()
+                if not _DCP_ENABLE_FULL_TOPK:
+                    dcp_topk = page_table_1.shape[1] // self.dcp_size
+                    page_table_1 = page_table_1[:, :dcp_topk].contiguous()
             return self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -2328,8 +2336,9 @@ class DeepseekSparseAttnBackend(
                 # This reduces tilelang kernel iterations by dcp_size (e.g. 4x for DCP4).
                 # .contiguous() is needed because the slice has stride[0]=2048 (original width)
                 # but tilelang expects stride[0]=dcp_topk. The allocation is captured in CUDA graph.
-                dcp_topk = page_table_1.shape[1] // self.dcp_size
-                page_table_1 = page_table_1[:, :dcp_topk].contiguous()
+                if not _DCP_ENABLE_FULL_TOPK:
+                    dcp_topk = page_table_1.shape[1] // self.dcp_size
+                    page_table_1 = page_table_1[:, :dcp_topk].contiguous()
 
         if self.dsa_decode_impl == "flashmla_sparse":
             if q_rope is not None:
