@@ -335,36 +335,87 @@ def sgl_build_tree_kernel_triton(
     )
 
 
+# Verify renormalizes a (bs * num_draft_tokens, vocab) probability tensor. A
+# whole-tensor sort materializes several tensors of that size at once -- the fp32
+# sorted values, the *int64* sort indices, the cumsum, and the zeros target --
+# measured at 11.1x the input tensor in peak transient memory on gfx950
+# (616 MB for 96 rows x 151552 vocab). At long context the KV pool has already
+# claimed nearly all VRAM, and that transient aborts the server with
+# HSA_STATUS_ERROR_OUT_OF_RESOURCES.
+#
+# Rows are independent, so chunking over them is exact and bounds the peak.
+_SPEC_RENORM_ROW_CHUNK = 8
+
+
+def _renorm_by_row_chunks(probs, params, renorm_chunk):
+    """Apply ``renorm_chunk(probs_chunk, params_chunk)`` over row blocks."""
+    if probs.shape[0] <= _SPEC_RENORM_ROW_CHUNK:
+        return renorm_chunk(probs, params)
+    out = torch.empty_like(probs)
+    for start in range(0, probs.shape[0], _SPEC_RENORM_ROW_CHUNK):
+        stop = min(start + _SPEC_RENORM_ROW_CHUNK, probs.shape[0])
+        out[start:stop] = renorm_chunk(probs[start:stop], params[start:stop])
+    return out
+
+
 def _top_k_normalize_probs_torch(
     probs: torch.Tensor,
     top_ks: torch.Tensor,
 ):
     """Rank-based top-k renormalization with native torch ops.
 
-    Mirrors the top-k cutoff in top_k_top_p_min_p_sampling_from_probs_torch so
+    Mirrors the top-k cutoff in `top_k_top_p_min_p_sampling_from_probs_torch` so
     the speculative verify path matches the non-speculative sampler.
     """
-    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
-    probs_sort[
-        torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
-        >= top_ks.view(-1, 1)
-    ] = 0.0
-    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
-    return torch.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
+
+    def chunk(p, ks):
+        probs_sort, probs_idx = p.sort(dim=-1, descending=True)
+        # masked_fill_ rather than boolean index assignment: the latter goes
+        # through nonzero() and allocates an int64 index per filtered entry,
+        # which is most of the vocab.
+        probs_sort.masked_fill_(
+            torch.arange(0, p.shape[-1], device=p.device).view(1, -1)
+            >= ks.view(-1, 1),
+            0.0,
+        )
+        probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+        return torch.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
+
+    return _renorm_by_row_chunks(probs, top_ks, chunk)
+
+
+def _top_p_normalize_probs_torch(
+    probs: torch.Tensor,
+    top_ps: torch.Tensor,
+):
+    """Row-chunked equivalent of `sampler.top_p_normalize_probs_torch`.
+
+    Same math and same results (verified bit-identical); only the peak memory
+    differs. The non-speculative sampler keeps using the unchunked version --
+    it renormalizes one row per request, not draft_token_num rows.
+    """
+
+    def chunk(p, ps):
+        probs_sort, probs_idx = p.sort(dim=-1, descending=True)
+        probs_sum = torch.cumsum(probs_sort, dim=-1)
+        probs_sum.sub_(probs_sort)  # exclusive prefix, in place
+        probs_sort.masked_fill_(probs_sum > ps.view(-1, 1), 0.0)
+        probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+        return torch.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
+
+    return _renorm_by_row_chunks(probs, top_ps, chunk)
 
 
 def _get_spec_renorm_fns():
     """Return (top_k_renorm, top_p_renorm) for the current platform.
 
-    flashinfer's renorm.cu is not part of the ROCm sgl-kernel build (see
-    sgl-kernel/setup_rocm.py), so top_k/top_p_renorm_prob have no registered
+    flashinfer's `renorm.cu` is not part of the ROCm sgl-kernel build (see
+    `sgl-kernel/setup_rocm.py`), so `top_k/top_p_renorm_prob` have no registered
     torch op there. Fall back to the torch implementations that the
     non-speculative sampler already uses on ROCm.
     """
     if _is_hip:
-        from sglang.srt.layers.sampler import top_p_normalize_probs_torch
-
-        return _top_k_normalize_probs_torch, top_p_normalize_probs_torch
+        return _top_k_normalize_probs_torch, _top_p_normalize_probs_torch
 
     from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
 
@@ -777,8 +828,11 @@ def eagle_sample(
 
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
 
-        # tree_speculative_sampling_target_only is CUDA-only; on ROCm the only
-        # distribution-preserving verifier is the Triton chain kernel.
+        # `speculative_sampling.cu` (tree_speculative_sampling_target_only) is not
+        # part of the ROCm sgl-kernel build, so the only distribution-preserving
+        # verifier available there is the Triton chain kernel. Fail loudly instead
+        # of silently degrading non-greedy requests to greedy verification, which
+        # breaks the losslessness guarantee of speculative decoding.
         if _is_hip and not use_rejection_sampling:
             raise NotImplementedError(
                 "Speculative decoding with non-greedy sampling (temperature/top_p/"

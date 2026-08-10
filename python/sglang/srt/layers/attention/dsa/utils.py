@@ -134,6 +134,58 @@ def is_dsa_prefill_cp_round_robin_split():
     )
 
 
+def dsa_use_cp_dcp_prefill(forward_batch) -> bool:
+    """True when prefill-CP is sharding rows AND DCP is sharding the KV pool.
+
+    This is the composition that needs the full-row restore: CP splits the
+    query rows across ranks while DCP splits the KV pool across a *different*
+    owner rule (global slot % dcp == rank). Without restoring full query rows
+    before the DCP head-gather + KV-shard attention, the per-rank partials
+    cannot be LSE-combined correctly.
+    """
+    return bool(
+        get_parallel().attn_cp_size > 1
+        and get_parallel().dcp_enabled
+        and dsa_use_prefill_cp(forward_batch)
+    )
+
+
+def cp_dcp_gather_full_rows(
+    x: torch.Tensor,
+    total_real_tokens: int,
+) -> torch.Tensor:
+    """Undo the CP row shard of a [tokens, ...] tensor.
+
+    Each rank holds exactly local_rows = x.shape[0] rows (batch-level cp-align
+    padding guarantees all ranks hold the same count, required by the
+    collective). Rank r holds global tokens r, r + cp_size, ...; rows past
+    total_real_tokens are batch padding rows. After the rank-major all-gather,
+    global row i is recovered from rank (i % cp_size), shard row (i // cp_size).
+    Returns the first total_real_tokens rows in global token order.
+    """
+    parallel = get_parallel()
+    cp_size = parallel.attn_cp_size
+    local_rows = x.shape[0]
+    gathered = parallel.attn_cp_group.all_gather(x.contiguous(), dim=0)
+    token_idx = torch.arange(total_real_tokens, device=x.device)
+    src_idx = (token_idx % cp_size) * local_rows + token_idx // cp_size
+    return gathered[src_idx]
+
+
+def cp_dcp_slice_local_rows(
+    x: torch.Tensor, total_real_tokens: int
+) -> torch.Tensor:
+    """Inverse of cp_dcp_gather_full_rows: pick this rank's token rows back."""
+    parallel = get_parallel()
+    local_idx = torch.arange(
+        parallel.attn_cp_rank,
+        total_real_tokens,
+        parallel.attn_cp_size,
+        device=x.device,
+    )
+    return x[local_idx]
+
+
 # Structural surface where the graph DSA split-op dispatch (DSA indexer) and the
 # MLA BMM-into-attention fusion apply: a non-speculative extend (prefill) running
 # inside a piecewise/breakable CUDA graph. Both fusions are now on by default on

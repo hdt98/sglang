@@ -241,6 +241,13 @@ class DSAMetadata:
     # shape: (seq_lens_sum,)
     topk_indices_offset: Optional[torch.Tensor] = None
 
+    # CP x DCP extend (B-prime): unsharded copies captured before the CP
+    # round-robin split below. Set only when dcp_enabled and the CP split is
+    # active; the full-row path (dsa.utils.dsa_use_cp_dcp_prefill) drives the
+    # topk->page transform from these instead of the CP-sharded fields.
+    dsa_cp_dcp_full_page_table: Optional[torch.Tensor] = None
+    dsa_cp_dcp_full_extend_seq_lens_list: Optional[List[int]] = None
+
     # k_start and k_end in kv cache for each token.
     indexer_k_start_end: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
     # seq lens for each batch.
@@ -843,6 +850,8 @@ class DeepseekSparseAttnBackend(
 
         page_table_1_flattened = None
         topk_indices_offset = None
+        dsa_cp_dcp_full_page_table = None
+        dsa_cp_dcp_full_extend_seq_lens_list = None
 
         # Centralized dispatch: decide all strategies for this batch
         self.set_dsa_prefill_impl(forward_batch)
@@ -968,6 +977,12 @@ class DeepseekSparseAttnBackend(
             )
 
             if can_dsa_prefill_cp_round_robin_split(forward_batch):
+                if self.dcp_enabled:
+                    # CP x DCP extend: attention restores full token rows, so
+                    # the topk->page transform needs the unsharded batch even
+                    # though the indexer below keeps the CP-sharded view.
+                    dsa_cp_dcp_full_page_table = page_table
+                    dsa_cp_dcp_full_extend_seq_lens_list = extend_seq_lens_cpu
                 if is_cp_v2_active(forward_batch):
                     strategy = get_cp_strategy()
                     seqlens_expanded = strategy.shard_local_tokens(seqlens_expanded)
@@ -1104,6 +1119,8 @@ class DeepseekSparseAttnBackend(
             dsa_cu_seqlens_k=dsa_cu_seqlens_k,
             dsa_seqlens_expanded=seqlens_expanded,
             dsa_extend_seq_lens_list=extend_seq_lens_cpu,
+            dsa_cp_dcp_full_page_table=dsa_cp_dcp_full_page_table,
+            dsa_cp_dcp_full_extend_seq_lens_list=dsa_cp_dcp_full_extend_seq_lens_list,
             real_page_table=self._transform_table_1_to_real(page_table),
             dsa_max_seqlen_q=1,
             topk_indices_offset=topk_indices_offset,
@@ -2032,20 +2049,37 @@ class DeepseekSparseAttnBackend(
                 )
             elif topk_transform_method == TopkTransformMethod.PAGED:
                 assert metadata.dsa_extend_seq_lens_list is not None
-                page_table_1 = transform_index_page_table_prefill(
-                    page_table=metadata.page_table_1,
-                    topk_indices=topk_indices,
-                    extend_lens_cpu=metadata.dsa_extend_seq_lens_list,
-                    page_size=1,
-                    output_num_tokens=q_nope.shape[0],
-                    page_table_is_expanded=(
-                        forward_batch.forward_mode.is_target_verify()
-                        or forward_batch.forward_mode.is_draft_extend_v2()
-                    ),
-                    cu_seqlens_q=metadata.cu_seqlens_q,
-                    dcp_size=self.dcp_size,
-                    dcp_rank=self.dcp_rank,
-                )
+                if metadata.dsa_cp_dcp_full_page_table is not None:
+                    # CP x DCP extend: q/topk rows were restored to the full
+                    # batch (prepare), so transform over the unsharded lens
+                    # and page table; cu_seqlens_q is recomputed from the
+                    # full extend lens inside the transform.
+                    page_table_1 = transform_index_page_table_prefill(
+                        page_table=metadata.dsa_cp_dcp_full_page_table,
+                        topk_indices=topk_indices,
+                        extend_lens_cpu=metadata.dsa_cp_dcp_full_extend_seq_lens_list,
+                        page_size=1,
+                        output_num_tokens=q_nope.shape[0],
+                        page_table_is_expanded=False,
+                        cu_seqlens_q=None,
+                        dcp_size=self.dcp_size,
+                        dcp_rank=self.dcp_rank,
+                    )
+                else:
+                    page_table_1 = transform_index_page_table_prefill(
+                        page_table=metadata.page_table_1,
+                        topk_indices=topk_indices,
+                        extend_lens_cpu=metadata.dsa_extend_seq_lens_list,
+                        page_size=1,
+                        output_num_tokens=q_nope.shape[0],
+                        page_table_is_expanded=(
+                            forward_batch.forward_mode.is_target_verify()
+                            or forward_batch.forward_mode.is_draft_extend_v2()
+                        ),
+                        cu_seqlens_q=metadata.cu_seqlens_q,
+                        dcp_size=self.dcp_size,
+                        dcp_rank=self.dcp_rank,
+                    )
 
         # todo hisparse: to cover more backends
         if self.hisparse_coordinator is not None:
