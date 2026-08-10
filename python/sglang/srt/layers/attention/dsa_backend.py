@@ -2057,6 +2057,13 @@ class DeepseekSparseAttnBackend(
                                 "k_rows_in": int(k.shape[0]),
                                 "cache_loc_rows": int(cache_loc.shape[0]),
                                 "cache_loc": cphc_cap(cache_loc, 192),
+                                "k_row_sig": {
+                                    "n": int(save_k.shape[0]),
+                                    "min": float(save_k.float().min().item()),
+                                    "max": float(save_k.float().max().item()),
+                                    "norm": float(save_k.float().norm().item()),
+                                    "kro_pe_norm": float(save_k_rope.float().norm().item()),
+                                },
                                 "extend_seq_lens_cpu": [
                                     int(x) for x in forward_batch.extend_seq_lens_cpu
                                 ],

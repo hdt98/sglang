@@ -586,6 +586,23 @@ class DeepseekMLARocmForwardMixin:
             total_real_kv_rows = int(sum(forward_batch.extend_seq_lens_cpu))
             k_nope = k_nope[:total_real_kv_rows]
             k_pe = k_pe[:total_real_kv_rows]
+            if cphc_dump_enabled():
+                cphc_debug_dump(
+                    "cp_dcp_kv_gather",
+                    {
+                        "layer_id": int(getattr(self, "layer_id", -1)),
+                        "total_real_kv_rows": total_real_kv_rows,
+                        "kn_norm": float(k_nope.float().norm().item()),
+                        "kn_min": float(k_nope.float().min().item()),
+                        "kn_max": float(k_nope.float().max().item()),
+                        "kpe_norm": float(k_pe.float().norm().item()),
+                        "kpe_min": float(k_pe.float().min().item()),
+                        "kpe_max": float(k_pe.float().max().item()),
+                        "extend_seq_lens_cpu": [
+                            int(x) for x in forward_batch.extend_seq_lens_cpu
+                        ],
+                    },
+                )
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
         cp_local_rows = None
