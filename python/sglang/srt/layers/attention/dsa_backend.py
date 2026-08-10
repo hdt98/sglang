@@ -1956,8 +1956,8 @@ class DeepseekSparseAttnBackend(
         if cphc_dump_enabled() and metadata.dsa_cp_dcp_full_page_table is not None:
             full_lens = metadata.dsa_cp_dcp_full_extend_seq_lens_list or []
             seq_inds = (
-                forward_batch.seq_inds_cpu
-                if forward_batch.seq_inds_cpu is not None
+                getattr(forward_batch, "seq_inds_cpu", None)
+                if getattr(forward_batch, "seq_inds_cpu", None) is not None
                 else []
             )
             cphc_debug_dump(
