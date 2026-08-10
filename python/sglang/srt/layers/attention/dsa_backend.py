@@ -51,6 +51,9 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_prefill_cp_round_robin_split,
     compute_dsa_seqlens,
+    cphc_cap,
+    cphc_debug_dump,
+    cphc_dump_enabled,
     dsa_cp_round_robin_split_data,
     dsa_cp_round_robin_split_q_seqs,
     dsa_use_prefill_cp,
@@ -1976,6 +1979,51 @@ class DeepseekSparseAttnBackend(
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
 
+        if cphc_dump_enabled() and metadata.dsa_cp_dcp_full_page_table is not None:
+            full_lens = metadata.dsa_cp_dcp_full_extend_seq_lens_list or []
+            seq_inds = (
+                forward_batch.seq_inds_cpu
+                if forward_batch.seq_inds_cpu is not None
+                else []
+            )
+            cphc_debug_dump(
+                "extend_in",
+                {
+                    "layer_id": int(layer.layer_id),
+                    "q_rows_in": int(q.shape[0]) if q is not None else None,
+                    "total_real": int(sum(full_lens)),
+                    "full_extend_seq_lens": [int(x) for x in full_lens][:8],
+                    "cu_seqlens_k_head": (
+                        cphc_cap(metadata.cu_seqlens_k, 16)
+                        if metadata.cu_seqlens_k is not None
+                        else None
+                    ),
+                    "seq_inds_head": [int(x) for x in seq_inds[:64]],
+                    "seq_inds_tail": [int(x) for x in seq_inds[-8:]],
+                    "topk_shape": (
+                        list(topk_indices.shape) if topk_indices is not None else None
+                    ),
+                    "topk_minmax": (
+                        [
+                            int(topk_indices.min().item()),
+                            int(topk_indices.max().item()),
+                        ]
+                        if topk_indices is not None
+                        else None
+                    ),
+                    "topk_lastrow_head": (
+                        cphc_cap(topk_indices[-1], 16)
+                        if topk_indices is not None
+                        else None
+                    ),
+                    "topk_lastrow_tail": (
+                        cphc_cap(topk_indices[-1], 3000)[-8:]
+                        if topk_indices is not None
+                        else None
+                    ),
+                },
+            )
+
         dsa_impl = (
             self.dsa_decode_impl
             if (
@@ -2016,6 +2064,23 @@ class DeepseekSparseAttnBackend(
                     # _cp_dcp_local_cache_loc); the full-batch out_cache_loc
                     # would over-iterate k and scatter into wrong slots.
                     cache_loc = _cp_dcp_local_cache_loc(forward_batch, k.shape[0])
+                    if cphc_dump_enabled():
+                        cphc_debug_dump(
+                            "extend_save",
+                            {
+                                "total_real": int(
+                                    sum(forward_batch.extend_seq_lens_cpu)
+                                ),
+                                "k_rows": int(k.shape[0]),
+                                "cache_loc": cphc_cap(cache_loc, 192),
+                                "extend_seq_lens_cpu": [
+                                    int(x) for x in forward_batch.extend_seq_lens_cpu
+                                ],
+                                "extend_prefix_lens_cpu": [
+                                    int(x) for x in forward_batch.extend_prefix_lens_cpu
+                                ],
+                            },
+                        )
                 self.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
                     layer,
                     cache_loc,
@@ -2111,6 +2176,43 @@ class DeepseekSparseAttnBackend(
                         dcp_size=self.dcp_size,
                         dcp_rank=self.dcp_rank,
                     )
+
+        if cphc_dump_enabled() and metadata.dsa_cp_dcp_full_page_table is not None:
+            full_pt = metadata.dsa_cp_dcp_full_page_table
+            cphc_debug_dump(
+                "topk_transform",
+                {
+                    "transform_method": str(
+                        self.get_topk_transform_method(forward_batch.forward_mode)
+                    ),
+                    "q_rows": int(q_nope.shape[0]),
+                    "topk_shape": (
+                        list(topk_indices.shape) if topk_indices is not None else None
+                    ),
+                    "full_pt_shape": list(full_pt.shape),
+                    "full_pt_head": cphc_cap(full_pt[0], 32),
+                    "full_pt_tail": cphc_cap(full_pt[0], 2000)[-32:],
+                    "pt1_present": "page_table_1" in locals(),
+                    "pt1_shape": (
+                        list(page_table_1.shape) if "page_table_1" in locals() else None
+                    ),
+                    "pt1_row0_head": (
+                        cphc_cap(page_table_1[0], 32)
+                        if "page_table_1" in locals()
+                        else None
+                    ),
+                    "pt1_row0_tail": (
+                        cphc_cap(page_table_1[0], 2000)[-32:]
+                        if "page_table_1" in locals()
+                        else None
+                    ),
+                    "pt1_lastrow_head": (
+                        cphc_cap(page_table_1[-1], 32)
+                        if "page_table_1" in locals()
+                        else None
+                    ),
+                },
+            )
 
         # todo hisparse: to cover more backends
         if self.hisparse_coordinator is not None:

@@ -23,6 +23,9 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import (
     cp_dcp_gather_full_rows,
     cp_dcp_slice_local_rows,
+    cphc_debug_dump,
+    cphc_dump_enabled,
+    cphc_rowsig,
     dsa_use_cp_dcp_prefill,
     dsa_use_prefill_cp,
 )

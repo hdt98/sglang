@@ -1,5 +1,8 @@
+import datetime
+import json
+import os
 from functools import lru_cache
-from typing import TYPE_CHECKING, List, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 import triton
@@ -18,6 +21,60 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip
 from sglang.srt.utils.common import ceil_align, ceil_div
+
+
+# --- CPxDCP bring-up debug dump (temporary) ---------------------------------
+# Gated on SGLANG_CPHC_DUMP_DIR. Emits at most SGLANG_CPHC_DUMP_N (default 4)
+# JSONL events per process, fanned out per (pid, tag): <dir>/cphc_dbg_<pid>.jsonl.
+# No-op (including no CUDA syncs) when the env var is unset.
+_cphc_dbg_counters = {}
+
+
+def cphc_dump_enabled() -> bool:
+    return bool(os.environ.get("SGLANG_CPHC_DUMP_DIR"))
+
+
+def _cphc_dbg_inc(tag: str) -> bool:
+    try:
+        dump_n = int(os.environ.get("SGLANG_CPHC_DUMP_N", "4"))
+    except ValueError:
+        dump_n = 4
+    n = _cphc_dbg_counters.get(tag, 0)
+    if n >= dump_n:
+        return False
+    _cphc_dbg_counters[tag] = n + 1
+    return True
+
+
+def cphc_cap(x: torch.Tensor, n: int) -> list:
+    return x.flatten()[:n].tolist()
+
+
+def cphc_rowsig(x: torch.Tensor, rows: int) -> list:
+    return [float(v) for v in x[:rows].float().abs().mean(dim=-1).flatten()[:rows].tolist()]
+
+
+def cphc_debug_dump(tag: str, payload: dict) -> None:
+    if not cphc_dump_enabled() or not _cphc_dbg_inc(tag):
+        return
+    parallel = get_parallel()
+    event = {
+        "tag": tag,
+        "ts": datetime.datetime.utcnow().isoformat(),
+        "pid": os.getpid(),
+        "cp_rank": parallel.attn_cp_rank,
+        "cp_size": parallel.attn_cp_size,
+        "dcp_rank": parallel.attn_dcp_rank,
+        "dcp_size": parallel.attn_dcp_size,
+    }
+    event.update(payload)
+    path = os.path.join(
+        os.environ["SGLANG_CPHC_DUMP_DIR"], f"cphc_dbg_{os.getpid()}.jsonl"
+    )
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps(event) + "\n")
+# --- end CPxDCP bring-up debug dump -----------------------------------------
 
 
 @lru_cache(maxsize=1)
