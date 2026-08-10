@@ -852,6 +852,55 @@ class DeepseekMLARocmForwardMixin:
                 attn_output = _select_local_dcp_heads_for_autotune(
                     attn_output, self.num_local_heads
                 )
+            elif cp_dcp_extend:
+                # CP x DCP EXTEND combine. q was restored to the FULL token rows
+                # (identical on every DCP rank) and head-gathered, so partials are
+                # [full_tokens, H*dcp, lora] per rank with the SAME token rows but
+                # DIFFERENT KV coverage. The decode combine (mori /
+                # cp_lse_ag_out_rs_mla) implements a CONTIGUOUS HEAD PARTITION
+                # (own-h slice via reduce-scatter) that does not match this
+                # layout. Use a full-head gather + LSE combine instead: same out
+                # shape as the decode combine, each token locked to its own
+                # LSE-weighted KV union. cp_lse_ag_mla is the in-tree primitive
+                # (all-gather + dcp_lse_combine_triton, no reduce-scatter);
+                # fall back to a local implementation if it import/runs fail.
+                dcp_group = get_parallel().dcp_group
+                lse_local = lse.view(
+                    attn_output.shape[0],
+                    self.num_local_heads * get_parallel().attn_dcp_size,
+                )
+                try:
+                    from sglang.srt.layers.dcp.comm import cp_lse_ag_mla
+
+                    attn_output = cp_lse_ag_mla(
+                        attn_output.contiguous(),
+                        lse_local.contiguous(),
+                        dcp_group,
+                        is_lse_base_on_e=is_lse_base_on_e,
+                    )
+                except Exception:
+                    from sglang.kernels.ops.attention.dcp_kernels import (
+                        dcp_lse_combine_triton,
+                    )
+
+                    n = dcp_group.world_size
+                    b, h, d = attn_output.shape
+                    recv_out = attn_output.contiguous().new_empty((n, b, h, d))
+                    dcp_group.all_gather_into_tensor(
+                        recv_out.view(-1), attn_output.contiguous().view(-1)
+                    )
+                    lse_f32 = lse_local.to(torch.float32).contiguous()
+                    recv_lse = lse_f32.new_empty((n, b, h))
+                    dcp_group.all_gather_into_tensor(
+                        recv_lse.view(-1), lse_f32.view(-1)
+                    )
+                    combined, _ = dcp_lse_combine_triton(
+                        recv_out,
+                        recv_lse,
+                        is_lse_base_on_e=is_lse_base_on_e,
+                        return_lse=False,
+                    )
+                    attn_output = combined.to(attn_output.dtype)
             else:
                 dcp_comm_backend = get_parallel().dcp_comm_backend
                 is_lse_base_on_e = is_mla_dcp_lse_base_on_e(
