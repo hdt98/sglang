@@ -297,7 +297,7 @@ _cluster_ws_cache = {}
 
 def _get_cluster_ws(num_rows: int, device: torch.device) -> torch.Tensor:
     """Allocate (or reuse) a zeroed workspace for the ROCm cluster path."""
-    ws_bytes = 65536  # upper bound for sizeof(Cluster::Workspace)
+    ws_bytes = 163840  # upper bound for sizeof(Cluster::Workspace) with kHistBits=12
     needed = num_rows * ws_bytes
     key = (num_rows, str(device))
     if key not in _cluster_ws_cache:
