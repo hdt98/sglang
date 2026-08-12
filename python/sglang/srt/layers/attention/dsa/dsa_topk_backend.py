@@ -20,6 +20,7 @@ _is_hip = is_hip()
 # max batch_size ~= 7-14) while falling back to the legacy fused path
 # for larger batches.  CUDA is unaffected.
 _ROCM_V2_MAX_BATCH_SIZE = 16
+_ROCM_V2_MAX_SEQ_LEN = 32768
 
 
 class TopkTransformMethod(IntEnum):
@@ -122,7 +123,10 @@ class DSATopKBackend(Enum):
             == attn_metadata.real_page_table.shape[0]
             and (
                 not _is_hip
-                or logits.shape[0] <= _ROCM_V2_MAX_BATCH_SIZE
+                or (
+                    logits.shape[0] <= _ROCM_V2_MAX_BATCH_SIZE
+                    and attn_metadata.max_seq_len_k <= _ROCM_V2_MAX_SEQ_LEN
+                )
             )
         ):
             # On ROCm, the v2 JIT kernel's kHasStreaming is false: the
