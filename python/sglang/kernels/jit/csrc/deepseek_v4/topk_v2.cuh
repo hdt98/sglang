@@ -550,12 +550,9 @@ struct TopKKernel {
         .page_table_stride = P.unwrap(),
         .topk = topk,
         .page_bits = page_bits,
-#ifdef USE_ROCM
-        // ROCm: enable cluster path for long sequences.
-        .cluster_floor = kClusterFloor,
-        .cluster_ws = cluster_ws_ptr,
-#else
         .cluster_floor = (batch_size <= kSmallBatchLowFloor) ? kClusterFloorSmall : kClusterFloor,
+#ifdef USE_ROCM
+        .cluster_ws = cluster_ws_ptr,
 #endif
     };
 
