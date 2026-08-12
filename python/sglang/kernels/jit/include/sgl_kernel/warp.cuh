@@ -180,9 +180,11 @@ SGL_DEVICE void copy_bytes(const void* __restrict__ src, void* __restrict__ dst)
 /// reduce_sum above: every lane keeps its own running total rather than the
 /// whole-warp result.
 SGL_DEVICE uint32_t inclusive_sum(uint32_t lane_id, uint32_t val) {
+#ifndef USE_ROCM
   static_assert(kWarpThreads == 32);
+#endif
 #pragma unroll
-  for (uint32_t offset = 1; offset < 32; offset *= 2) {
+  for (uint32_t offset = 1; offset < kWarpThreads; offset *= 2) {
 #ifndef USE_ROCM
     uint32_t n = __shfl_up_sync(0xFFFFFFFF, val, offset);
 #else

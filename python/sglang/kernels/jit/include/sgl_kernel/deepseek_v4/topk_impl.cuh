@@ -142,11 +142,11 @@ SGL_DEVICE float coarse_bin_lower_bound(uint32_t bin) {
 
 SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
 #pragma unroll
-  for (uint32_t offset = 1; offset < 32; offset *= 2) {
+  for (uint32_t offset = 1; offset < kWarpSize; offset *= 2) {
 #ifndef USE_ROCM
     uint32_t n = __shfl_up_sync(0xFFFFFFFF, val, offset);
 #else
-    uint32_t n = __shfl_up(val, offset, 32);
+    uint32_t n = __shfl_up(val, offset, kWarpSize);
 #endif
     if (lane_id >= offset) val += n;
   }
@@ -257,7 +257,9 @@ struct TopKConfig {
     const auto tx = threadIdx.x;
     const auto lane_id = tx % kWarpSize;
     const auto warp_id = tx / kWarpSize;
+#ifndef USE_ROCM
     static_assert(kNumWarps == kWarpSize);
+#endif
 
     if (num_ties <= topk) {
       for (uint32_t t = tx; t < num_ties; t += kBlockSize) {
@@ -532,7 +534,7 @@ struct TopKRadixBase : TopKConfig {
 
     __syncthreads();
 
-    const auto tmp = smem->warp_sum[lane_id];
+    const auto tmp = lane_id < kNumWarps ? smem->warp_sum[lane_id] : 0;
     // Exactly one bin satisfies: above < K && above + count >= K
     uint32_t prefix_sum = warp::reduce_sum(lane_id < warp_id ? tmp : 0);
     prefix_sum += warp_exc;

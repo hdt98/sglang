@@ -134,7 +134,11 @@ static_assert(
 inline constexpr std::size_t kMaxVecBytes = SGL_ARCH_BLACKWELL_OR_GREATER ? 32 : 16;
 
 /// \brief Number of threads per warp (always 32 on NVIDIA/AMD GPUs).
+#ifdef USE_ROCM
+inline constexpr auto kWarpThreads = 64u;
+#else
 inline constexpr auto kWarpThreads = 32u;
+#endif
 /// \brief Full warp active mask (all 32 lanes).
 #ifndef USE_ROCM
 inline constexpr auto kFullMask = 0xffffffffu;
