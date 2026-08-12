@@ -1195,23 +1195,19 @@ class DeepseekSparseAttnBackend(
         # VGPR pressure from the Register paths. No context-length limit
         # is needed; see topk_v2.cuh for details.
 
-        # On ROCm the v2 kernel is correct but performs poorly for the
-        # multi-token decode batches produced by speculative decoding
-        # (MTP/EAGLE).  CUDA handles this by gating dsa_drop_wide_page_table
-        # on !speculative_num_draft_tokens; on ROCm we additionally disable
-        # v2 itself to avoid a 5x tpot regression observed at ISL >=
-        # chunked_prefill_size.  Non-MTP decode is unaffected.
+        # On ROCm the v2 Register2 path hangs at larger batch sizes
+        # (observed at batch_size >= ~26 with MTP speculative decoding).
+        # Instead of fully disabling v2, we keep it enabled and let the
+        # per-call batch-size guard in dsa_topk_backend.topk_transform
+        # fall back to the legacy path when the batch is too large.
         if (
             _is_hip
             and self.speculative_num_draft_tokens
             and envs.SGLANG_OPT_USE_TOPK_V2.get()
         ):
-            envs.SGLANG_OPT_USE_TOPK_V2.set(False)
-            logger.warning(
-                "topk v2 disabled on ROCm: speculative decoding "
-                "(MTP/EAGLE) is active. The v2 kernel is correct but "
-                "slow for multi-token decode batches on gfx950. "
-                "Non-speculative decode retains the full v2 speedup."
+            logger.info(
+                "topk v2 enabled on ROCm with speculative decoding: "
+                "per-call batch-size guard active (see dsa_topk_backend)."
             )
 
         max_ctx_len = self.req_to_token.shape[1]

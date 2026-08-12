@@ -6,11 +6,20 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_hip
 
 _FLASHINFER_TIE_BREAK_VALUES = {
     "small": 1,
     "large": 2,
 }
+
+_is_hip = is_hip()
+# On ROCm, the v2 Register2 kernel path hangs at larger batch sizes
+# (observed at batch_size >= ~26 during MTP draft_extend/verify at c >= 8).
+# This guard lets v2 run for small batches (c=1-2 with MTP 5/1/6, where
+# max batch_size ~= 7-14) while falling back to the legacy fused path
+# for larger batches.  CUDA is unaffected.
+_ROCM_V2_MAX_BATCH_SIZE = 16
 
 
 class TopkTransformMethod(IntEnum):
@@ -111,6 +120,10 @@ class DSATopKBackend(Enum):
             and lengths.shape[0]
             == logits.shape[0]
             == attn_metadata.real_page_table.shape[0]
+            and (
+                not _is_hip
+                or logits.shape[0] <= _ROCM_V2_MAX_BATCH_SIZE
+            )
         ):
             # On ROCm, the v2 JIT kernel's kHasStreaming is false: the
             # Register2 and Register4 paths (C4-domain seq_len <= 16384)
