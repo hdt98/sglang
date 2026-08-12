@@ -945,11 +945,11 @@ struct TopKCluster : TopKRadixBase<10> {
 // primary block (rank 0) does the final tie-breaking and page-table transform.
 // The host must zero the workspace before each launch.
 template <uint32_t kClusterSize_>
-struct TopKCluster : TopKRadixBase<10> {
+struct TopKCluster : TopKRadixBase<12> {
  public:
   static constexpr uint32_t kClusterSize = kClusterSize_;
   static constexpr uint32_t kMaxSeqLen = std::numeric_limits<uint32_t>::max();
-  using Base = TopKRadixBase<10>;
+  using Base = TopKRadixBase<12>;
   using Smem = Base::Smem;
 
   // Per-batch-element workspace in global memory.
@@ -966,7 +966,7 @@ struct TopKCluster : TopKRadixBase<10> {
   SGL_DEVICE static void forward(TopKProblem problem, void* _smem,
                                   Workspace* ws, uint32_t this_rank) {
     const auto tx = threadIdx.x;
-    const auto smem = static_cast<Smem*>(_smem);
+    auto smem = static_cast<Smem*>(_smem);
     const bool is_primary = (this_rank == 0);
 
     // Chunk: each block processes a contiguous, vector-aligned slice.
