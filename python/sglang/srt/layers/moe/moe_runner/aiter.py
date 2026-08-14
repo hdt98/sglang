@@ -238,6 +238,11 @@ def pre_permute_standard_to_aiter(
     topk_weights, topk_ids, _ = dispatch_output.topk_output
     topk_weights = topk_weights.to(torch.float32)
 
+    a1_scale = None
+    pre_quant = getattr(dispatch_output, "hidden_states_pre_quant", None)
+    if pre_quant is not None:
+        hidden_states, a1_scale = pre_quant
+
     if runner_config.apply_router_weight_on_input and not quant_info.doweight_stage1:
         # Pre-scale at the Python level for kernels that don't honor doweight_stage1.
         assert (
@@ -251,6 +256,7 @@ def pre_permute_standard_to_aiter(
         topk_ids=topk_ids.to(torch.int32),
         topk_weights=topk_weights,
         quant_type=quant_info.quant_type,
+        a1_scale=a1_scale,
     )
 
 

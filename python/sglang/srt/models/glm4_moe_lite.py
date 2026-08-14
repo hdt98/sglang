@@ -312,6 +312,7 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
+        pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         if not self._enable_a2a_moe:
             if (
@@ -320,15 +321,20 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()
             ):
-                return self.forward_normal_dual_stream(hidden_states)
+                return self.forward_normal_dual_stream(
+                    hidden_states, pre_quant_input=pre_quant_input
+                )
             else:
-                return self.forward_normal(hidden_states)
+                return self.forward_normal(
+                    hidden_states, pre_quant_input=pre_quant_input
+                )
         else:
             return self.forward_deepep(hidden_states, forward_batch)
 
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
+        pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
@@ -338,7 +344,9 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
-            final_hidden_states = self.experts(hidden_states, topk_output)
+            final_hidden_states = self.experts(
+                hidden_states, topk_output, pre_quant_input=pre_quant_input
+            )
             if not _is_cuda or isinstance(self.experts.quant_method, KTEPWrapperMethod):
                 final_hidden_states *= self.routed_scaling_factor
 
@@ -353,6 +361,7 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
+        pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         if hidden_states.shape[0] > 0:
             shared_output = self._forward_shared_experts(hidden_states)
@@ -363,7 +372,9 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
-        final_hidden_states = self.experts(hidden_states, topk_output)
+        final_hidden_states = self.experts(
+            hidden_states, topk_output, pre_quant_input=pre_quant_input
+        )
         if not _is_cuda and not _use_aiter:
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
@@ -661,7 +672,8 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         get_attn_tp_context().clear_attn_inputs()
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
+            hidden_states, residual, forward_batch,
+            quant_format=getattr(self, "_gfx95_quant_format", ""),
         )
 
         fuse_mlp_allreduce = (
@@ -679,7 +691,10 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
             fuse_mlp_allreduce=fuse_mlp_allreduce,
             mlp_reduce_scatter=mlp_reduce_scatter,
         ):
-            hidden_states = self.mlp(hidden_states, forward_batch)
+            pre_quant = getattr(hidden_states, "_sglang_pre_quant", None)
+            hidden_states = self.mlp(
+                hidden_states, forward_batch, pre_quant_input=pre_quant
+            )
 
         if fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True

@@ -157,6 +157,32 @@ def _fused_rmsnorm_fp8_per_token_quant(
         return (out_fp8, scale.unsqueeze(1))
 
 
+class _FusedRMSNormFP8Quant:
+    """Wraps RMSNorm to fuse residual_add + RMSNorm + FP8 group quant."""
+
+    def __init__(self, layernorm):
+        self._layernorm = layernorm
+        self.weight = layernorm.weight
+        self.variance_epsilon = layernorm.variance_epsilon
+
+    def __call__(self, hidden_states, residual):
+        fp8_hidden, bf16_hidden, scale, residual = fused_rms_fp8_group_quant(
+            hidden_states,
+            self.weight,
+            self.variance_epsilon,
+            inp2=None,
+            inp2_weight=None,
+            inp2_epsilon=None,
+            group_size=128,
+            dtype_quant=torch.float8_e4m3fn,
+            res1=residual,
+            output_unquantized_inp1=True,
+            transpose_scale=False,
+        )
+        bf16_hidden._sglang_pre_quant = (fp8_hidden, scale)
+        return bf16_hidden, residual
+
+
 # TODO: According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
 # We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
 FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
@@ -762,15 +788,24 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         cache=None,
+        quant_format: str = "",
     ):
         if cache is not None:
             self._context.cache = cache
+
+        layernorm = self.post_attention_layernorm
+        if (
+            quant_format == "fp8"
+            and _use_aiter
+            and _is_gfx95_supported
+        ):
+            layernorm = _FusedRMSNormFP8Quant(self.post_attention_layernorm)
 
         return self._communicate_with_all_reduce_and_layer_norm_fn(
             hidden_states=hidden_states,
             residual=residual,
             forward_batch=forward_batch,
-            layernorm=self.post_attention_layernorm,
+            layernorm=layernorm,
             context=self._context,
         )
 
