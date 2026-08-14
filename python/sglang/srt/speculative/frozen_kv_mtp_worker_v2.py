@@ -317,9 +317,12 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         if forward_batch.forward_mode.is_idle():
             return
         if forward_batch.seq_lens_cpu is not None:
-            forward_batch.seq_lens_sum = forward_batch.seq_lens_cpu.sum().item()
+            forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())
         else:
-            forward_batch.seq_lens_sum = torch.sum(forward_batch.seq_lens).item()
+            # Avoid GPU sync from .item(); upper bound is safe for metadata sizing
+            forward_batch.seq_lens_sum = (
+                forward_batch.seq_lens.shape[0] * self.model_config.context_len
+            )
         with self._frozen_kv_target_view(forward_batch):
             self.draft_attn_backend.init_forward_metadata(forward_batch)
         forward_batch.mark_forward_metadata_ready()
@@ -455,7 +458,13 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         spec_info.num_tokens_per_req = self.topk
         spec_info.num_tokens_for_logprob_per_req = self.topk
         spec_info.positions = self._position_for_batch(batch)
-        batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
+        if batch.seq_lens_cpu is not None:
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+        else:
+            # Avoid GPU sync; upper bound is safe for tree mask sizing
+            batch.seq_lens_sum = (
+                batch.seq_lens.shape[0] * self.model_config.context_len
+            )
         batch.return_hidden_states = False
 
         forward_batch = ForwardBatch.init_new(
