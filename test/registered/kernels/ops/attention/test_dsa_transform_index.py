@@ -235,6 +235,316 @@ class TestDSATransformIndex(CustomTestCase):
         self._check_decode_case(8192, 4096)
         self._check_decode_case(2, 1_000_000)
 
+    # ------------------------------------------------------------------
+    # DCP correctness tests
+    # ------------------------------------------------------------------
+
+    def _expected_dcp(
+        self,
+        page_table: torch.Tensor,
+        topk_indices: torch.Tensor,
+        extend_lens_cpu: list[int],
+        output_num_tokens: int,
+        page_table_is_expanded: bool,
+        dcp_size: int,
+        dcp_rank: int,
+    ) -> torch.Tensor:
+        """Ref implementation with DCP owner-filter + global-to-local map."""
+        expected = self._expected(
+            page_table,
+            topk_indices,
+            extend_lens_cpu,
+            output_num_tokens,
+            page_table_is_expanded,
+        )
+        if dcp_size <= 1:
+            return expected
+        real_num_tokens = sum(extend_lens_cpu)
+        if real_num_tokens == 0:
+            return expected
+        slab = expected[:real_num_tokens]
+        valid = slab >= 0
+        owned = valid & (slab % dcp_size == dcp_rank)
+        slab[valid & ~owned] = -1
+        slab[owned] //= dcp_size
+        return expected
+
+    def _check_prefill_dcp_case(
+        self,
+        extend_lens_cpu: list[int],
+        context_length: int,
+        *,
+        page_table_is_expanded: bool,
+        dcp_size: int,
+        dcp_rank: int,
+        topk_padding: int = 0,
+        output_padding: int = 0,
+    ) -> None:
+        real_num_tokens = sum(extend_lens_cpu)
+        page_table_rows = (
+            real_num_tokens if page_table_is_expanded else len(extend_lens_cpu)
+        )
+        topk_num_tokens = real_num_tokens + topk_padding
+        output_num_tokens = topk_num_tokens + output_padding
+        page_table = self._make_page_table(page_table_rows, context_length)
+        topk_indices = self._make_topk(topk_num_tokens, context_length)
+        expected = self._expected_dcp(
+            page_table,
+            topk_indices,
+            extend_lens_cpu,
+            output_num_tokens,
+            page_table_is_expanded,
+            dcp_size,
+            dcp_rank,
+        )
+
+        actual = transform_index_page_table_prefill_fast(
+            page_table=page_table,
+            topk_indices=topk_indices,
+            extend_lens_cpu=extend_lens_cpu,
+            output_num_tokens=output_num_tokens,
+            page_table_is_expanded=page_table_is_expanded,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_prefill_dcp_across_widths_and_lengths(self):
+        """Fast-vs-ref correctness across page-table widths, extend lengths,
+        and DCP configurations.
+
+        Page-table widths 64/127/128/4096 verify that do_not_specialize on
+        page_table_stride_0 does not break correctness for any width.
+        Extend lengths 1/2/4/7 cover BLOCK_Q 1/2/4/4.
+        DCP sizes 1 (baseline) and 2 (owner-filter) with both ranks.
+        """
+        for context_length in (64, 127, 128, 4096):
+            for extend_lens in ([1], [2], [4], [7], [1, 2, 4, 7]):
+                for dcp_size, dcp_rank in (
+                    (1, 0),
+                    (2, 0),
+                    (2, 1),
+                ):
+                    with self.subTest(
+                        context_length=context_length,
+                        extend_lens=extend_lens,
+                        dcp_size=dcp_size,
+                        dcp_rank=dcp_rank,
+                    ):
+                        self._check_prefill_dcp_case(
+                            extend_lens,
+                            context_length,
+                            page_table_is_expanded=False,
+                            dcp_size=dcp_size,
+                            dcp_rank=dcp_rank,
+                        )
+
+    def test_prefill_dcp_expanded_mode(self):
+        """DCP correctness with page_table_is_expanded=True (target_verify path)."""
+        for context_length in (128, 4096):
+            for extend_lens in ([4], [7], [2, 4]):
+                for dcp_size, dcp_rank in ((1, 0), (2, 0), (2, 1)):
+                    with self.subTest(
+                        context_length=context_length,
+                        extend_lens=extend_lens,
+                        dcp_size=dcp_size,
+                        dcp_rank=dcp_rank,
+                    ):
+                        self._check_prefill_dcp_case(
+                            extend_lens,
+                            context_length,
+                            page_table_is_expanded=True,
+                            dcp_size=dcp_size,
+                            dcp_rank=dcp_rank,
+                        )
+
+    def test_prefill_dcp_with_padding(self):
+        """DCP correctness with topk and output padding."""
+        self._check_prefill_dcp_case(
+            [4, 7],
+            128,
+            page_table_is_expanded=False,
+            dcp_size=2,
+            dcp_rank=0,
+            topk_padding=3,
+            output_padding=5,
+        )
+        self._check_prefill_dcp_case(
+            [1, 2],
+            4096,
+            page_table_is_expanded=False,
+            dcp_size=2,
+            dcp_rank=1,
+            topk_padding=2,
+            output_padding=4,
+        )
+
+    def test_prefill_dcp_empty_batch(self):
+        """DCP correctness with zero-length extend (no real tokens)."""
+        self._check_prefill_dcp_case(
+            [0, 0],
+            128,
+            page_table_is_expanded=False,
+            dcp_size=2,
+            dcp_rank=0,
+           output_padding=4,
+       )
+
+    # ------------------------------------------------------------------
+    # DCP decode correctness tests
+    # ------------------------------------------------------------------
+
+    def _expected_decode_dcp(
+        self,
+        page_table: torch.Tensor,
+        topk_indices: torch.Tensor,
+        dcp_size: int,
+        dcp_rank: int,
+        compact_dcp: bool,
+    ) -> torch.Tensor:
+        """Ref implementation of decode transform with DCP owner-filter,
+        global-to-local mapping, and optional compaction."""
+        expected = torch.empty(
+            (topk_indices.shape[0], TOPK), dtype=torch.int32, device=self.device
+        )
+        torch.gather(
+            page_table.to(torch.int32),
+            dim=1,
+            index=topk_indices.clamp(min=0),
+            out=expected,
+        )
+        expected[topk_indices < 0] = -1
+
+        if dcp_size > 1:
+            valid = expected >= 0
+            owned = valid & (expected % dcp_size == dcp_rank)
+            expected[valid & ~owned] = -1
+            expected[owned] //= dcp_size
+
+        if compact_dcp and dcp_size > 1:
+            result = torch.full_like(expected, -1)
+            for i in range(expected.shape[0]):
+                valid_vals = expected[i, expected[i] >= 0]
+                result[i, : valid_vals.shape[0]] = valid_vals
+            expected = result
+
+        return expected
+
+    def _check_decode_dcp_case(
+        self,
+        batch_size: int,
+        context_length: int,
+        *,
+        dcp_size: int,
+        dcp_rank: int,
+        compact_dcp: bool,
+        zero_row_stride: bool = False,
+        provide_result: bool = False,
+    ) -> None:
+        if zero_row_stride:
+            page_table = self._make_page_table(1, context_length).expand(
+                batch_size, -1
+            )
+        else:
+            page_table = self._make_page_table(batch_size, context_length)
+        topk_indices = self._make_topk(batch_size, context_length)
+        expected = self._expected_decode_dcp(
+            page_table, topk_indices, dcp_size, dcp_rank, compact_dcp
+        )
+        result = torch.empty_like(expected) if provide_result else None
+        actual = transform_index_page_table_decode_fast(
+            page_table=page_table,
+            topk_indices=topk_indices,
+            result=result,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
+            compact_dcp=compact_dcp,
+        )
+        torch.cuda.synchronize()
+        if result is not None:
+            self.assertIs(actual, result)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_decode_dcp_owner_filter(self):
+        """DCP decode owner filtering + local index mapping (no compaction).
+
+        With dcp_size=2, rank 0 keeps even KV slots, rank 1 keeps odd.
+        Global indices are mapped to local via // dcp_size.
+        Non-owned and invalid slots become -1 in-place.
+        """
+        for dcp_rank in (0, 1):
+            with self.subTest(dcp_rank=dcp_rank):
+                self._check_decode_dcp_case(
+                    17, 8192,
+                    dcp_size=2, dcp_rank=dcp_rank, compact_dcp=False,
+                )
+
+    def test_decode_dcp_compact(self):
+        """DCP decode with compact_dcp=True: valid entries compacted to front.
+
+        After owner filtering, owned slots are moved to the front of each row
+        via prefix-sum compaction. Remaining positions are filled with -1.
+        """
+        for dcp_rank in (0, 1):
+            with self.subTest(dcp_rank=dcp_rank):
+                self._check_decode_dcp_case(
+                    17, 8192,
+                    dcp_size=2, dcp_rank=dcp_rank, compact_dcp=True,
+                )
+
+    def test_decode_dcp_across_widths(self):
+        """DCP decode correctness across page-table widths.
+
+        Widths 64/127/128/4096 exercise different page_table_row_stride
+        values (tl.constexpr in the kernel) to ensure correctness regardless
+        of stride specialization.
+        """
+        for context_length in (64, 127, 128, 4096):
+            for dcp_rank in (0, 1):
+                for compact_dcp in (False, True):
+                    with self.subTest(
+                        context_length=context_length,
+                        dcp_rank=dcp_rank,
+                        compact_dcp=compact_dcp,
+                    ):
+                        self._check_decode_dcp_case(
+                            8, context_length,
+                            dcp_size=2, dcp_rank=dcp_rank,
+                            compact_dcp=compact_dcp,
+                        )
+
+    def test_decode_dcp_strides_and_result(self):
+        """DCP decode with expanded (zero-stride) page table and pre-allocated result."""
+        for compact_dcp in (False, True):
+            with self.subTest(compact_dcp=compact_dcp):
+                self._check_decode_dcp_case(
+                    17, 8192,
+                    dcp_size=2, dcp_rank=0, compact_dcp=compact_dcp,
+                    zero_row_stride=True, provide_result=True,
+                )
+
+    def test_decode_dcp_extreme_shapes(self):
+        """DCP decode with large batch and large context length."""
+        self._check_decode_dcp_case(
+            8192, 4096,
+            dcp_size=2, dcp_rank=0, compact_dcp=True,
+        )
+        self._check_decode_dcp_case(
+            2, 1_000_000,
+            dcp_size=2, dcp_rank=1, compact_dcp=True,
+        )
+
+    def test_decode_dcp_baseline_no_dcp(self):
+        """compact_dcp=True with dcp_size=1 is a no-op.
+
+        No owner filtering or compaction should occur; result matches the
+        plain decode transform (invalid slots -> -1, valid slots unchanged).
+        """
+        self._check_decode_dcp_case(
+            17, 8192,
+            dcp_size=1, dcp_rank=0, compact_dcp=True,
+        )
 
 if __name__ == "__main__":
     unittest.main()
