@@ -1447,6 +1447,28 @@ class Glm4MoeForCausalLM(nn.Module):
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
     fused_shared_experts_architecture = "GlmMoeDsaForCausalLM"
 
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        # GLM stores its NextN block under model.layers.<num_hidden_layers>.
+        # Its shared expert may use a different precision without constraining
+        # fusion in the target model, which never loads that extra layer.
+        if quant_config is not None and quant_config.get_name() == "quark":
+            nextn_prefix = f"model.layers.{hf_config.num_hidden_layers}."
+            if any(
+                name.startswith(nextn_prefix) for name in quant_config.exclude_layers
+            ):
+                import copy
+
+                target_quant_config = copy.copy(quant_config)
+                target_quant_config.exclude_layers = [
+                    name
+                    for name in quant_config.exclude_layers
+                    if not name.startswith(nextn_prefix)
+                ]
+                quant_config = target_quant_config
+
+        return super().shared_experts_fusion_disable_reason(hf_config, quant_config)
+
 
 class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
     # GLM-5.2's MTP layer index differs from DeepSeek's (61), so the inherited

@@ -32,6 +32,8 @@ def _quant_info(**overrides):
         "w13_weight": torch.empty((2, 8, 2)),
         "w2_weight": torch.empty((2, 4, 2)),
         "quant_type": AiterQuantType.PER_1X32,
+        "w13_scale": torch.empty((2, 8, 1), dtype=torch.uint8),
+        "w2_scale": torch.empty((2, 4, 1), dtype=torch.uint8),
     }
     kwargs.update(overrides)
     return AiterMoeQuantInfo(**kwargs)
@@ -113,6 +115,100 @@ def test_aiter_runner_preserves_no_combine_rank_for_empty_input(monkeypatch):
     output = runner.run(runner_input, _quant_info(), running_state={})
 
     assert output.hidden_states.shape == (0, 2, 4)
+
+
+def test_aiter_runner_routes_marked_mxfp4_to_triton(monkeypatch):
+    fused_moe_called = False
+    captured = {}
+
+    def fused_moe(**kwargs):
+        nonlocal fused_moe_called
+        fused_moe_called = True
+        return kwargs["hidden_states"]
+
+    def fused_moe_mxfp4_triton(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return args[0]
+
+    _install_fake_aiter(monkeypatch, fused_moe)
+    fake_triton_route = ModuleType(
+        "sglang.srt.layers.moe.moe_runner.aiter_mxfp4_triton"
+    )
+    fake_triton_route.fused_moe_mxfp4_triton = fused_moe_mxfp4_triton
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.layers.moe.moe_runner.aiter_mxfp4_triton",
+        fake_triton_route,
+    )
+
+    runner_input = _runner_input()
+    runner = AiterRunnerCore(
+        MoeRunnerConfig(
+            num_experts=2,
+            num_local_experts=2,
+            activation="silu",
+        )
+    )
+    output = runner.run(
+        runner_input,
+        _quant_info(mxfp4_triton=True),
+        running_state={},
+    )
+
+    assert fused_moe_called is False
+    assert output.hidden_states is runner_input.hidden_states
+    assert captured["args"][0] is runner_input.hidden_states
+    assert captured["kwargs"]["activation"] == "silu"
+    assert captured["kwargs"]["expected_hidden_size"] is None
+    assert captured["kwargs"]["expected_intermediate_size"] is None
+    assert captured["kwargs"]["apply_router_weight_on_input"] is False
+
+
+def test_aiter_runner_rejects_mxfp4_triton_activation_scale(monkeypatch):
+    _install_fake_aiter(monkeypatch, lambda **kwargs: kwargs["hidden_states"])
+    runner_input = _runner_input()
+    runner_input.a1_scale = torch.ones((1,), dtype=torch.float32)
+    runner = AiterRunnerCore(
+        MoeRunnerConfig(num_experts=2, num_local_experts=2, activation="silu")
+    )
+
+    with pytest.raises(NotImplementedError, match="activation scales"):
+        runner.run(
+            runner_input,
+            _quant_info(mxfp4_triton=True),
+            running_state={},
+        )
+
+
+@pytest.mark.parametrize(
+    ("config_overrides", "quant_overrides", "match"),
+    [
+        ({"is_gated": False}, {}, "is_gated=False"),
+        ({"gemm1_alpha": 1.0}, {}, "gemm1 alpha/beta/clamp"),
+        ({"num_local_experts": 1}, {}, "expert parallelism"),
+        ({}, {"quant_type": AiterQuantType.NONE}, "quant_type="),
+    ],
+)
+def test_aiter_runner_rejects_unsupported_mxfp4_triton_contract(
+    monkeypatch, config_overrides, quant_overrides, match
+):
+    _install_fake_aiter(monkeypatch, lambda **kwargs: kwargs["hidden_states"])
+    runner_input = _runner_input()
+    config = {
+        "num_experts": 2,
+        "num_local_experts": 2,
+        "activation": "silu",
+    }
+    config.update(config_overrides)
+    runner = AiterRunnerCore(MoeRunnerConfig(**config))
+
+    with pytest.raises(NotImplementedError, match=match):
+        runner.run(
+            runner_input,
+            _quant_info(mxfp4_triton=True, **quant_overrides),
+            running_state={},
+        )
 
 
 if __name__ == "__main__":

@@ -1006,6 +1006,9 @@ class PrefillAdder:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
             _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
+            # Reserve budget for warm turns in waiting queue
+            if self.rem_chunk_tokens is not None and self.rem_chunk_tokens > 2048:
+                _rem_tokens = min(_rem_tokens, self.rem_chunk_tokens - 2048)
             if self.is_hybrid_swa:
                 # alloc_extend needs extend_num_tokens + page_size per request,
                 # so reserve one page here to avoid OOM
@@ -1384,6 +1387,10 @@ class PrefillAdder:
                     storage_hit_len=req.storage_hit_length,
                 )
             else:
+                # Guard: do not create new chunked req when one is active
+                if has_chunked_req:
+                    return AddReqResult.OTHER
+
                 # Make sure at least one page is available
                 trunc_len = chunk_tokens_limit // self.page_size * self.page_size
 

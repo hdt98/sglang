@@ -60,6 +60,7 @@ class AiterMoeQuantInfo(MoeQuantInfo):
     intermediate_pad: int = 0
     swiglu_limit: float = 0.0
     fused_moe_kwargs: Optional[dict[str, Any]] = None
+    mxfp4_triton: bool = False
 
 
 @dataclass
@@ -148,6 +149,84 @@ class AiterRunnerCore(MoeRunnerCore):
                     )
                 )
             return AiterRunnerOutput(hidden_states=runner_input.hidden_states)
+
+        if quant_info.mxfp4_triton:
+            is_expert_parallel = (
+                self.config.num_experts != self.config.num_local_experts
+            )
+            unsupported = []
+            if self.config.activation != "silu":
+                unsupported.append(f"activation={self.config.activation}")
+            if not self.config.is_gated:
+                unsupported.append("is_gated=False")
+            if self.config.no_combine:
+                unsupported.append("no_combine=True")
+            if (
+                quant_info.quant_type != AiterQuantType.PER_1X32
+                or runner_input.quant_type != AiterQuantType.PER_1X32
+            ):
+                unsupported.append(
+                    "quant_type=" f"{quant_info.quant_type}/{runner_input.quant_type}"
+                )
+            if is_expert_parallel:
+                unsupported.append("expert parallelism")
+            if runner_input.num_local_tokens is not None:
+                unsupported.append("num_local_tokens")
+            if runner_input.output_dtype is not None:
+                unsupported.append("output_dtype")
+            if quant_info.expert_mask is not None:
+                unsupported.append("expert_mask")
+            if (
+                runner_input.a1_scale is not None
+                or quant_info.a13_scale is not None
+                or quant_info.a2_scale is not None
+            ):
+                unsupported.append("activation scales")
+            if quant_info.b13 is not None or quant_info.b2 is not None:
+                unsupported.append("bias")
+            if quant_info.hidden_pad or quant_info.intermediate_pad:
+                unsupported.append("padded dimensions")
+            if quant_info.swiglu_limit:
+                unsupported.append("swiglu_limit")
+            if self.config.swiglu_limit:
+                unsupported.append("config.swiglu_limit")
+            if any(
+                value is not None
+                for value in (
+                    self.config.gemm1_alpha,
+                    self.config.gemm1_beta,
+                    self.config.gemm1_clamp_limit,
+                )
+            ):
+                unsupported.append("gemm1 alpha/beta/clamp")
+            if quant_info.fused_moe_kwargs:
+                unsupported.append("fused_moe_kwargs")
+            if unsupported:
+                raise NotImplementedError(
+                    "gfx942 MXFP4 Triton MoE does not support: "
+                    + ", ".join(unsupported)
+                )
+            if quant_info.w13_scale is None or quant_info.w2_scale is None:
+                raise ValueError("MXFP4 Triton MoE requires raw E8M0 weight scales")
+
+            from sglang.srt.layers.moe.moe_runner.aiter_mxfp4_triton import (
+                fused_moe_mxfp4_triton,
+            )
+
+            output = fused_moe_mxfp4_triton(
+                runner_input.hidden_states,
+                quant_info.w13_weight,
+                quant_info.w2_weight,
+                quant_info.w13_scale,
+                quant_info.w2_scale,
+                runner_input.topk_weights,
+                runner_input.topk_ids,
+                activation=self.config.activation,
+                expected_hidden_size=self.config.hidden_size,
+                expected_intermediate_size=self.config.intermediate_size_per_partition,
+                apply_router_weight_on_input=quant_info.doweight_stage1,
+            )
+            return AiterRunnerOutput(hidden_states=output)
 
         from aiter.fused_moe import fused_moe
 

@@ -113,9 +113,10 @@ class TestDeepseekV2Gate(_FusionGateCase):
         from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 
         self._seed()
-        self.assertTrue(
-            self._reason(DeepseekV2ForCausalLM, self._config(), moe_ep_size=2)
-        )
+        with unittest.mock.patch("sglang.srt.models.deepseek_v2._is_hip", False):
+            self.assertTrue(
+                self._reason(DeepseekV2ForCausalLM, self._config(), moe_ep_size=2)
+            )
 
     def test_mixed_precision_quant_vetoes_even_when_enforced(self):
         """A precision mismatch causes crash when shared expert fusion is enabled,
@@ -190,6 +191,64 @@ class TestGlmMoeGate(_FusionGateCase):
             GlmMoeDsaForCausalLM.fused_shared_experts_architecture,
             "GlmMoeDsaForCausalLM",
         )
+
+    def test_dsa_variant_respects_quark_shared_expert_format(self):
+        from sglang.srt.layers.quantization.quark.quark import QuarkConfig
+        from sglang.srt.models.glm4_moe import (
+            GlmMoeDsaForCausalLM,
+            GlmMoeDsaForCausalLMNextN,
+        )
+
+        self._seed()
+        config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"],
+            n_routed_experts=256,
+            n_shared_experts=1,
+            num_hidden_layers=78,
+        )
+        mtp_exclude = "model.layers.78.mlp.shared_experts.gate_proj"
+        mtp_only_quant = QuarkConfig(
+            quant_config={
+                "exclude": [mtp_exclude],
+                "packed_modules_mapping": {},
+            },
+            is_prequantized=True,
+        )
+        target_mismatch_quant = QuarkConfig(
+            quant_config={
+                "exclude": ["model.layers.3.mlp.shared_experts.gate_proj"],
+                "packed_modules_mapping": {},
+            },
+            is_prequantized=True,
+        )
+
+        with (
+            unittest.mock.patch("sglang.srt.models.deepseek_v2._is_hip", True),
+            unittest.mock.patch("sglang.srt.models.deepseek_v2._is_cuda", False),
+            unittest.mock.patch(
+                "sglang.srt.models.deepseek_v2.torch.cuda.get_device_capability",
+                return_value=(9, 4),
+            ),
+        ):
+            self.assertIsNone(
+                self._reason(GlmMoeDsaForCausalLM, config, mtp_only_quant)
+            )
+            self.assertEqual(mtp_only_quant.exclude_layers, [mtp_exclude])
+            self.assertIn(
+                "higher precision",
+                self._reason(GlmMoeDsaForCausalLM, config, target_mismatch_quant),
+            )
+
+            draft_config = SimpleNamespace(
+                architectures=["DeepseekV3ForCausalLMNextN"],
+                n_routed_experts=256,
+                n_shared_experts=1,
+                num_hidden_layers=78,
+            )
+            self.assertIn(
+                "higher precision",
+                self._reason(GlmMoeDsaForCausalLMNextN, draft_config, mtp_only_quant),
+            )
 
 
 class TestMiniMaxGates(_FusionGateCase):

@@ -813,6 +813,18 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             assert layer.w13_weight_scale.dtype == torch.uint8
             assert layer.w2_weight_scale.dtype == torch.uint8
 
+        if getattr(self, "use_aiter_mxfp4_triton", False):
+            # AITER's Triton kernels consume the checkpoint's raw
+            # [expert, output, K/32] E8M0 layout.  The shuffle below is only
+            # for the gfx95 FlyDSL kernels.
+            layer.w13_weight.is_shuffled = False
+            layer.w2_weight.is_shuffled = False
+            if hasattr(layer, "dispatcher"):
+                layer.dispatcher.set_quant_config(
+                    {"weight_dtype": torch.float4_e2m1fn_x2}
+                )
+            return
+
         # Pre-shuffle weight scales
         s0, s1, _ = layer.w13_weight_scale.shape
         w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
@@ -848,11 +860,84 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         )
 
         self.moe_runner_config = moe_runner_config
+        self.use_aiter_mxfp4_triton = False
         moe_runner_backend = get_moe_runner_backend()
-        if moe_runner_backend.is_auto() and get_moe_a2a_backend().supports_aiter():
+        moe_a2a_backend = get_moe_a2a_backend()
+        if moe_runner_backend.is_auto() and moe_a2a_backend.supports_aiter():
             moe_runner_backend = MoeRunnerBackend.AITER
 
         if moe_runner_backend.is_aiter():
+            from sglang.srt.layers.moe.moe_runner.aiter_mxfp4_triton import (
+                use_triton_mxfp4_moe,
+            )
+
+            if _use_aiter and use_triton_mxfp4_moe():
+                unsupported = []
+                if moe_runner_config.activation != "silu":
+                    unsupported.append(f"activation={moe_runner_config.activation}")
+                if not moe_runner_config.is_gated:
+                    unsupported.append("is_gated=False")
+                if moe_runner_config.no_combine:
+                    unsupported.append("no_combine=True")
+                if moe_runner_config.num_experts != moe_runner_config.num_local_experts:
+                    unsupported.append("expert parallelism")
+                if moe_runner_config.swiglu_limit:
+                    unsupported.append("swiglu_limit")
+                if any(
+                    value is not None
+                    for value in (
+                        moe_runner_config.gemm1_alpha,
+                        moe_runner_config.gemm1_beta,
+                        moe_runner_config.gemm1_clamp_limit,
+                    )
+                ):
+                    unsupported.append("gemm1 alpha/beta/clamp")
+                if unsupported:
+                    raise NotImplementedError(
+                        "gfx942 MXFP4 Triton MoE does not support: "
+                        + ", ".join(unsupported)
+                    )
+
+                hidden = moe_runner_config.hidden_size
+                intermediate = moe_runner_config.intermediate_size_per_partition
+                if hidden is None or intermediate is None:
+                    raise ValueError(
+                        "gfx942 MXFP4 Triton MoE requires known hidden and "
+                        "TP-local intermediate sizes"
+                    )
+                expected_shapes = {
+                    "w13_weight": (
+                        moe_runner_config.num_local_experts,
+                        2 * intermediate,
+                        hidden // 2,
+                    ),
+                    "w2_weight": (
+                        moe_runner_config.num_local_experts,
+                        hidden,
+                        intermediate // 2,
+                    ),
+                    "w13_weight_scale": (
+                        moe_runner_config.num_local_experts,
+                        2 * intermediate,
+                        hidden // OCP_MX_BLOCK_SIZE,
+                    ),
+                    "w2_weight_scale": (
+                        moe_runner_config.num_local_experts,
+                        hidden,
+                        intermediate // OCP_MX_BLOCK_SIZE,
+                    ),
+                }
+                for name, expected_shape in expected_shapes.items():
+                    actual_shape = tuple(getattr(layer, name).shape)
+                    if actual_shape != expected_shape:
+                        raise ValueError(
+                            "gfx942 MXFP4 Triton MoE requires unpadded raw weights: "
+                            f"{name} has {actual_shape}, expected {expected_shape}"
+                        )
+                self.use_aiter_mxfp4_triton = True
+                logger.info_once(
+                    "Using AITER Triton W4A16 MXFP4 MoE compatibility path on gfx942."
+                )
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
             # TODO(cwan): refactor other backends
@@ -875,7 +960,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             w13_weight = layer.w13_weight
             w2_weight = layer.w2_weight
 
-        if hasattr(layer.w13_weight, "is_shuffled"):
+        if getattr(layer.w13_weight, "is_shuffled", False):
             w13_weight.is_shuffled = True
             w2_weight.is_shuffled = True
 
@@ -885,6 +970,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             quant_type=AiterQuantType.PER_1X32,
             w13_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
+            mxfp4_triton=getattr(self, "use_aiter_mxfp4_triton", False),
             expert_mask=layer.dispatcher.expert_mask_gpu,
         )
         return self.runner.run(dispatch_output, quant_info)

@@ -3402,7 +3402,7 @@ class Scheduler(
                             req.mamba_pool_idx.unsqueeze(-1)
                         )
                         req.mamba_pool_idx = None
-                break
+                continue
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()

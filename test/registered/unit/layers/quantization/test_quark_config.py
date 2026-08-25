@@ -91,6 +91,21 @@ class TestCheckSchemeSupportedError(CustomTestCase):
         self.assertFalse(ok)
 
 
+class TestSharedExpertFusionDecision(CustomTestCase):
+    def test_constructor_defers_precision_mismatch_to_model_gate(self):
+        config = QuarkConfig(
+            quant_config={
+                "exclude": [
+                    "model.layers.78.mlp.shared_experts.gate_proj",
+                ],
+                "packed_modules_mapping": {},
+            },
+            is_prequantized=True,
+        )
+
+        self.assertFalse(config.can_fuse_shared_expert())
+
+
 class TestMixedPrecisionLayerConfig(CustomTestCase):
     """NVFP4-only-experts + FP8-elsewhere online requant (quark_mxfp4).
 

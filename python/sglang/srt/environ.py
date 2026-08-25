@@ -437,6 +437,9 @@ class Envs:
     # ===================================================================
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    # Synchronize after each stage of the gfx942 MXFP4 Triton MoE adapter so
+    # asynchronous ROCm faults are attributed to the kernel that caused them.
+    SGLANG_DEBUG_MXFP4_TRITON_SYNC = EnvBool(False)
     # NaN-fill the unified memory pool at boot (debug repro switch).
     SGLANG_DEBUG_POISON_POOL = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
@@ -1371,6 +1374,10 @@ class Envs:
         False, deprecated_name="SGLANG_NSA_HIP_DISABLE_PRESHUFFLE"
     )
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
+    # Opt in to AITER's gfx942 FlyDSL ragged MQA-logits kernel. This replaces
+    # the Triton DSA-indexer kernel during prefill while preserving its API and
+    # masking semantics.
+    SGLANG_OPT_USE_FLYDSL_FP8_MQA_LOGITS = EnvBool(False)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
