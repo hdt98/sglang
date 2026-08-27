@@ -1455,6 +1455,20 @@ class HybridReqToTokenPool(ReqToTokenPool):
         """Return the ping-pong index holding the most recent tracked state."""
         return req.mamba_last_track_idx
 
+    def mamba_slots_needed(self, req: Req) -> int:
+        """Return the active Mamba slots still needed to allocate ``req``."""
+        needed = int(req.mamba_pool_idx is None)
+        if (
+            self.enable_mamba_extra_buffer
+            and req.mamba_ping_pong_track_buffer is None
+        ):
+            needed += (
+                1
+                if self.enable_mamba_extra_buffer_lazy
+                else self.mamba_ping_pong_track_buffer_size
+            )
+        return needed
+
     def _alloc_ping_pong_buffer(self, req: Req):
         """Allocate the ping-pong track buffer for a new request.
 

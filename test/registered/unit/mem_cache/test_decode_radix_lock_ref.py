@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.utils.common import Range
 
@@ -160,6 +161,56 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
             error,
             "SWA eviction insufficient: needed=192, available=128, req=req-1",
         )
+
+    def test_reclaim_mamba_prealloc_capacity_evicts_cached_state(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        req = SimpleNamespace(rid="req-1")
+        allocator = MagicMock()
+        allocator.available_size.side_effect = [0, 1]
+        queue.req_to_token_pool = MagicMock(mamba_allocator=allocator)
+        queue.req_to_token_pool.mamba_slots_needed.return_value = 1
+        queue.tree_cache = MagicMock()
+        queue.tree_cache.supports_mamba.return_value = True
+
+        error = queue._reclaim_mamba_prealloc_capacity(req)
+
+        self.assertIsNone(error)
+        params = queue.tree_cache.evict_for_alloc.call_args.args[0]
+        self.assertEqual(params.num_tokens, 0)
+        self.assertEqual(params.mamba_num, 1)
+
+    def test_reclaim_mamba_prealloc_capacity_fails_without_evictable_state(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        req = SimpleNamespace(rid="req-1")
+        allocator = MagicMock()
+        allocator.available_size.side_effect = [0, 0]
+        queue.req_to_token_pool = MagicMock(mamba_allocator=allocator)
+        queue.req_to_token_pool.mamba_slots_needed.return_value = 2
+        queue.tree_cache = MagicMock()
+        queue.tree_cache.supports_mamba.return_value = True
+
+        error = queue._reclaim_mamba_prealloc_capacity(req)
+
+        self.assertEqual(
+            error,
+            "Mamba state eviction insufficient for decode preallocation: "
+            "needed=2, available=0, req=req-1",
+        )
+
+    def test_mamba_slots_needed_accounts_for_existing_cow_state(self):
+        pool = object.__new__(HybridReqToTokenPool)
+        pool.enable_mamba_extra_buffer = True
+        pool.enable_mamba_extra_buffer_lazy = False
+        pool.mamba_ping_pong_track_buffer_size = 1
+        req = SimpleNamespace(
+            mamba_pool_idx=torch.tensor(3),
+            mamba_ping_pong_track_buffer=None,
+        )
+
+        self.assertEqual(pool.mamba_slots_needed(req), 1)
+
+        req.mamba_pool_idx = None
+        self.assertEqual(pool.mamba_slots_needed(req), 2)
 
     def _populate_prefix(self, cache, prefix_ids, prefix_values):
         """Insert a prefix into the tree so future requests can match it."""

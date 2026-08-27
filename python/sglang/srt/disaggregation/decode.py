@@ -1359,6 +1359,26 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     failed_reqs.append(decode_req)
                     indices_to_remove.add(i)
                     continue
+            mamba_reclaim_error = self._reclaim_mamba_prealloc_capacity(
+                decode_req.req
+            )
+            if mamba_reclaim_error is not None:
+                if prefix_match is not None and prefix_match.l1_prefix_len > 0:
+                    self._release_matched_prefix_lock(decode_req.req)
+                logger.error(mamba_reclaim_error)
+                prepare_abort(
+                    decode_req.req,
+                    mamba_reclaim_error,
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                self.scheduler.output_streamer.stream_output(
+                    [decode_req.req], decode_req.req.return_logprob
+                )
+                decode_req.kv_receiver.clear()
+                decode_req.kv_receiver = None
+                failed_reqs.append(decode_req)
+                indices_to_remove.add(i)
+                continue
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
@@ -1791,6 +1811,30 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             page_size=page_size,
         )
         return num_new_pages * page_size
+
+    def _reclaim_mamba_prealloc_capacity(self, req: Req) -> Optional[str]:
+        """Make cached Mamba slots available before PD request preallocation."""
+        allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+        slots_needed_fn = getattr(
+            self.req_to_token_pool, "mamba_slots_needed", None
+        )
+        if allocator is None or slots_needed_fn is None:
+            return None
+
+        slots_needed = slots_needed_fn(req)
+        available = allocator.available_size()
+        if available < slots_needed and self.tree_cache.supports_mamba():
+            self.tree_cache.evict_for_alloc(
+                EvictParams(mamba_num=slots_needed - available)
+            )
+            available = allocator.available_size()
+
+        if available < slots_needed:
+            return (
+                "Mamba state eviction insufficient for decode preallocation: "
+                f"needed={slots_needed}, available={available}, req={req.rid}"
+            )
+        return None
 
     def _pre_alloc(
         self,
