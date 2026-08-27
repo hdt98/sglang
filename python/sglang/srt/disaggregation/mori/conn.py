@@ -48,6 +48,37 @@ from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 logger = logging.getLogger(__name__)
 MORI_GUARD = b"MoriMsgGuard"
+_MORI_XGMI_ONLY_FALLBACK_PORT = 1
+
+
+def _ensure_xgmi_fallback_kernels(engine: IOEngine, actual_port: int) -> bool:
+    """Load Mori's XGMI kernels after its RDMA backend falls back to XGMI."""
+    # Mori reserves port 1 as kXgmiOnlyFallbackPlaceholderPort. Requesting the
+    # already-created XGMI backend is idempotent in Mori and makes its Python
+    # wrapper load the scatter/gather module as it does for explicit XGMI.
+    if actual_port != _MORI_XGMI_ONLY_FALLBACK_PORT:
+        return False
+
+    xgmi_backend = getattr(BackendType, "XGMI", None)
+    if xgmi_backend is None:
+        logger.warning(
+            "Mori XGMI-only fallback is active, but this Mori version does not "
+            "expose BackendType.XGMI; fragmented transfers will use peer copies"
+        )
+        return False
+
+    try:
+        engine.create_backend(xgmi_backend)
+    except Exception:
+        logger.warning(
+            "Failed to load Mori XGMI fallback kernels; fragmented transfers "
+            "will use peer copies",
+            exc_info=True,
+        )
+        return False
+
+    logger.info("Loaded Mori XGMI fallback kernels")
+    return True
 
 
 def _normalize_state_indices_per_component(
@@ -373,6 +404,7 @@ class MoriKVManager(CommonKVManager):
         engine.create_backend(BackendType.RDMA, rdma_cfg)
         actual_port = engine.get_engine_desc().port
         assert actual_port > 0, f"Failed to bind port for engine {engine_key}"
+        _ensure_xgmi_fallback_kernels(engine, actual_port)
         logger.debug(
             "Initialized Mori IOEngine %s at %s:%s (qp_per_transfer=%s, workers=%s, poll_mode=%s)",
             engine_key,
