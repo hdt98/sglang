@@ -41,7 +41,11 @@ from sglang.srt.disaggregation.common.utils import (
     pack_int_lists,
     unpack_int_lists,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    build_dsa_tail_transfer_blocks,
+    slice_dsa_tail_dst_ptrs_for_pp,
+)
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
@@ -1090,6 +1094,32 @@ class MoriKVManager(CommonKVManager):
         for i, st in enumerate(state_types):
             src_indices = src_state_indices[i] if i < len(src_state_indices) else None
             dst_indices = dst_state_indices[i] if i < len(dst_state_indices) else None
+            if st == "dsa_tail":
+                if src_indices is None or dst_indices is None:
+                    continue
+                if src_indices.size == 0 and dst_indices.size == 0:
+                    continue
+                src_descs = self.state_mem_descs[i]
+                dst_descs = peer_info.dst_state_mem_descs[i]
+                src_lens = (
+                    src_state_item_lens[i] if i < len(src_state_item_lens) else []
+                )
+                dst_lens = (
+                    peer_info.dst_state_item_lens[i]
+                    if i < len(peer_info.dst_state_item_lens)
+                    else []
+                )
+                statuses.extend(
+                    self._send_dsa_tail_state(
+                        src_indices,
+                        dst_indices,
+                        src_descs,
+                        dst_descs,
+                        src_lens,
+                        dst_lens,
+                    )
+                )
+                continue
             if src_indices is None or src_indices.size == 0:
                 continue
             if dst_indices is None or dst_indices.size == 0:
@@ -1141,6 +1171,74 @@ class MoriKVManager(CommonKVManager):
             else:
                 raise RuntimeError(f"PD state transfer failed: unknown state_type={st}")
 
+        return statuses
+
+    def _send_dsa_tail_state(
+        self,
+        src_state_indices: npt.NDArray[np.int32],
+        dst_state_indices: npt.NDArray[np.int32],
+        src_state_mem_descs: List[MemoryDesc],
+        dst_state_mem_descs: List[MemoryDesc],
+        src_state_item_lens: List[int],
+        dst_state_item_lens: List[int],
+    ) -> List[TransferStatus]:
+        dst_state_mem_descs = slice_dsa_tail_dst_ptrs_for_pp(
+            src_state_mem_descs,
+            dst_state_mem_descs,
+            self.kv_args.prefill_start_layer,
+            getattr(self.kv_args, "prefill_end_layer", None),
+        )
+        dst_state_item_lens = slice_dsa_tail_dst_ptrs_for_pp(
+            src_state_mem_descs,
+            dst_state_item_lens,
+            self.kv_args.prefill_start_layer,
+            getattr(self.kv_args, "prefill_end_layer", None),
+        )
+
+        if not (
+            len(src_state_mem_descs)
+            == len(dst_state_mem_descs)
+            == len(src_state_item_lens)
+            == len(dst_state_item_lens)
+        ):
+            raise RuntimeError(
+                "PD state transfer failed: DSA tail descriptor metadata mismatch "
+                f"(src_descs={len(src_state_mem_descs)}, "
+                f"dst_descs={len(dst_state_mem_descs)}, "
+                f"src_item_lens={len(src_state_item_lens)}, "
+                f"dst_item_lens={len(dst_state_item_lens)})"
+            )
+
+        src_indices = src_state_indices.tolist()
+        dst_indices = dst_state_indices.tolist()
+        statuses: List[TransferStatus] = []
+        for src_desc, dst_desc, src_item_len, dst_item_len in zip(
+            src_state_mem_descs,
+            dst_state_mem_descs,
+            src_state_item_lens,
+            dst_state_item_lens,
+        ):
+            # MemoryDesc already anchors each registered tensor. Synthetic zero
+            # bases make the shared helper return descriptor-relative offsets.
+            blocks = build_dsa_tail_transfer_blocks(
+                [0],
+                [src_item_len],
+                [0],
+                src_indices,
+                dst_indices,
+                [dst_item_len],
+            )
+            statuses.extend(
+                self._submit_batch_transfer_plan(
+                    src_desc,
+                    dst_desc,
+                    BatchTransferPlan(
+                        local_offsets=[src for src, _, _ in blocks],
+                        remote_offsets=[dst for _, dst, _ in blocks],
+                        sizes=[size for _, _, size in blocks],
+                    ),
+                )
+            )
         return statuses
 
     def _send_mamba_state(
