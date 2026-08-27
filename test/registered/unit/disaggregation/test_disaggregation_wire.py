@@ -35,6 +35,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.eagle_disaggregation import (
     build_eagle_disagg_draft_input,
@@ -552,6 +553,60 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
                 self.assertEqual(kv_args.state_data_ptrs[-1], expected_infos[0])
                 self.assertEqual(kv_args.state_data_lens[-1], expected_infos[1])
                 self.assertEqual(kv_args.state_item_lens[-1], expected_infos[2])
+
+
+def _make_dsa_pool(*, state_ptr, tail_ptr):
+    pool = object.__new__(DSATokenToKVPool)
+    pool.kpool_use_compress = True
+    pool.get_state_buf_infos = lambda: _buf_infos(state_ptr)
+    pool.get_compress_tail_buf_infos = lambda: _buf_infos(tail_ptr)
+    return pool
+
+
+def _make_hybrid_dsa_pool(*, mamba_ptr, dsa_pool):
+    pool = object.__new__(HybridLinearKVPool)
+    pool.use_dsa = True
+    pool.full_kv_pool = dsa_pool
+    pool.get_state_buf_infos = lambda: _buf_infos(mamba_ptr)
+    pool.get_state_dim_per_tensor = lambda: []
+    pool.get_state_conv_shard_groups = lambda: []
+    pool.get_state_slice_outer_counts = lambda: []
+    pool.get_state_layer_ids = lambda: []
+    return pool
+
+
+class TestHybridDSADraftStateRegistration(unittest.TestCase):
+    def test_draft_dsa_state_is_registered_after_hybrid_target_state(self):
+        target_dsa = _make_dsa_pool(state_ptr=21, tail_ptr=31)
+        draft_dsa = _make_dsa_pool(state_ptr=41, tail_ptr=51)
+        target = _make_hybrid_dsa_pool(mamba_ptr=11, dsa_pool=target_dsa)
+
+        for name, draft in (
+            ("bare", draft_dsa),
+            (
+                "hybrid_wrapper",
+                _make_hybrid_dsa_pool(mamba_ptr=61, dsa_pool=draft_dsa),
+            ),
+        ):
+            with self.subTest(name=name):
+                kv_args = KVArgs()
+
+                setup_state_kv_args(kv_args, target, draft)
+
+                self.assertEqual(
+                    kv_args.state_types,
+                    [
+                        StateType.MAMBA,
+                        StateType.DSA,
+                        StateType.DSA_TAIL,
+                        StateType.DSA,
+                        StateType.DSA_TAIL,
+                    ],
+                )
+                self.assertEqual(
+                    kv_args.state_data_ptrs,
+                    [[11], [21], [31], [41], [51]],
+                )
 
 
 if __name__ == "__main__":

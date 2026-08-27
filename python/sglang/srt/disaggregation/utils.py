@@ -1398,6 +1398,22 @@ def setup_state_kv_args(
                     dsa_item_lens,
                 )
                 append_dsa_tail(dsa_pool)
+
+                draft_dsa_pool = draft_token_to_kv_pool
+                if isinstance(draft_dsa_pool, HybridLinearKVPool):
+                    draft_dsa_pool = draft_dsa_pool.full_kv_pool
+                if isinstance(draft_dsa_pool, DSATokenToKVPool):
+                    draft_ptrs, draft_lens, draft_item_lens = (
+                        draft_dsa_pool.get_state_buf_infos()
+                    )
+                    append_state_component(
+                        kv_args,
+                        StateType.DSA,
+                        draft_ptrs,
+                        draft_lens,
+                        draft_item_lens,
+                    )
+                    append_dsa_tail(draft_dsa_pool)
         elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
             tail_ptrs, tail_lens, tail_item_lens = [], [], []
             if isinstance(token_to_kv_pool, DSATokenToKVPool):
