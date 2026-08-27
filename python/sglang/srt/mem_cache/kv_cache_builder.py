@@ -111,6 +111,20 @@ def uses_ssm_state(model_config) -> bool:
     )
 
 
+def _validate_decode_radix_tree_support(
+    *, enabled: bool, mode: str, tree_cache: object, is_hybrid_ssm: bool
+) -> None:
+    """Validate capabilities that are known only after selecting the tree cache."""
+    if not enabled or mode != "decode" or not is_hybrid_ssm:
+        return
+    if not tree_cache.supports_mamba():
+        raise ValueError(
+            "--disaggregation-decode-enable-radix-cache with Mamba/SSM models "
+            "requires a radix-cache backend with Mamba state support; selected "
+            f"{type(tree_cache).__name__}"
+        )
+
+
 def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
     """Resolve the retraction backend onto the config bags and return it.
 
@@ -234,8 +248,8 @@ def build_kv_cache(
 
     # Decode-side radix cache supports SWA only through the unified tree, whose
     # component pools preserve the full-attention prefix while transferring the
-    # SWA window fresh. The legacy SWA cache and hybrid SSM pools remain
-    # incompatible with the prefix-match-and-lock allocation path.
+    # SWA window fresh. Mamba support is validated against the selected tree's
+    # capabilities after construction below.
     if (
         get_disagg().disaggregation_decode_enable_radix_cache
         and get_disagg().disaggregation_mode == "decode"
@@ -264,12 +278,6 @@ def build_kv_cache(
                     "--disaggregation-decode-enable-radix-cache does not support "
                     "SWA-compress models (e.g. Gemma4 / MiMo-V2) yet."
                 )
-        if is_hybrid_ssm:
-            raise ValueError(
-                "--disaggregation-decode-enable-radix-cache is incompatible "
-                "with Mamba/SSM models"
-            )
-
     effective_chunked_prefill_size = get_schedule().chunked_prefill_size
     if model_config.is_multimodal and uses_transformers_backend:
         effective_chunked_prefill_size = None
@@ -325,6 +333,13 @@ def build_kv_cache(
             tp_rank=ps.tp_rank,
             tp_group=tp_group,
         )
+    )
+    disagg = get_disagg()
+    _validate_decode_radix_tree_support(
+        enabled=disagg.disaggregation_decode_enable_radix_cache,
+        mode=disagg.disaggregation_mode,
+        tree_cache=tree_cache,
+        is_hybrid_ssm=is_hybrid_ssm,
     )
 
     if (

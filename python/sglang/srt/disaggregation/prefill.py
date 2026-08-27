@@ -1207,8 +1207,9 @@ class SchedulerDisaggregationPrefillMixin:
                 return kv_to_page_indices(window_kv_indices_swa, page_size)
 
             def _full_kv_pages_payload():
+                # Decode radix already owns the matched prefix's DSA rows.
                 kv_indices_full = self.req_to_token_pool.req_to_token[
-                    req.req_pool_idx, :seq_len
+                    req.req_pool_idx, req.disagg_decode_prefix_len : seq_len
                 ]
                 return kv_to_page_indices(kv_indices_full, page_size)
 

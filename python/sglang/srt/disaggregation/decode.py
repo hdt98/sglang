@@ -1438,8 +1438,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 return kv_to_page_indices(window_kv_indices_swa, page_size)
 
             def _full_kv_pages_payload():
+                # The matched decode prefix already owns its DSA rows. Register
+                # destinations only for the suffix that prefill will send.
                 kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx, :seq_len
+                    decode_req.req.req_pool_idx, total_prefix_len:seq_len
                 ]
                 # Indexer lives on device pool; always use device page_size
                 device_page_size = self.token_to_kv_pool.page_size

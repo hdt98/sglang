@@ -73,6 +73,11 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
 
     if cfg.disaggregation_mode == "decode":
         if cfg.disaggregation_decode_enable_radix_cache:
+            if cfg.enable_hierarchical_cache:
+                raise ValueError(
+                    "--disaggregation-decode-enable-radix-cache is incompatible "
+                    "with --enable-hierarchical-cache (HiCache)"
+                )
             if cfg.enable_hisparse:
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache is incompatible "
@@ -84,10 +89,17 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "with --disaggregation-transfer-backend fake"
                 )
             if cfg.speculative_algorithm is not None:
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache is incompatible "
-                    "with speculative decoding "
-                    f"(--speculative-algorithm {cfg.speculative_algorithm})"
+                speculative_algorithm = cfg.speculative_algorithm.upper()
+                if speculative_algorithm not in ("EAGLE", "NEXTN"):
+                    raise ValueError(
+                        "--disaggregation-decode-enable-radix-cache only supports "
+                        "EAGLE/NEXTN speculative decoding; got "
+                        f"--speculative-algorithm {cfg.speculative_algorithm}"
+                    )
+                logger.warning(
+                    "EXPERIMENTAL: PD decode radix cache with EAGLE/NEXTN. "
+                    "Prefill and decode must use matched EAGLE settings; "
+                    "DCP, HiCache, and HiSparse remain unsupported."
                 )
             from sglang.srt.arg_groups.overrides import resolved_view
 

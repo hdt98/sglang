@@ -126,6 +126,18 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         ),
     )
 
+    if (
+        cfg.disaggregation_mode == "decode"
+        and cfg.disaggregation_decode_enable_radix_cache
+        and cfg.speculative_algorithm is not None
+        and cfg.speculative_algorithm != "EAGLE"
+    ):
+        raise ValueError(
+            "PD decode radix cache only supports resolved EAGLE speculative "
+            "decoding (raw EAGLE/NEXTN); got resolved "
+            f"--speculative-algorithm {cfg.speculative_algorithm}"
+        )
+
     # Validate --speculative-draft-window-size once, regardless of algorithm.
     # Consumed by DFLASH (compact draft KV cache) and Llama EAGLE-3 (drafter attention SWA).
     if cfg.speculative_draft_window_size is not None:

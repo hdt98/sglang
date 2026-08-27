@@ -53,9 +53,12 @@ readonly PREFILL_MEM_FRACTION_STATIC="${PREFILL_MEM_FRACTION_STATIC:-0.85}"
 readonly DECODE_MEM_FRACTION_STATIC="${DECODE_MEM_FRACTION_STATIC:-0.80}"
 readonly DECODE_CUDA_GRAPH_BACKEND="${DECODE_CUDA_GRAPH_BACKEND:-full}"
 readonly DECODE_CUDA_GRAPH_MAX_BS="${DECODE_CUDA_GRAPH_MAX_BS:-64}"
+readonly ENABLE_DECODE_RADIX_CACHE="${ENABLE_DECODE_RADIX_CACHE:-1}"
+readonly JSON_MODEL_OVERRIDE_ARGS="${JSON_MODEL_OVERRIDE_ARGS:-}"
 readonly SPECULATIVE_NUM_STEPS="${SPECULATIVE_NUM_STEPS:-5}"
 readonly SPECULATIVE_NUM_DRAFT_TOKENS="${SPECULATIVE_NUM_DRAFT_TOKENS:-6}"
 readonly ENABLE_SPECULATIVE_DECODING="${ENABLE_SPECULATIVE_DECODING:-1}"
+readonly ENABLE_SPECULATIVE_ADAPTIVE="${ENABLE_SPECULATIVE_ADAPTIVE:-0}"
 readonly PREFILL_AITER_ALLREDUCE_FUSION="${PREFILL_AITER_ALLREDUCE_FUSION:-1}"
 readonly DECODE_AITER_ALLREDUCE_FUSION="${DECODE_AITER_ALLREDUCE_FUSION:-1}"
 readonly PREFILL_QUICK_REDUCE_QUANTIZATION="${PREFILL_QUICK_REDUCE_QUANTIZATION:-${ROCM_QUICK_REDUCE_QUANTIZATION:-INT4}}"
@@ -145,6 +148,26 @@ if [[ "${ENABLE_SPECULATIVE_DECODING}" == "1" ]]; then
   )
 fi
 
+if [[ "${ENABLE_SPECULATIVE_ADAPTIVE}" == "1" ]]; then
+  SPECULATIVE_ARGS+=(--speculative-adaptive)
+elif [[ "${ENABLE_SPECULATIVE_ADAPTIVE}" != "0" ]]; then
+  echo "ENABLE_SPECULATIVE_ADAPTIVE must be 0 or 1; got ${ENABLE_SPECULATIVE_ADAPTIVE}" >&2
+  exit 2
+fi
+
+declare -a MODEL_OVERRIDE_ARGS=()
+if [[ -n "${JSON_MODEL_OVERRIDE_ARGS}" ]]; then
+  MODEL_OVERRIDE_ARGS=(--json-model-override-args "${JSON_MODEL_OVERRIDE_ARGS}")
+fi
+
+declare -a DECODE_RADIX_ARGS=()
+if [[ "${ENABLE_DECODE_RADIX_CACHE}" == "1" ]]; then
+  DECODE_RADIX_ARGS=(--disaggregation-decode-enable-radix-cache)
+elif [[ "${ENABLE_DECODE_RADIX_CACHE}" != "0" ]]; then
+  echo "ENABLE_DECODE_RADIX_CACHE must be 0 or 1; got ${ENABLE_DECODE_RADIX_CACHE}" >&2
+  exit 2
+fi
+
 # ---------------------------------------------------------------------------
 # Derived values
 # ---------------------------------------------------------------------------
@@ -212,8 +235,10 @@ echo "[$(date -u +%FT%TZ)] GLM-5.3 Flash FP8 PD -- stamp=${S}"
 echo "[$(date -u +%FT%TZ)] Prefill: TP=${PREFILL_TP_SIZE} PP=${PREFILL_PP_SIZE} DP=${PREFILL_DP_SIZE} EP=${PREFILL_EP_SIZE} GPUs=${PREFILL_GPU_IDS}"
 echo "[$(date -u +%FT%TZ)] Decode:  TP=${DECODE_TP_SIZE} PP=${DECODE_PP_SIZE} DP=${DECODE_DP_SIZE} EP=${DECODE_EP_SIZE} GPUs=${DECODE_GPU_IDS}"
 echo "[$(date -u +%FT%TZ)] Transfer: ${DISAGGREGATION_TRANSFER_BACKEND} (XGMI enabled), CP=${PREFILL_CP_STRATEGY}"
-echo "[$(date -u +%FT%TZ)] Spec decode: enabled=${ENABLE_SPECULATIVE_DECODING} steps=${SPECULATIVE_NUM_STEPS} draft=${SPECULATIVE_NUM_DRAFT_TOKENS}"
+echo "[$(date -u +%FT%TZ)] Spec decode: enabled=${ENABLE_SPECULATIVE_DECODING} adaptive=${ENABLE_SPECULATIVE_ADAPTIVE} steps=${SPECULATIVE_NUM_STEPS} draft=${SPECULATIVE_NUM_DRAFT_TOKENS}"
 echo "[$(date -u +%FT%TZ)] CUDA graph decode: ${DECODE_CUDA_GRAPH_BACKEND} max_bs=${DECODE_CUDA_GRAPH_MAX_BS}"
+echo "[$(date -u +%FT%TZ)] Decode radix cache: ${ENABLE_DECODE_RADIX_CACHE}"
+echo "[$(date -u +%FT%TZ)] Model overrides: ${JSON_MODEL_OVERRIDE_ARGS:-none}"
 echo "[$(date -u +%FT%TZ)] Mem fraction: prefill=${PREFILL_MEM_FRACTION_STATIC} decode=${DECODE_MEM_FRACTION_STATIC}"
 echo "[$(date -u +%FT%TZ)] QuickReduce: prefill=${PREFILL_QUICK_REDUCE_QUANTIZATION} decode=${DECODE_QUICK_REDUCE_QUANTIZATION}"
 echo "[$(date -u +%FT%TZ)] Shared experts fusion: prefill=${PREFILL_SHARED_EXPERTS_FUSION} decode=${DECODE_SHARED_EXPERTS_FUSION}"
@@ -240,6 +265,7 @@ env -u CUDA_VISIBLE_DEVICES -u MC_FORCE_TCP -u MOONCAKE_PROTOCOL -u SGLANG_PP_LA
     "${PREFILL_DP_ARGS[@]}" "${PREFILL_CP_ARGS[@]}" \
     "${PREFILL_MOE_ARGS[@]}" "${PREFILL_SHARED_EXPERTS_ARGS[@]}" \
     --quantization fp8 --trust-remote-code --kv-cache-dtype fp8_e4m3 \
+    "${MODEL_OVERRIDE_ARGS[@]}" \
     --attention-backend dsa --dsa-prefill-backend tilelang --dsa-decode-backend tilelang \
     --linear-attn-backend triton --moe-runner-backend aiter \
     "${PREFILL_ALLREDUCE_ARGS[@]}" \
@@ -286,6 +312,7 @@ env -u CUDA_VISIBLE_DEVICES -u MC_FORCE_TCP -u MOONCAKE_PROTOCOL -u SGLANG_PP_LA
     "${DECODE_DP_ARGS[@]}" \
     "${DECODE_MOE_ARGS[@]}" "${DECODE_SHARED_EXPERTS_ARGS[@]}" \
     --quantization fp8 --trust-remote-code --kv-cache-dtype fp8_e4m3 \
+    "${MODEL_OVERRIDE_ARGS[@]}" \
     --attention-backend dsa --dsa-prefill-backend tilelang --dsa-decode-backend tilelang \
     --linear-attn-backend triton --moe-runner-backend aiter \
     "${DECODE_ALLREDUCE_ARGS[@]}" \
@@ -298,6 +325,7 @@ env -u CUDA_VISIBLE_DEVICES -u MC_FORCE_TCP -u MOONCAKE_PROTOCOL -u SGLANG_PP_LA
     "${SPECULATIVE_ARGS[@]}" \
     --num-reserved-decode-tokens 1024 \
     --disaggregation-mode decode --disaggregation-transfer-backend ${DISAGGREGATION_TRANSFER_BACKEND} \
+    "${DECODE_RADIX_ARGS[@]}" \
     --disaggregation-bootstrap-port ${BOOT} --nccl-port ${D_NCCL} \
     --enable-metrics --enable-cache-report --enable-request-time-stats-logging \
     --random-seed 0 --watchdog-timeout 3600 \

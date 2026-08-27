@@ -710,6 +710,71 @@ class TestLoadBalanceMethod(unittest.TestCase):
             str(context.exception),
         )
 
+    def test_pd_decode_radix_cache_accepts_eagle_and_nextn(self):
+        for algorithm in ("EAGLE", "NEXTN"):
+            with self.subTest(algorithm=algorithm):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    disaggregation_mode="decode",
+                    disaggregation_decode_enable_radix_cache=True,
+                    disaggregation_transfer_backend="nixl",
+                    speculative_algorithm=algorithm,
+                )
+                with self.assertLogs(
+                    pd_disaggregation_hook.logger, level="WARNING"
+                ) as logs:
+                    server_args._handle_pd_disaggregation()
+
+                self.assertFalse(resolution_result(server_args, "disable_radix_cache"))
+                self.assertEqual(server_args.speculative_algorithm, algorithm)
+                self.assertIn(
+                    "Prefill and decode must use matched EAGLE settings",
+                    "\n".join(logs.output),
+                )
+
+    def test_pd_decode_radix_cache_rejects_other_speculative_algorithms(self):
+        for algorithm in ("EAGLE3", "DFLASH", "FROZEN_KV_MTP", "NGRAM"):
+            with self.subTest(algorithm=algorithm):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    disaggregation_mode="decode",
+                    disaggregation_decode_enable_radix_cache=True,
+                    disaggregation_transfer_backend="nixl",
+                    speculative_algorithm=algorithm,
+                )
+                with self.assertRaisesRegex(ValueError, "only supports EAGLE/NEXTN"):
+                    server_args._handle_pd_disaggregation()
+
+    def test_pd_decode_radix_cache_rejects_hicache(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="nixl",
+            enable_hierarchical_cache=True,
+        )
+        with self.assertRaisesRegex(ValueError, "HiCache"):
+            server_args._handle_pd_disaggregation()
+
+    @patch(
+        "sglang.srt.arg_groups.speculative_hook._resolve_speculative_algorithm_alias",
+        return_value="FROZEN_KV_MTP",
+    )
+    def test_pd_decode_radix_cache_rejects_non_eagle_resolved_alias(
+        self, _resolve_alias
+    ):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="nixl",
+            speculative_algorithm="NEXTN",
+        )
+        server_args._handle_pd_disaggregation()
+
+        with self.assertRaisesRegex(ValueError, "resolved EAGLE"):
+            handle_speculative_decoding(server_args)
+
     def test_pd_decode_radix_cache_allows_mooncake_tcp(self):
         server_args = self._load_balance_args(
             disaggregation_mode="decode",
