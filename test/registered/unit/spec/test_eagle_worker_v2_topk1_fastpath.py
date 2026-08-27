@@ -361,6 +361,33 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
 
         self.assertIs(dw.draft_runner.attn_backend, new_extend_backend)
 
+    def test_trivial_verify_input_normalizes_bonus_tokens_to_int64(self):
+        worker = object.__new__(EAGLEWorkerV2)
+        worker.device = DEVICE
+        worker.topk = 1
+        worker._target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                attn_backend=SimpleNamespace(
+                    verify_mask=None,
+                    max_context_len=32,
+                )
+            )
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            spec_info=SimpleNamespace(
+                bonus_tokens=torch.tensor([11, 17], dtype=torch.int32, device=DEVICE)
+            ),
+            seq_lens=torch.tensor([7, 9], dtype=torch.int32, device=DEVICE),
+            seq_lens_sum=16,
+            seq_lens_cpu=None,
+        )
+
+        verify_input = worker._build_trivial_verify_input(batch)
+
+        self.assertEqual(verify_input.draft_token.dtype, torch.long)
+        self.assertEqual(verify_input.draft_token.tolist(), [11, 17])
+
     def test_spec_v2_attn_backends_include_draft_extend_fallback(self):
         target_backend = object()
         decode_backend = object()

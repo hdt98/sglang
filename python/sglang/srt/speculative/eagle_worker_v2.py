@@ -1382,7 +1382,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         positions = batch.seq_lens.to(torch.int64)
 
         return EagleVerifyInput(
-            draft_token=draft_input.bonus_tokens,
+            # The zero-step path bypasses the regular tree builder, which
+            # normally normalizes candidate IDs to the verifier's int64 ABI.
+            draft_token=draft_input.bonus_tokens.to(dtype=torch.long),
             custom_mask=custom_mask,
             positions=positions,
             retrieve_index=retrieve_index,
