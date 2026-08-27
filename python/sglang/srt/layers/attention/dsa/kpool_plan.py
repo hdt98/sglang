@@ -738,7 +738,7 @@ def update_kpool_write_plan(
     effective_n_per_batch: Optional[torch.Tensor] = None,
     include_deep_gemm_schedule: bool = True,
 ) -> None:
-    if not _is_kpool_layout_enabled(pool_size, real_page_size) or not is_cuda():
+    if not _is_kpool_layout_enabled(pool_size, real_page_size):
         return
     is_verify = forward_mode.is_target_verify()
     is_decode = forward_mode.is_decode_or_idle()

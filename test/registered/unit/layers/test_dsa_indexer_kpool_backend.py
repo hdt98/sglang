@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.layers.attention.dsa import dsa_indexer_kpool
+from sglang.srt.layers.attention.dsa import kpool_plan
 from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
     _topk_from_pooled_history_logits_unfused,
 )
@@ -16,6 +17,32 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestKPoolMqaBackend(CustomTestCase):
+    def test_kpool_write_plan_update_runs_on_rocm(self):
+        metadata = MagicMock()
+        metadata.kpool_write_plan.pool_schedule_metadata = None
+        forward_mode = MagicMock()
+        forward_mode.is_target_verify.return_value = True
+        forward_mode.is_decode_or_idle.return_value = False
+        forward_mode.is_draft_extend_v2.return_value = False
+
+        with (
+            patch.object(kpool_plan, "is_cuda", return_value=False),
+            patch.object(kpool_plan, "update_kpool_write_plan_cuda_graph") as update,
+        ):
+            kpool_plan.update_kpool_write_plan(
+                metadata,
+                write_start=torch.tensor([0], dtype=torch.int32),
+                req_pool_indices=torch.tensor([0], dtype=torch.int32),
+                real_page_table=torch.tensor([[1]], dtype=torch.int32),
+                pool_size=4,
+                real_page_size=64,
+                num_draft_tokens=6,
+                forward_mode=forward_mode,
+                slots_per_page=16,
+            )
+
+        update.assert_called_once()
+
     def test_cuda_tilelang_selector_reads_heads_from_unexpanded_query(self):
         with (
             patch.object(dsa_indexer_kpool, "is_cuda", return_value=True),
