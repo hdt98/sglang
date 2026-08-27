@@ -135,6 +135,10 @@ def _use_tilelang_mhc_post() -> bool:
     return envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get() and not is_hip()
 
 
+def _use_aiter_mhc() -> bool:
+    return is_hip() and envs.SGLANG_USE_AITER.get()
+
+
 FP8 = "float8_e4m3"
 BF16 = "bfloat16"
 FP32 = "float32"
@@ -1659,6 +1663,45 @@ def _mhc_post_torch(
     return out.type_as(x)
 
 
+def _mhc_pre_aiter(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    from aiter.ops.mhc import mhc_pre as aiter_mhc_pre
+
+    return aiter_mhc_pre(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+    )
+
+
+def _mhc_post_aiter(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> torch.Tensor:
+    from aiter.ops.mhc import mhc_post as aiter_mhc_post
+
+    out = torch.empty_like(residual)
+    aiter_mhc_post(out, x, residual, post_layer_mix, comb_res_mix)
+    return out
+
+
 @torch._dynamo.disable
 def _mhc_pre_dispatch(
     residual: torch.Tensor,
@@ -1678,6 +1721,20 @@ def _mhc_pre_dispatch(
     Returns (post_mix=(s,n,1), comb_mix=(s,n,n), layer_input=(s,h), norm_fused).
     """
     assert residual.dim() == 3, f"residual must be (s, n, h); got {residual.shape}"
+    if _use_aiter_mhc():
+        post_mix, comb_mix, layer_input = _mhc_pre_aiter(
+            residual=residual,
+            fn=fn,
+            hc_scale=hc_scale,
+            hc_base=hc_base,
+            rms_eps=rms_eps,
+            hc_pre_eps=hc_pre_eps,
+            hc_sinkhorn_eps=hc_sinkhorn_eps,
+            hc_post_mult_value=hc_post_mult_value,
+            sinkhorn_repeat=sinkhorn_repeat,
+        )
+        return post_mix, comb_mix, layer_input, False
+
     if not _use_tilelang_mhc_pre():
         post_mix, comb_mix, layer_input = _mhc_pre_torch(
             residual=residual,
@@ -1717,6 +1774,8 @@ def _mhc_post_dispatch(
 ) -> torch.Tensor:
     assert x.dim() == 2 and residual.dim() == 3
     assert post_layer_mix.dim() == 3 and comb_res_mix.dim() == 3
+    if _use_aiter_mhc():
+        return _mhc_post_aiter(x, residual, post_layer_mix, comb_res_mix)
     if not _use_tilelang_mhc_post():
         return _mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
     return mhc_post(x, residual, post_layer_mix, comb_res_mix)
