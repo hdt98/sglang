@@ -34,7 +34,10 @@ never substituted for either decode-throughput gate.
 
 - TP4 prefill on GPUs 0-3 and TP4 decode on GPUs 4-7 for the reference cell
 - MoRI XGMI KV transfer
-- EAGLE speculative decode on the decode role only, with adaptive 5/1/6 gears
+- EAGLE speculative token decoding on the decode role only, with adaptive
+  5/1/6 gears. The prefill role runs the matched draft-state prefill path so it
+  can hand off draft KV, hidden state, first-token probabilities, and DSA seed
+  indices; it does not decode output tokens.
 - Full target-model decode graphs
 - Decode radix cache enabled for the hybrid KDA model
 - FP8 attention KV cache
@@ -104,7 +107,7 @@ is diagnostic only and cannot establish the final decode ranking.
 
 ## Current candidates
 
-Published SGLang source: `a8447ac53a8bb4a8b7d9cb203dfcf728fed8ca4c`.
+Runtime SGLang candidate: `a8447ac53a8bb4a8b7d9cb203dfcf728fed8ca4c`.
 
 - Adaptive speculative graph capture now sizes every gear and shares one
   process-wide capture stream, reducing graph scratch pressure on KV/KDA.
@@ -123,19 +126,61 @@ Dormant CR7 containers:
 
 They must be started only with exact GPUardian authorization.
 
+## ROCm library audit
+
+The pinned image is not carrying a recent `rocm-libraries` snapshot. Its
+installed packages are ROCm 7.2.0, hipBLASLt 1.2.1, rocBLAS 5.2.0, and RCCL
+2.27.7. The hipBLASLt binary reports git revision `5b515cf1bc`, while the
+synced `hdt98/rocm-libraries` fork is at `ac26ef164c7`.
+
+The r18 prefill trace makes the useful part of that delta precise. On one TP
+rank, hipBLASLt/Tensile kernels account for 6.43% of summed GPU kernel time.
+Within that subtotal, 99.44% is the gfx942 `BBS` family and only 0.56% is
+single precision; HHS is effectively zero. The hottest `BBS` kernel alone is
+4.55% of total kernel time.
+
+Relevant upstream work is therefore limited to the gfx942 `BBS` tuning line:
+
+- `904b35244dd`: large-K BBS grid tuning
+- `d930bfea324`: exact BBS/TN tuning
+- `f88ee60fb47`: broader gfx942 BBS grid and equality tuning
+- `8c12dadbfd8`: later gfx942 BBS/TN grid tuning
+
+The first matched library experiment should use an isolated hipBLASLt
+1.2-series build through `f88ee60fb47`, because it retains the image's major
+ABI while including the direct BBS tuning. The later `8c12dadbfd8` source is
+hipBLASLt 1.4.0 and must not be overlaid as though it were ABI-equivalent.
+Neither build should replace the node or image libraries globally.
+
+Several superficially relevant commits are excluded: the 38-CU
+WorkgroupMappingXCC fix targets CPX, while CR7 is SPX/NPS1; HHS and F8NBS
+tuning do not match the traced datatype family; CK's CompV4 barrier removal is
+already older than the CK pins in both the baseline and candidate AITER trees;
+and RCCL is not present in this monorepo. Since hipBLASLt is only 6.43% of the
+current prefill trace, this A/B follows the current-head, FlyDSL, AITER, and
+topology cells unless a new trace raises its share.
+
 ## Experiment order
 
 1. Current HEAD smoke C8 with FlyDSL enabled.
 2. Clean restart, then full uncapped C16.
 3. Matched FlyDSL off/on smoke if the new prefill trace does not prove the gain.
 4. Matched AITER baseline/`a5b691e3` smoke.
-5. Role-local KDA cap: prefill max-running 16 with KDA cap 64; decode
+5. Matched isolated hipBLASLt 1.2 baseline/`f88ee60fb47` smoke if the new
+   trace still shows material `BBS` time.
+6. Role-local KDA cap: prefill max-running 16 with KDA cap 64; decode
    max-running 24 with KDA cap 96. Verify startup capacity before benchmarking.
-6. Prefill topology cells, in trace order: TP4 without CP, TP4/EP4 MoRI A2A,
+7. Matched prefill draft-state on/off smoke. A GLM-5.2 Messi target-only
+   prefill produced a correct 131K-token NIAH answer, so the mode is
+   semantically viable, but its C4 GSP attempts completed zero warmup
+   sequences and do not establish a performance win. Promote it only if
+   AgentX shows lower TTFT without degrading speculative acceptance or decode
+   throughput.
+8. Prefill topology cells, in trace order: TP4 without CP, TP4/EP4 MoRI A2A,
    then DP2 x TP2 if the collective profile still dominates.
-7. Profile the winning prefill and decode cells separately with the same seeded
+9. Profile the winning prefill and decode cells separately with the same seeded
    AgentX replay.
-8. Run full C16 and increase concurrency until one of the four gates or
+10. Run full C16 and increase concurrency until one of the four gates or
    resident KV/KDA capacity fails. Confirm the last passing point with a clean
    restart.
 
