@@ -71,6 +71,20 @@ Artifacts:
 | KV / KDA peak usage | 15% / 2% |
 | Retractions | 0 |
 
+Startup allocation confirms that r22 is not KV- or KDA-capacity-bound at C8.
+On each prefill rank, the KDA/Mamba pool admits 714 states and consumes 0.86 GB
+of convolution state plus 24.44 GB of SSM state. The target KV pool holds
+14,175,552 tokens in 93.52 GB and the matched draft KV pool holds the same token
+count in 8.50 GB, leaving about 39.8 GB after both pools. On each decode rank,
+the KDA/Mamba pool admits 656 states and consumes 0.79 GB of convolution state,
+22.46 GB of SSM state, 33.09 GB of intermediate SSM state, and 1.16 GB of
+intermediate convolution state. Decode allocates 10,005,632 target KV tokens
+in 66.01 GB plus the matched draft pool in 6.00 GB, leaving about 39.0 GB before
+graph capture. Full target verification graphs consume another 4.00 GB per
+rank; the adaptive draft decode/extend graph tiers reduce the final reported
+free memory to about 15.3 GB. These are stable allocations, not the stale
+75-GB draft-model estimate used in earlier diagnosis.
+
 ## Trace attribution
 
 The decode-side `transfer_duration` timer is not pure XGMI latency. Matching
