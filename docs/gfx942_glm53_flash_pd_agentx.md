@@ -154,6 +154,15 @@ Runtime SGLang candidate: `a8447ac53a8bb4a8b7d9cb203dfcf728fed8ca4c`.
   three gfx942 code objects. It replaces the exact old `32x256` kernel loaded by
   r22 for M=32-256. AITER's isolated tuned times improve 10.4-13.0%, while the
   new binaries also fix a missing scale barrier.
+- The later AITER `48718fa7b` retune is a clean one-line overlay on the image's
+  exact parent file, but it changes only the `block_m == 16` Triton path. All
+  65,152 traced prefill A8W8 blockscale GEMM dispatches and all 2,490 dispatches
+  in the stale four-rank decode capture use `BLOCK_SIZE_M=128`. The file is
+  staged at `/scratch/sonle5/aiter-48718fa7-overlay` for a later EP-only A/B if
+  expert sharding makes M16 visible; it cannot improve the current TP4 trace.
+  Other newly synced AITER commits are excluded from the baseline: the GLM5
+  regression and retune are FP4/gfx950-only, the split-K configs target
+  Kimi-K3, and the new MLA kernels do not serve GLM-5.3's DSA path.
 
 Dormant CR7 containers:
 
