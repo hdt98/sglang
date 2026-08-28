@@ -114,6 +114,10 @@ Runtime SGLang candidate: `a8447ac53a8bb4a8b7d9cb203dfcf728fed8ca4c`.
 - The checkpoint's gfx942 FlyDSL ragged FP8 MQA resolver is wired into both the
   legacy and GLM-5.3 kpool indexers. The launcher exposes a matched on/off
   switch and defaults it on.
+- The launcher now separates decode speculative arguments from prefill
+  draft-state arguments. `ENABLE_PREFILL_DRAFT_STATE=0` enables the target-only
+  prefill A/B without disabling EAGLE on decode; the matched path remains the
+  default.
 - A minimal AITER `a5b691e3` overlay contains only the GLM-5 FP8 tuned CSV and
   three gfx942 code objects. It replaces the exact old `32x256` kernel loaded by
   r22 for M=32-256. AITER's isolated tuned times improve 10.4-13.0%, while the
@@ -170,7 +174,8 @@ topology cells unless a new trace raises its share.
    trace still shows material `BBS` time.
 6. Role-local KDA cap: prefill max-running 16 with KDA cap 64; decode
    max-running 24 with KDA cap 96. Verify startup capacity before benchmarking.
-7. Matched prefill draft-state on/off smoke. A GLM-5.2 Messi target-only
+7. Matched prefill draft-state on/off smoke with
+   `ENABLE_PREFILL_DRAFT_STATE`. A GLM-5.2 Messi target-only
    prefill produced a correct 131K-token NIAH answer, so the mode is
    semantically viable, but its C4 GSP attempts completed zero warmup
    sequences and do not establish a performance win. Promote it only if

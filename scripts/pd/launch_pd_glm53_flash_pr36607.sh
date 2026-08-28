@@ -5,7 +5,8 @@ set -euo pipefail
 # on gfx942 (MI325X) with upstream PR #36607 kpool/ROCm fixes.
 #
 # Config: TP4 prefill + TP4 decode, MoRI XGMI transfer,
-#         CP-interleave on prefill, EAGLE/NEXTN spec decode (5 steps),
+#         CP-interleave on prefill, matched EAGLE draft-state prefill,
+#         EAGLE speculative token decode (5 steps) on the decode role,
 #         CUDA graph full on decode, INT4 QuickReduce on both roles.
 #
 # Usage: docker exec -e RUN_STAMP=<tag> \
@@ -68,6 +69,7 @@ readonly SPECULATIVE_NUM_STEPS="${SPECULATIVE_NUM_STEPS:-5}"
 readonly SPECULATIVE_NUM_DRAFT_TOKENS="${SPECULATIVE_NUM_DRAFT_TOKENS:-6}"
 readonly ENABLE_SPECULATIVE_DECODING="${ENABLE_SPECULATIVE_DECODING:-1}"
 readonly ENABLE_SPECULATIVE_ADAPTIVE="${ENABLE_SPECULATIVE_ADAPTIVE:-1}"
+readonly ENABLE_PREFILL_DRAFT_STATE="${ENABLE_PREFILL_DRAFT_STATE:-1}"
 readonly PREFILL_AITER_ALLREDUCE_FUSION="${PREFILL_AITER_ALLREDUCE_FUSION:-1}"
 readonly DECODE_AITER_ALLREDUCE_FUSION="${DECODE_AITER_ALLREDUCE_FUSION:-1}"
 readonly PREFILL_FLYDSL_FP8_MQA_LOGITS="${PREFILL_FLYDSL_FP8_MQA_LOGITS:-1}"
@@ -145,12 +147,29 @@ if [[ ! "${SPECULATIVE_NUM_DRAFT_TOKENS}" =~ ^[0-9]+$ ]] || ((SPECULATIVE_NUM_DR
 fi
 
 # ---------------------------------------------------------------------------
-# Speculative decoding args
+# Speculative decode and prefill draft-state args
 # ---------------------------------------------------------------------------
 
-declare -a SPECULATIVE_ARGS=()
+for _bool_setting in ENABLE_SPECULATIVE_DECODING ENABLE_SPECULATIVE_ADAPTIVE ENABLE_PREFILL_DRAFT_STATE; do
+  if [[ "${!_bool_setting}" != "0" && "${!_bool_setting}" != "1" ]]; then
+    echo "${_bool_setting} must be 0 or 1; got ${!_bool_setting}" >&2
+    exit 2
+  fi
+done
+unset _bool_setting
+
+if [[ "${ENABLE_SPECULATIVE_DECODING}" == "0" && "${ENABLE_SPECULATIVE_ADAPTIVE}" == "1" ]]; then
+  echo "ENABLE_SPECULATIVE_ADAPTIVE=1 requires ENABLE_SPECULATIVE_DECODING=1" >&2
+  exit 2
+fi
+if [[ "${ENABLE_SPECULATIVE_DECODING}" == "0" && "${ENABLE_PREFILL_DRAFT_STATE}" == "1" ]]; then
+  echo "ENABLE_PREFILL_DRAFT_STATE=1 requires ENABLE_SPECULATIVE_DECODING=1" >&2
+  exit 2
+fi
+
+declare -a DECODE_SPECULATIVE_ARGS=()
 if [[ "${ENABLE_SPECULATIVE_DECODING}" == "1" ]]; then
-  SPECULATIVE_ARGS=(
+  DECODE_SPECULATIVE_ARGS=(
     --speculative-algorithm EAGLE
     --speculative-num-steps "${SPECULATIVE_NUM_STEPS}"
     --speculative-eagle-topk 1
@@ -160,13 +179,14 @@ if [[ "${ENABLE_SPECULATIVE_DECODING}" == "1" ]]; then
     --speculative-accept-threshold-acc 1.0
     --speculative-draft-model-quantization unquant
   )
+  if [[ "${ENABLE_SPECULATIVE_ADAPTIVE}" == "1" ]]; then
+    DECODE_SPECULATIVE_ARGS+=(--speculative-adaptive)
+  fi
 fi
 
-if [[ "${ENABLE_SPECULATIVE_ADAPTIVE}" == "1" ]]; then
-  SPECULATIVE_ARGS+=(--speculative-adaptive)
-elif [[ "${ENABLE_SPECULATIVE_ADAPTIVE}" != "0" ]]; then
-  echo "ENABLE_SPECULATIVE_ADAPTIVE must be 0 or 1; got ${ENABLE_SPECULATIVE_ADAPTIVE}" >&2
-  exit 2
+declare -a PREFILL_DRAFT_STATE_ARGS=()
+if [[ "${ENABLE_PREFILL_DRAFT_STATE}" == "1" ]]; then
+  PREFILL_DRAFT_STATE_ARGS=("${DECODE_SPECULATIVE_ARGS[@]}")
 fi
 
 for _bool_setting in PREFILL_ROCPROF DECODE_ROCPROF PREFILL_FLYDSL_FP8_MQA_LOGITS; do
@@ -337,7 +357,7 @@ echo "[$(date -u +%FT%TZ)] GLM-5.3 Flash FP8 PD -- stamp=${S}"
 echo "[$(date -u +%FT%TZ)] Prefill: TP=${PREFILL_TP_SIZE} PP=${PREFILL_PP_SIZE} DP=${PREFILL_DP_SIZE} EP=${PREFILL_EP_SIZE} GPUs=${PREFILL_GPU_IDS}"
 echo "[$(date -u +%FT%TZ)] Decode:  TP=${DECODE_TP_SIZE} PP=${DECODE_PP_SIZE} DP=${DECODE_DP_SIZE} EP=${DECODE_EP_SIZE} GPUs=${DECODE_GPU_IDS}"
 echo "[$(date -u +%FT%TZ)] Transfer: ${DISAGGREGATION_TRANSFER_BACKEND} (XGMI enabled), CP=${PREFILL_CP_STRATEGY}"
-echo "[$(date -u +%FT%TZ)] Spec decode: enabled=${ENABLE_SPECULATIVE_DECODING} adaptive=${ENABLE_SPECULATIVE_ADAPTIVE} steps=${SPECULATIVE_NUM_STEPS} draft=${SPECULATIVE_NUM_DRAFT_TOKENS}"
+echo "[$(date -u +%FT%TZ)] Spec decode: decode=${ENABLE_SPECULATIVE_DECODING} prefill_draft_state=${ENABLE_PREFILL_DRAFT_STATE} adaptive=${ENABLE_SPECULATIVE_ADAPTIVE} steps=${SPECULATIVE_NUM_STEPS} draft=${SPECULATIVE_NUM_DRAFT_TOKENS}"
 echo "[$(date -u +%FT%TZ)] CUDA graph decode: ${DECODE_CUDA_GRAPH_BACKEND} max_bs=${DECODE_CUDA_GRAPH_MAX_BS}"
 echo "[$(date -u +%FT%TZ)] Decode radix cache: ${ENABLE_DECODE_RADIX_CACHE}"
 echo "[$(date -u +%FT%TZ)] Model overrides: ${JSON_MODEL_OVERRIDE_ARGS:-none}"
@@ -386,7 +406,7 @@ env -u MC_FORCE_TCP -u MOONCAKE_PROTOCOL -u SGLANG_PP_LAYER_PARTITION \
     --chunked-prefill-size ${PREFILL_CHUNKED_PREFILL_SIZE} --max-prefill-tokens 16384 \
     --prefill-max-requests 16 "${PREFILL_OVERLAP_ARGS[@]}" \
     --cuda-graph-backend-prefill disabled --cuda-graph-backend-decode disabled \
-    "${SPECULATIVE_ARGS[@]}" \
+    "${PREFILL_DRAFT_STATE_ARGS[@]}" \
     --enable-session-radix-cache \
     --disaggregation-mode prefill --disaggregation-transfer-backend ${DISAGGREGATION_TRANSFER_BACKEND} \
     --disaggregation-bootstrap-port ${BOOT} --nccl-port ${P_NCCL} \
@@ -440,7 +460,7 @@ env -u MC_FORCE_TCP -u MOONCAKE_PROTOCOL -u SGLANG_PP_LAYER_PARTITION \
     "${DECODE_OVERLAP_ARGS[@]}" \
     --cuda-graph-backend-prefill disabled --cuda-graph-backend-decode "${DECODE_CUDA_GRAPH_BACKEND}" \
     --cuda-graph-max-bs-decode "${DECODE_CUDA_GRAPH_MAX_BS}" \
-    "${SPECULATIVE_ARGS[@]}" \
+    "${DECODE_SPECULATIVE_ARGS[@]}" \
     --num-reserved-decode-tokens 1024 \
     --disaggregation-mode decode --disaggregation-transfer-backend ${DISAGGREGATION_TRANSFER_BACKEND} \
     "${DECODE_RADIX_ARGS[@]}" \
