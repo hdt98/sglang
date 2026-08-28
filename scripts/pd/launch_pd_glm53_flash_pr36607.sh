@@ -63,6 +63,10 @@ readonly PREFILL_AITER_ALLREDUCE_FUSION="${PREFILL_AITER_ALLREDUCE_FUSION:-1}"
 readonly DECODE_AITER_ALLREDUCE_FUSION="${DECODE_AITER_ALLREDUCE_FUSION:-1}"
 readonly PREFILL_QUICK_REDUCE_QUANTIZATION="${PREFILL_QUICK_REDUCE_QUANTIZATION:-${ROCM_QUICK_REDUCE_QUANTIZATION:-INT4}}"
 readonly DECODE_QUICK_REDUCE_QUANTIZATION="${DECODE_QUICK_REDUCE_QUANTIZATION:-${ROCM_QUICK_REDUCE_QUANTIZATION:-INT4}}"
+readonly MORI_QP_PER_TRANSFER="${MORI_QP_PER_TRANSFER:-${SGLANG_MORI_QP_PER_TRANSFER:-8}}"
+readonly MORI_TRANSFER_SHARDS="${MORI_TRANSFER_SHARDS:-${SGLANG_MORI_TRANSFER_SHARDS:-24}}"
+readonly PREFILL_ROCPROF="${PREFILL_ROCPROF:-0}"
+readonly DECODE_ROCPROF="${DECODE_ROCPROF:-0}"
 
 # ---------------------------------------------------------------------------
 # Validation
@@ -155,6 +159,22 @@ elif [[ "${ENABLE_SPECULATIVE_ADAPTIVE}" != "0" ]]; then
   exit 2
 fi
 
+for _role_profiler in PREFILL_ROCPROF DECODE_ROCPROF; do
+  if [[ "${!_role_profiler}" != "0" && "${!_role_profiler}" != "1" ]]; then
+    echo "${_role_profiler} must be 0 or 1; got ${!_role_profiler}" >&2
+    exit 2
+  fi
+done
+unset _role_profiler
+
+for _mori_setting in MORI_QP_PER_TRANSFER MORI_TRANSFER_SHARDS; do
+  if [[ ! "${!_mori_setting}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "${_mori_setting} must be a positive integer; got ${!_mori_setting}" >&2
+    exit 2
+  fi
+done
+unset _mori_setting
+
 declare -a MODEL_OVERRIDE_ARGS=()
 if [[ -n "${JSON_MODEL_OVERRIDE_ARGS}" ]]; then
   MODEL_OVERRIDE_ARGS=(--json-model-override-args "${JSON_MODEL_OVERRIDE_ARGS}")
@@ -227,6 +247,34 @@ fi
 
 mkdir -p "${OUT}" "${OUT}/profiles/prefill" "${OUT}/profiles/decode"
 
+declare -a PREFILL_LAUNCH_PREFIX=()
+if [[ "${PREFILL_ROCPROF}" == "1" ]]; then
+  mkdir -p "${OUT}/profiles/rocprof/prefill"
+  PREFILL_LAUNCH_PREFIX=(
+    /opt/rocm/bin/rocprofv3
+    --kernel-trace
+    --rccl-trace
+    --output-format csv
+    --output-directory "${OUT}/profiles/rocprof/prefill"
+    --output-file 'prefill-%pid%'
+    --
+  )
+fi
+
+declare -a DECODE_LAUNCH_PREFIX=()
+if [[ "${DECODE_ROCPROF}" == "1" ]]; then
+  mkdir -p "${OUT}/profiles/rocprof/decode"
+  DECODE_LAUNCH_PREFIX=(
+    /opt/rocm/bin/rocprofv3
+    --kernel-trace
+    --rccl-trace
+    --output-format csv
+    --output-directory "${OUT}/profiles/rocprof/decode"
+    --output-file 'decode-%pid%'
+    --
+  )
+fi
+
 # ---------------------------------------------------------------------------
 # Log configuration
 # ---------------------------------------------------------------------------
@@ -242,6 +290,8 @@ echo "[$(date -u +%FT%TZ)] Model overrides: ${JSON_MODEL_OVERRIDE_ARGS:-none}"
 echo "[$(date -u +%FT%TZ)] Mem fraction: prefill=${PREFILL_MEM_FRACTION_STATIC} decode=${DECODE_MEM_FRACTION_STATIC}"
 echo "[$(date -u +%FT%TZ)] QuickReduce: prefill=${PREFILL_QUICK_REDUCE_QUANTIZATION} decode=${DECODE_QUICK_REDUCE_QUANTIZATION}"
 echo "[$(date -u +%FT%TZ)] Shared experts fusion: prefill=${PREFILL_SHARED_EXPERTS_FUSION} decode=${DECODE_SHARED_EXPERTS_FUSION}"
+echo "[$(date -u +%FT%TZ)] MoRI: qp_per_transfer=${MORI_QP_PER_TRANSFER} transfer_shards=${MORI_TRANSFER_SHARDS}"
+echo "[$(date -u +%FT%TZ)] rocprof: prefill=${PREFILL_ROCPROF} decode=${DECODE_ROCPROF}"
 
 # ---------------------------------------------------------------------------
 # Prefill server
@@ -257,7 +307,10 @@ env -u CUDA_VISIBLE_DEVICES -u MC_FORCE_TCP -u MOONCAKE_PROTOCOL -u SGLANG_PP_LA
   SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK="${PREFILL_MORI_MAX_DISPATCH_TOKENS}" \
   SGLANG_MORI_DISPATCH_DTYPE="${PREFILL_MORI_DISPATCH_DTYPE}" \
   SGLANG_MORI_COMBINE_DTYPE="${PREFILL_MORI_COMBINE_DTYPE}" \
+  SGLANG_MORI_QP_PER_TRANSFER="${MORI_QP_PER_TRANSFER}" \
+  SGLANG_MORI_TRANSFER_SHARDS="${MORI_TRANSFER_SHARDS}" \
   MORI_DISABLE_AUTO_XGMI=0 MC_TE_METRIC=1 \
+  "${PREFILL_LAUNCH_PREFIX[@]}" \
   python3 -m sglang.launch_server \
     --model-path /model --served-model-name glm-5.3-flash \
     --host 0.0.0.0 --port ${P_PORT} --base-gpu-id 0 \
@@ -304,7 +357,10 @@ env -u CUDA_VISIBLE_DEVICES -u MC_FORCE_TCP -u MOONCAKE_PROTOCOL -u SGLANG_PP_LA
   SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 \
   SGLANG_MORI_DISPATCH_DTYPE="${DECODE_MORI_DISPATCH_DTYPE}" \
   SGLANG_MORI_COMBINE_DTYPE="${DECODE_MORI_COMBINE_DTYPE}" \
+  SGLANG_MORI_QP_PER_TRANSFER="${MORI_QP_PER_TRANSFER}" \
+  SGLANG_MORI_TRANSFER_SHARDS="${MORI_TRANSFER_SHARDS}" \
   MORI_DISABLE_AUTO_XGMI=0 MC_TE_METRIC=1 \
+  "${DECODE_LAUNCH_PREFIX[@]}" \
   python3 -m sglang.launch_server \
     --model-path /model --served-model-name glm-5.3-flash \
     --host 0.0.0.0 --port ${D_PORT} --base-gpu-id 0 \
