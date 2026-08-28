@@ -70,6 +70,7 @@ readonly ENABLE_SPECULATIVE_DECODING="${ENABLE_SPECULATIVE_DECODING:-1}"
 readonly ENABLE_SPECULATIVE_ADAPTIVE="${ENABLE_SPECULATIVE_ADAPTIVE:-1}"
 readonly PREFILL_AITER_ALLREDUCE_FUSION="${PREFILL_AITER_ALLREDUCE_FUSION:-1}"
 readonly DECODE_AITER_ALLREDUCE_FUSION="${DECODE_AITER_ALLREDUCE_FUSION:-1}"
+readonly PREFILL_FLYDSL_FP8_MQA_LOGITS="${PREFILL_FLYDSL_FP8_MQA_LOGITS:-1}"
 readonly PREFILL_QUICK_REDUCE_QUANTIZATION="${PREFILL_QUICK_REDUCE_QUANTIZATION:-INT4}"
 readonly DECODE_QUICK_REDUCE_QUANTIZATION="${DECODE_QUICK_REDUCE_QUANTIZATION:-INT4}"
 readonly MORI_QP_PER_TRANSFER="${MORI_QP_PER_TRANSFER:-${SGLANG_MORI_QP_PER_TRANSFER:-8}}"
@@ -168,13 +169,13 @@ elif [[ "${ENABLE_SPECULATIVE_ADAPTIVE}" != "0" ]]; then
   exit 2
 fi
 
-for _role_profiler in PREFILL_ROCPROF DECODE_ROCPROF; do
-  if [[ "${!_role_profiler}" != "0" && "${!_role_profiler}" != "1" ]]; then
-    echo "${_role_profiler} must be 0 or 1; got ${!_role_profiler}" >&2
+for _bool_setting in PREFILL_ROCPROF DECODE_ROCPROF PREFILL_FLYDSL_FP8_MQA_LOGITS; do
+  if [[ "${!_bool_setting}" != "0" && "${!_bool_setting}" != "1" ]]; then
+    echo "${_bool_setting} must be 0 or 1; got ${!_bool_setting}" >&2
     exit 2
   fi
 done
-unset _role_profiler
+unset _bool_setting
 
 for _mori_setting in MORI_QP_PER_TRANSFER MORI_TRANSFER_SHARDS; do
   if [[ ! "${!_mori_setting}" =~ ^[1-9][0-9]*$ ]]; then
@@ -345,6 +346,7 @@ echo "[$(date -u +%FT%TZ)] Running requests: prefill=${PREFILL_MAX_RUNNING_REQUE
 echo "[$(date -u +%FT%TZ)] KDA/Mamba: prefill_ratio=${PREFILL_MAMBA_FULL_MEMORY_RATIO} prefill_cap=${PREFILL_MAX_MAMBA_CACHE_SIZE:-auto} prefill_ssm_dtype=${PREFILL_MAMBA_SSM_DTYPE:-default} decode_ratio=${DECODE_MAMBA_FULL_MEMORY_RATIO} decode_cap=${DECODE_MAX_MAMBA_CACHE_SIZE:-auto} decode_ssm_dtype=${DECODE_MAMBA_SSM_DTYPE:-default} decode_skip_lock=${DECODE_MAMBA_SKIP_DECODE_LOCK}"
 echo "[$(date -u +%FT%TZ)] QuickReduce: prefill=${PREFILL_QUICK_REDUCE_QUANTIZATION} decode=${DECODE_QUICK_REDUCE_QUANTIZATION}"
 echo "[$(date -u +%FT%TZ)] Shared experts fusion: prefill=${PREFILL_SHARED_EXPERTS_FUSION} decode=${DECODE_SHARED_EXPERTS_FUSION}"
+echo "[$(date -u +%FT%TZ)] Prefill ragged MQA logits: flydsl=${PREFILL_FLYDSL_FP8_MQA_LOGITS}"
 echo "[$(date -u +%FT%TZ)] MoRI: qp_per_transfer=${MORI_QP_PER_TRANSFER} transfer_shards=${MORI_TRANSFER_SHARDS}"
 echo "[$(date -u +%FT%TZ)] rocprof: prefill=${PREFILL_ROCPROF} decode=${DECODE_ROCPROF}"
 
@@ -359,7 +361,7 @@ env -u MC_FORCE_TCP -u MOONCAKE_PROTOCOL -u SGLANG_PP_LAYER_PARTITION \
   SGLANG_USE_AITER=1 \
   ROCM_QUICK_REDUCE_QUANTIZATION="${PREFILL_QUICK_REDUCE_QUANTIZATION}" \
   ROCR_VISIBLE_DEVICES="${PREFILL_GPU_IDS}" HIP_VISIBLE_DEVICES="${PREFILL_LOGICAL_GPU_IDS}" \
-  SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 SGLANG_OPT_USE_FLYDSL_FP8_MQA_LOGITS=1 \
+  SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 SGLANG_OPT_USE_FLYDSL_FP8_MQA_LOGITS="${PREFILL_FLYDSL_FP8_MQA_LOGITS}" \
   SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK="${PREFILL_MORI_MAX_DISPATCH_TOKENS}" \
   SGLANG_MORI_DISPATCH_DTYPE="${PREFILL_MORI_DISPATCH_DTYPE}" \
   SGLANG_MORI_COMBINE_DTYPE="${PREFILL_MORI_COMBINE_DTYPE}" \
