@@ -105,6 +105,24 @@ That profile predates the current FlyDSL MQA wiring and must be repeated. The
 decode profile also predates the current adaptive graph and mHC/KDA fixes; it
 is diagnostic only and cannot establish the final decode ranking.
 
+The stale r13 decode capture can now be attributed precisely. Five full target
+graph replays on each TP rank spent roughly 29-30% of summed kernel time in the
+FP32 add, divide, and reduction sequence implementing mHC's iterative Sinkhorn
+normalization. AITER MoE was about 11.5%, the FP8 blockscale GEMMs about 7.7%,
+and INT4 QuickReduce 4.0-5.7%, depending on rank. Runtime commit `bdce464a70`
+replaced the pure-PyTorch mHC pre/post sequence with AITER kernels; r22 loaded
+`module_mhc` on all prefill and decode ranks. A fresh decode profile must first
+confirm that removal before any optimization is attributed to the old
+elementwise sequence.
+
+Speculative decode is already functioning in r22 rather than merely enabled.
+Across 237 decode log samples during the canonical smoke, adaptive EAGLE
+averaged 5.75 accepted tokens with p50 5.69 and an average/p50 acceptance rate
+of 0.79. The adaptive controller selected 3-, 5-, and 7-step gears 32, 115, and
+90 times respectively. Every sampled batch used a target CUDA graph, with no
+retractions; average instantaneous server generation throughput was 257.05
+tok/s across an average 1.83 active requests.
+
 ## Current candidates
 
 Runtime SGLang candidate: `a8447ac53a8bb4a8b7d9cb203dfcf728fed8ca4c`.
@@ -141,7 +159,10 @@ The r18 prefill trace makes the useful part of that delta precise. On one TP
 rank, hipBLASLt/Tensile kernels account for 6.43% of summed GPU kernel time.
 Within that subtotal, 99.44% is the gfx942 `BBS` family and only 0.56% is
 single precision; HHS is effectively zero. The hottest `BBS` kernel alone is
-4.55% of total kernel time.
+4.55% of total kernel time. It is the
+`Cijk_Alik_Bljk_BBS...MT256x224x64` kernel: 33,943 dispatches, 13.606 seconds
+summed, and 400.8 microseconds per dispatch. This is a direct BF16/TN tuning
+target rather than a generic reason to replace every ROCm math library.
 
 Relevant upstream work is therefore limited to the gfx942 `BBS` tuning line:
 
@@ -155,6 +176,14 @@ The first matched library experiment should use an isolated hipBLASLt
 ABI while including the direct BBS tuning. The later `8c12dadbfd8` source is
 hipBLASLt 1.4.0 and must not be overlaid as though it were ABI-equivalent.
 Neither build should replace the node or image libraries globally.
+
+The newly synced `ac26ef164c7` head is hipBLASLt 1.4.1, but none of its newest
+gfx942 commits supersedes that matched experiment. `253389de6ca` retunes
+single-precision GEMM, `68ce6209fcd` changes rocBLAS's single-precision backend,
+and `503228a1aaf` adds F8NBS sizes; those families are absent or negligible in
+the trace. `669ef4d1fca` looks relevant by name but adds MXFP4/FP8 Origami
+libraries only for gfx1250. The synced head is therefore a source of candidate
+logic, not a safe whole-library drop-in for the ROCm 7.2 image.
 
 Several superficially relevant commits are excluded: the 38-CU
 WorkgroupMappingXCC fix targets CPX, while CR7 is SPX/NPS1; HHS and F8NBS
