@@ -14,6 +14,9 @@ from sglang.srt.layers.attention.dsa.dsa_indexer import (
     rotate_activation,
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
+from sglang.srt.layers.attention.dsa.ragged_mqa_logits_backend import (
+    resolve_hip_ragged_mqa_logits,
+)
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
@@ -158,6 +161,9 @@ class IndexerKPool(MultiPlatformOp):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
+        self.hip_ragged_mqa_logits = (
+            resolve_hip_ragged_mqa_logits() if is_hip() else None
+        )
 
     @torch.compile(dynamic=True)
     def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
@@ -166,8 +172,8 @@ class IndexerKPool(MultiPlatformOp):
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
 
-    @staticmethod
     def _fp8_mqa_logits(
+        self,
         q_fp8: torch.Tensor,
         k_fp8: torch.Tensor,
         k_scale: torch.Tensor,
@@ -178,9 +184,8 @@ class IndexerKPool(MultiPlatformOp):
         clean_logits: bool,
     ) -> torch.Tensor:
         if is_hip():
-            from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
-
-            return fp8_mqa_logits(
+            assert self.hip_ragged_mqa_logits is not None
+            return self.hip_ragged_mqa_logits(
                 q_fp8,
                 k_fp8,
                 k_scale,

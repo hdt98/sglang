@@ -26,6 +26,9 @@ from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
+from sglang.srt.layers.attention.dsa.ragged_mqa_logits_backend import (
+    resolve_hip_ragged_mqa_logits,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
     is_dsa_enable_prefill_cp,
@@ -312,6 +315,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
             get_exec().kernel.dsa_paged_mqa_logits_backend
+        )
+        self.hip_ragged_mqa_logits = (
+            resolve_hip_ragged_mqa_logits() if _is_hip else None
         )
 
     @contextlib.contextmanager
@@ -1159,14 +1165,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             assert q_fp8[:q_offset].shape[0] != 0
             with self._with_real_sm_count():
                 if _is_hip:
-                    from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
-
                     kv, scale = kv_fp8
                     # Match the CUDA deep_gemm path (clean_logits=False): the topk
                     # transform masks invalid positions via ks/ke/lengths, so the
                     # -inf pre-fill of the [tokens x seq_len_kv] logits buffer is
                     # redundant and grows quadratically with context length.
-                    logits = fp8_mqa_logits(
+                    assert self.hip_ragged_mqa_logits is not None
+                    logits = self.hip_ragged_mqa_logits(
                         q_fp8[:q_offset],
                         kv,
                         scale,
@@ -1218,11 +1223,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
             with self._with_real_sm_count():
                 if _is_hip:
-                    from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
-
                     kv, scale = kv_fp8
                     # clean_logits=False: topk transform handles masking (see above)
-                    logits_chunk = fp8_mqa_logits(
+                    assert self.hip_ragged_mqa_logits is not None
+                    logits_chunk = self.hip_ragged_mqa_logits(
                         q_fp8[start:end],
                         kv,
                         scale,
