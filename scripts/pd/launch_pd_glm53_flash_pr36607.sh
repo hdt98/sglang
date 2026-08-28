@@ -51,6 +51,12 @@ readonly DISAGGREGATION_TRANSFER_BACKEND="${DISAGGREGATION_TRANSFER_BACKEND:-mor
 readonly CONTEXT_LENGTH="${CONTEXT_LENGTH:-1048576}"
 readonly PREFILL_MEM_FRACTION_STATIC="${PREFILL_MEM_FRACTION_STATIC:-0.85}"
 readonly DECODE_MEM_FRACTION_STATIC="${DECODE_MEM_FRACTION_STATIC:-0.80}"
+readonly PREFILL_MAX_RUNNING_REQUESTS="${PREFILL_MAX_RUNNING_REQUESTS:-16}"
+readonly DECODE_MAX_RUNNING_REQUESTS="${DECODE_MAX_RUNNING_REQUESTS:-120}"
+readonly PREFILL_MAMBA_FULL_MEMORY_RATIO="${PREFILL_MAMBA_FULL_MEMORY_RATIO:-0.9}"
+readonly DECODE_MAMBA_FULL_MEMORY_RATIO="${DECODE_MAMBA_FULL_MEMORY_RATIO:-0.9}"
+readonly PREFILL_MAX_MAMBA_CACHE_SIZE="${PREFILL_MAX_MAMBA_CACHE_SIZE:-}"
+readonly DECODE_MAX_MAMBA_CACHE_SIZE="${DECODE_MAX_MAMBA_CACHE_SIZE:-}"
 readonly DECODE_CUDA_GRAPH_BACKEND="${DECODE_CUDA_GRAPH_BACKEND:-full}"
 readonly DECODE_CUDA_GRAPH_MAX_BS="${DECODE_CUDA_GRAPH_MAX_BS:-64}"
 readonly ENABLE_DECODE_RADIX_CACHE="${ENABLE_DECODE_RADIX_CACHE:-1}"
@@ -175,6 +181,22 @@ for _mori_setting in MORI_QP_PER_TRANSFER MORI_TRANSFER_SHARDS; do
 done
 unset _mori_setting
 
+for _request_limit in PREFILL_MAX_RUNNING_REQUESTS DECODE_MAX_RUNNING_REQUESTS; do
+  if [[ ! "${!_request_limit}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "${_request_limit} must be a positive integer; got ${!_request_limit}" >&2
+    exit 2
+  fi
+done
+unset _request_limit
+
+for _mamba_limit in PREFILL_MAX_MAMBA_CACHE_SIZE DECODE_MAX_MAMBA_CACHE_SIZE; do
+  if [[ -n "${!_mamba_limit}" && ! "${!_mamba_limit}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "${_mamba_limit} must be empty or a positive integer; got ${!_mamba_limit}" >&2
+    exit 2
+  fi
+done
+unset _mamba_limit
+
 declare -a MODEL_OVERRIDE_ARGS=()
 if [[ -n "${JSON_MODEL_OVERRIDE_ARGS}" ]]; then
   MODEL_OVERRIDE_ARGS=(--json-model-override-args "${JSON_MODEL_OVERRIDE_ARGS}")
@@ -186,6 +208,15 @@ if [[ "${ENABLE_DECODE_RADIX_CACHE}" == "1" ]]; then
 elif [[ "${ENABLE_DECODE_RADIX_CACHE}" != "0" ]]; then
   echo "ENABLE_DECODE_RADIX_CACHE must be 0 or 1; got ${ENABLE_DECODE_RADIX_CACHE}" >&2
   exit 2
+fi
+
+declare -a PREFILL_MAMBA_ARGS=(--mamba-full-memory-ratio "${PREFILL_MAMBA_FULL_MEMORY_RATIO}")
+if [[ -n "${PREFILL_MAX_MAMBA_CACHE_SIZE}" ]]; then
+  PREFILL_MAMBA_ARGS+=(--max-mamba-cache-size "${PREFILL_MAX_MAMBA_CACHE_SIZE}")
+fi
+declare -a DECODE_MAMBA_ARGS=(--mamba-full-memory-ratio "${DECODE_MAMBA_FULL_MEMORY_RATIO}")
+if [[ -n "${DECODE_MAX_MAMBA_CACHE_SIZE}" ]]; then
+  DECODE_MAMBA_ARGS+=(--max-mamba-cache-size "${DECODE_MAX_MAMBA_CACHE_SIZE}")
 fi
 
 # ---------------------------------------------------------------------------
@@ -288,6 +319,8 @@ echo "[$(date -u +%FT%TZ)] CUDA graph decode: ${DECODE_CUDA_GRAPH_BACKEND} max_b
 echo "[$(date -u +%FT%TZ)] Decode radix cache: ${ENABLE_DECODE_RADIX_CACHE}"
 echo "[$(date -u +%FT%TZ)] Model overrides: ${JSON_MODEL_OVERRIDE_ARGS:-none}"
 echo "[$(date -u +%FT%TZ)] Mem fraction: prefill=${PREFILL_MEM_FRACTION_STATIC} decode=${DECODE_MEM_FRACTION_STATIC}"
+echo "[$(date -u +%FT%TZ)] Running requests: prefill=${PREFILL_MAX_RUNNING_REQUESTS} decode=${DECODE_MAX_RUNNING_REQUESTS}"
+echo "[$(date -u +%FT%TZ)] KDA/Mamba: prefill_ratio=${PREFILL_MAMBA_FULL_MEMORY_RATIO} prefill_cap=${PREFILL_MAX_MAMBA_CACHE_SIZE:-auto} decode_ratio=${DECODE_MAMBA_FULL_MEMORY_RATIO} decode_cap=${DECODE_MAX_MAMBA_CACHE_SIZE:-auto}"
 echo "[$(date -u +%FT%TZ)] QuickReduce: prefill=${PREFILL_QUICK_REDUCE_QUANTIZATION} decode=${DECODE_QUICK_REDUCE_QUANTIZATION}"
 echo "[$(date -u +%FT%TZ)] Shared experts fusion: prefill=${PREFILL_SHARED_EXPERTS_FUSION} decode=${DECODE_SHARED_EXPERTS_FUSION}"
 echo "[$(date -u +%FT%TZ)] MoRI: qp_per_transfer=${MORI_QP_PER_TRANSFER} transfer_shards=${MORI_TRANSFER_SHARDS}"
@@ -323,7 +356,8 @@ env -u MC_FORCE_TCP -u MOONCAKE_PROTOCOL -u SGLANG_PP_LAYER_PARTITION \
     --attention-backend dsa --dsa-prefill-backend tilelang --dsa-decode-backend tilelang \
     --linear-attn-backend triton --moe-runner-backend aiter \
     "${PREFILL_ALLREDUCE_ARGS[@]}" \
-    --mem-fraction-static ${PREFILL_MEM_FRACTION_STATIC} --max-running-requests 16 \
+    --mem-fraction-static ${PREFILL_MEM_FRACTION_STATIC} --max-running-requests "${PREFILL_MAX_RUNNING_REQUESTS}" \
+    "${PREFILL_MAMBA_ARGS[@]}" \
     --schedule-policy lpm --context-length "${CONTEXT_LENGTH}" --page-size 64 \
     --chunked-prefill-size ${PREFILL_CHUNKED_PREFILL_SIZE} --max-prefill-tokens 16384 \
     --prefill-max-requests 16 "${PREFILL_OVERLAP_ARGS[@]}" \
@@ -374,7 +408,8 @@ env -u MC_FORCE_TCP -u MOONCAKE_PROTOCOL -u SGLANG_PP_LAYER_PARTITION \
     --attention-backend dsa --dsa-prefill-backend tilelang --dsa-decode-backend tilelang \
     --linear-attn-backend triton --moe-runner-backend aiter \
     "${DECODE_ALLREDUCE_ARGS[@]}" \
-    --mem-fraction-static ${DECODE_MEM_FRACTION_STATIC} --max-running-requests 120 \
+    --mem-fraction-static ${DECODE_MEM_FRACTION_STATIC} --max-running-requests "${DECODE_MAX_RUNNING_REQUESTS}" \
+    "${DECODE_MAMBA_ARGS[@]}" \
     --context-length "${CONTEXT_LENGTH}" --page-size 64 \
     --chunked-prefill-size ${DECODE_CHUNKED_PREFILL_SIZE} --max-prefill-tokens 65536 \
     "${DECODE_OVERLAP_ARGS[@]}" \
