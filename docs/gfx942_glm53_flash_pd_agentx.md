@@ -162,6 +162,16 @@ Dormant CR7 containers:
 
 They must be started only with exact GPUardian authorization.
 
+The role-local EP experiment is `TP4/EP4/DP1`, not pure DP. In the current
+argument-resolution contract, MoRI is an A2A backend that expands routed-expert
+parallelism across the TP group, so `EP4` is the resolved topology while
+attention and the language-model head remain TP4. `--enable-dp-lm-head` is a
+DP-attention option and must not be copied from the GLM-5.2 pure-DP examples
+into this cell. The draft model inherits the target MoRI A2A backend unless a
+speculative backend is explicitly supplied, so the decode EP smoke validates
+both target verification and EAGLE draft forwards. The argument-resolution,
+shared-expert gate, and allreduce-fusion EP unit tests pass for this contract.
+
 ## ROCm library audit
 
 The pinned image is not carrying a recent `rocm-libraries` snapshot. Its
@@ -177,6 +187,15 @@ single precision; HHS is effectively zero. The hottest `BBS` kernel alone is
 `Cijk_Alik_Bljk_BBS...MT256x224x64` kernel: 33,943 dispatches, 13.606 seconds
 summed, and 400.8 microseconds per dispatch. This is a direct BF16/TN tuning
 target rather than a generic reason to replace every ROCm math library.
+
+The older r13 decode captures put the same library in perspective on the other
+PD role: `Cijk` kernels account for 4.17-4.28% of summed decode kernel time
+across the four TP ranks. The hottest individual hipBLASLt kernels are one
+`S_B` family at 0.95-0.98% and one `BBS_BH` family at 0.88-0.90%. Even a
+perfect hipBLASLt replacement is therefore Amdahl-limited to about 4.3% on
+that stale decode trace, before accounting for the newer mHC and adaptive-graph
+paths. This reinforces using the library as a late matched A/B rather than as
+the baseline image.
 
 Relevant upstream work is therefore limited to the gfx942 `BBS` tuning line:
 
