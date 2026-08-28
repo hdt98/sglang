@@ -1,5 +1,6 @@
 from typing import Optional, Tuple
 
+import os
 import torch
 import triton
 import triton.language as tl
@@ -1620,6 +1621,51 @@ def _select_and_scatter_pool_slots_kernel(
     tl.store(buf_ptr + s_dst, s_val)
 
 
+@triton.jit
+def _scatter_owner_read_pool_slots_kernel(
+    recv_ptr,
+    owner_ptr,
+    locs_ptr,
+    buf_ptr,
+    cp_rank: tl.constexpr,
+    payload_bytes: tl.constexpr,
+    slots_per_page: tl.constexpr,
+    head_dim: tl.constexpr,
+    page_bytes: tl.constexpr,
+    scale_region_off: tl.constexpr,
+    PRESHUFFLE_TILE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    row = tl.program_id(0)
+    owner = tl.load(owner_ptr + row).to(tl.int64)
+    if owner == cp_rank:
+        return
+
+    loc = tl.load(locs_ptr + row).to(tl.int64)
+    page = loc // slots_per_page
+    slot = loc % slots_per_page
+    page_base = page * page_bytes
+    recv_row_base = row * payload_bytes
+
+    offs = tl.arange(0, BLOCK_D)
+    mask = offs < head_dim
+    val = tl.load(recv_ptr + recv_row_base + offs, mask=mask, other=0).to(tl.uint8)
+    dst = _kpool_cache_k_offsets(
+        page,
+        slot,
+        offs,
+        page_bytes,
+        head_dim,
+        PRESHUFFLE_TILE,
+    )
+    tl.store(buf_ptr + dst, val, mask=mask)
+
+    s_offs = tl.arange(0, 4)
+    s_val = tl.load(recv_ptr + recv_row_base + head_dim + s_offs).to(tl.uint8)
+    s_dst = page_base + scale_region_off + slot * 4 + s_offs
+    tl.store(buf_ptr + s_dst, s_val)
+
+
 def all_gather_and_scatter_pool_slots(
     buf: torch.Tensor,
     local_locs: torch.Tensor,
@@ -1656,6 +1702,40 @@ def all_gather_and_scatter_pool_slots(
         PRESHUFFLE_TILE=_preshuffle_tile(),
         BLOCK_D=triton.next_power_of_2(head_dim),
     )
+
+    # Owner-read path: each rank reads only its assigned rows from the
+    # owner's IPC-registered buffer via peer pointers, avoiding the full
+    # CP × n_total AllGather + discard. Gated by SGLANG_DSA_KPOOL_OWNER_READ.
+    if os.environ.get("SGLANG_DSA_KPOOL_OWNER_READ", "0") == "1":
+        from sglang.srt.distributed.parallel_state import get_attn_cp_group
+
+        ca_comm = get_attn_cp_group().ca_comm
+        if (
+            ca_comm is not None
+            and not getattr(ca_comm, "disabled", True)
+            and hasattr(ca_comm, "owner_read_gather_fused")
+        ):
+            recv_owner = torch.empty(
+                (n_total, payload_bytes), dtype=torch.uint8, device=device
+            )
+            ca_comm.owner_read_gather_fused(
+                send_payload, owner_rank.to(torch.int32), out=recv_owner
+            )
+            _scatter_owner_read_pool_slots_kernel[(n_total,)](
+                recv_owner,
+                owner_rank,
+                local_locs,
+                buf,
+                cp_rank=cp_rank,
+                payload_bytes=payload_bytes,
+                slots_per_page=slots_per_page,
+                head_dim=head_dim,
+                page_bytes=page_bytes,
+                scale_region_off=scale_region_off,
+                PRESHUFFLE_TILE=_preshuffle_tile(),
+                BLOCK_D=triton.next_power_of_2(head_dim),
+            )
+            return
 
     recv = torch.empty(
         (cp_size, n_total, payload_bytes), dtype=torch.uint8, device=device

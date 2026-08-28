@@ -1208,29 +1208,44 @@ class GroupCoordinator:
         # all_gather_reg during CUDA-graph capture, and all_gather_unreg
         # under torch_memory_saver and other paths.
         ca_comm = self.ca_comm
+        # DSA K-pool CP exchanges uint8 payloads (128B FP8 K-vector + 4B
+        # scale per row). The AITER all-gather kernel is pure memcpy, so
+        # reinterpreting uint8 as float16 is byte-exact and lets uint8 use
+        # the faster AITER custom path instead of falling back to RCCL.
+        if (
+            input.dtype == torch.uint8
+            and input.numel() % 2 == 0
+            and input.is_contiguous()
+            and output.is_contiguous()
+        ):
+            ag_input = input.view(torch.float16)
+            ag_output = output.view(torch.float16)
+        else:
+            ag_input = input
+            ag_output = output
         if (
             is_hip()
             and envs.SGLANG_USE_AITER_AG.get()
             and self._has_aiter_custom_all_gather()
-            and input.is_contiguous()
-            and output.is_contiguous()
-            and input.dtype in (torch.float32, torch.float16, torch.bfloat16)
-            and ca_comm.should_custom_ag(input)
+            and ag_input.is_contiguous()
+            and ag_output.is_contiguous()
+            and ag_input.dtype in (torch.float32, torch.float16, torch.bfloat16)
+            and ca_comm.should_custom_ag(ag_input)
         ):
             if getattr(ca_comm, "_IS_CAPTURING", False):
                 if torch.cuda.is_current_stream_capturing():
                     if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get():
-                        ca_comm.all_gather_unreg(input, out=output, dim=0)
+                        ca_comm.all_gather_unreg(ag_input, out=ag_output, dim=0)
                     else:
-                        ca_comm.all_gather_reg(input, out=output, dim=0)
+                        ca_comm.all_gather_reg(ag_input, out=ag_output, dim=0)
                 elif is_in_tc_piecewise_cuda_graph():
-                    ca_comm.all_gather_unreg(input, out=output, dim=0)
+                    ca_comm.all_gather_unreg(ag_input, out=ag_output, dim=0)
                 else:
                     # True CUDA graph warmup: avoid a different host collective.
                     output.zero_()
                 return
             else:
-                ca_comm.all_gather_unreg(input, out=output, dim=0)
+                ca_comm.all_gather_unreg(ag_input, out=ag_output, dim=0)
                 return
 
         pynccl_comm = self.pynccl_comm
