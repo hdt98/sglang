@@ -57,6 +57,8 @@ readonly PREFILL_MAMBA_FULL_MEMORY_RATIO="${PREFILL_MAMBA_FULL_MEMORY_RATIO:-0.9
 readonly DECODE_MAMBA_FULL_MEMORY_RATIO="${DECODE_MAMBA_FULL_MEMORY_RATIO:-0.9}"
 readonly PREFILL_MAX_MAMBA_CACHE_SIZE="${PREFILL_MAX_MAMBA_CACHE_SIZE:-}"
 readonly DECODE_MAX_MAMBA_CACHE_SIZE="${DECODE_MAX_MAMBA_CACHE_SIZE:-}"
+readonly PREFILL_MAMBA_SSM_DTYPE="${PREFILL_MAMBA_SSM_DTYPE:-}"
+readonly DECODE_MAMBA_SSM_DTYPE="${DECODE_MAMBA_SSM_DTYPE:-}"
 readonly DECODE_MAMBA_SKIP_DECODE_LOCK="${DECODE_MAMBA_SKIP_DECODE_LOCK:-0}"
 readonly DECODE_CUDA_GRAPH_BACKEND="${DECODE_CUDA_GRAPH_BACKEND:-full}"
 readonly DECODE_CUDA_GRAPH_MAX_BS="${DECODE_CUDA_GRAPH_MAX_BS:-64}"
@@ -198,6 +200,14 @@ for _mamba_limit in PREFILL_MAX_MAMBA_CACHE_SIZE DECODE_MAX_MAMBA_CACHE_SIZE; do
 done
 unset _mamba_limit
 
+for _mamba_dtype in PREFILL_MAMBA_SSM_DTYPE DECODE_MAMBA_SSM_DTYPE; do
+  case "${!_mamba_dtype}" in
+    ""|float32|bfloat16|float16) ;;
+    *) echo "${_mamba_dtype} must be empty, float32, bfloat16, or float16; got ${!_mamba_dtype}" >&2; exit 2 ;;
+  esac
+done
+unset _mamba_dtype
+
 if [[ "${DECODE_MAMBA_SKIP_DECODE_LOCK}" != "0" && "${DECODE_MAMBA_SKIP_DECODE_LOCK}" != "1" ]]; then
   echo "DECODE_MAMBA_SKIP_DECODE_LOCK must be 0 or 1; got ${DECODE_MAMBA_SKIP_DECODE_LOCK}" >&2
   exit 2
@@ -220,9 +230,15 @@ declare -a PREFILL_MAMBA_ARGS=(--mamba-full-memory-ratio "${PREFILL_MAMBA_FULL_M
 if [[ -n "${PREFILL_MAX_MAMBA_CACHE_SIZE}" ]]; then
   PREFILL_MAMBA_ARGS+=(--max-mamba-cache-size "${PREFILL_MAX_MAMBA_CACHE_SIZE}")
 fi
+if [[ -n "${PREFILL_MAMBA_SSM_DTYPE}" ]]; then
+  PREFILL_MAMBA_ARGS+=(--mamba-ssm-dtype "${PREFILL_MAMBA_SSM_DTYPE}")
+fi
 declare -a DECODE_MAMBA_ARGS=(--mamba-full-memory-ratio "${DECODE_MAMBA_FULL_MEMORY_RATIO}")
 if [[ -n "${DECODE_MAX_MAMBA_CACHE_SIZE}" ]]; then
   DECODE_MAMBA_ARGS+=(--max-mamba-cache-size "${DECODE_MAX_MAMBA_CACHE_SIZE}")
+fi
+if [[ -n "${DECODE_MAMBA_SSM_DTYPE}" ]]; then
+  DECODE_MAMBA_ARGS+=(--mamba-ssm-dtype "${DECODE_MAMBA_SSM_DTYPE}")
 fi
 
 # ---------------------------------------------------------------------------
@@ -326,7 +342,7 @@ echo "[$(date -u +%FT%TZ)] Decode radix cache: ${ENABLE_DECODE_RADIX_CACHE}"
 echo "[$(date -u +%FT%TZ)] Model overrides: ${JSON_MODEL_OVERRIDE_ARGS:-none}"
 echo "[$(date -u +%FT%TZ)] Mem fraction: prefill=${PREFILL_MEM_FRACTION_STATIC} decode=${DECODE_MEM_FRACTION_STATIC}"
 echo "[$(date -u +%FT%TZ)] Running requests: prefill=${PREFILL_MAX_RUNNING_REQUESTS} decode=${DECODE_MAX_RUNNING_REQUESTS}"
-echo "[$(date -u +%FT%TZ)] KDA/Mamba: prefill_ratio=${PREFILL_MAMBA_FULL_MEMORY_RATIO} prefill_cap=${PREFILL_MAX_MAMBA_CACHE_SIZE:-auto} decode_ratio=${DECODE_MAMBA_FULL_MEMORY_RATIO} decode_cap=${DECODE_MAX_MAMBA_CACHE_SIZE:-auto} decode_skip_lock=${DECODE_MAMBA_SKIP_DECODE_LOCK}"
+echo "[$(date -u +%FT%TZ)] KDA/Mamba: prefill_ratio=${PREFILL_MAMBA_FULL_MEMORY_RATIO} prefill_cap=${PREFILL_MAX_MAMBA_CACHE_SIZE:-auto} prefill_ssm_dtype=${PREFILL_MAMBA_SSM_DTYPE:-default} decode_ratio=${DECODE_MAMBA_FULL_MEMORY_RATIO} decode_cap=${DECODE_MAX_MAMBA_CACHE_SIZE:-auto} decode_ssm_dtype=${DECODE_MAMBA_SSM_DTYPE:-default} decode_skip_lock=${DECODE_MAMBA_SKIP_DECODE_LOCK}"
 echo "[$(date -u +%FT%TZ)] QuickReduce: prefill=${PREFILL_QUICK_REDUCE_QUANTIZATION} decode=${DECODE_QUICK_REDUCE_QUANTIZATION}"
 echo "[$(date -u +%FT%TZ)] Shared experts fusion: prefill=${PREFILL_SHARED_EXPERTS_FUSION} decode=${DECODE_SHARED_EXPERTS_FUSION}"
 echo "[$(date -u +%FT%TZ)] MoRI: qp_per_transfer=${MORI_QP_PER_TRANSFER} transfer_shards=${MORI_TRANSFER_SHARDS}"
