@@ -189,7 +189,9 @@ if [[ "${ENABLE_PREFILL_DRAFT_STATE}" == "1" ]]; then
   PREFILL_DRAFT_STATE_ARGS=("${DECODE_SPECULATIVE_ARGS[@]}")
 fi
 
-for _bool_setting in PREFILL_ROCPROF DECODE_ROCPROF PREFILL_FLYDSL_FP8_MQA_LOGITS; do
+for _bool_setting in \
+  PREFILL_AITER_ALLREDUCE_FUSION DECODE_AITER_ALLREDUCE_FUSION \
+  PREFILL_ROCPROF DECODE_ROCPROF PREFILL_FLYDSL_FP8_MQA_LOGITS; do
   if [[ "${!_bool_setting}" != "0" && "${!_bool_setting}" != "1" ]]; then
     echo "${_bool_setting} must be 0 or 1; got ${!_bool_setting}" >&2
     exit 2
@@ -282,14 +284,18 @@ case "${DECODE_SHARED_EXPERTS_FUSION}" in
 esac
 
 declare -a PREFILL_CP_ARGS=()
-declare -a PREFILL_ALLREDUCE_ARGS=(--enable-aiter-allreduce-fusion)
+declare -a PREFILL_ALLREDUCE_ARGS=()
 if [[ "${PREFILL_CP_STRATEGY}" == "interleave" ]]; then
   PREFILL_CP_ARGS=(--enable-prefill-cp --cp-strategy interleave)
-  PREFILL_ALLREDUCE_ARGS=()
+fi
+if [[ "${PREFILL_AITER_ALLREDUCE_FUSION}" == "1" && "${PREFILL_CP_STRATEGY}" == "none" ]] && ((PREFILL_EP_SIZE == 1)); then
+  PREFILL_ALLREDUCE_ARGS=(--enable-aiter-allreduce-fusion)
 fi
 
-declare -a DECODE_ALLREDUCE_ARGS=(--enable-aiter-allreduce-fusion)
-if ((DECODE_EP_SIZE > 1)); then DECODE_ALLREDUCE_ARGS=(); fi
+declare -a DECODE_ALLREDUCE_ARGS=()
+if [[ "${DECODE_AITER_ALLREDUCE_FUSION}" == "1" ]] && ((DECODE_EP_SIZE == 1)); then
+  DECODE_ALLREDUCE_ARGS=(--enable-aiter-allreduce-fusion)
+fi
 
 declare -a PREFILL_OVERLAP_ARGS=(--disable-overlap-schedule)
 if [[ "${PREFILL_OVERLAP_SCHEDULE}" == "1" ]]; then PREFILL_OVERLAP_ARGS=(); fi
@@ -365,6 +371,7 @@ echo "[$(date -u +%FT%TZ)] Mem fraction: prefill=${PREFILL_MEM_FRACTION_STATIC} 
 echo "[$(date -u +%FT%TZ)] Running requests: prefill=${PREFILL_MAX_RUNNING_REQUESTS} decode=${DECODE_MAX_RUNNING_REQUESTS}"
 echo "[$(date -u +%FT%TZ)] KDA/Mamba: prefill_ratio=${PREFILL_MAMBA_FULL_MEMORY_RATIO} prefill_cap=${PREFILL_MAX_MAMBA_CACHE_SIZE:-auto} prefill_ssm_dtype=${PREFILL_MAMBA_SSM_DTYPE:-default} decode_ratio=${DECODE_MAMBA_FULL_MEMORY_RATIO} decode_cap=${DECODE_MAX_MAMBA_CACHE_SIZE:-auto} decode_ssm_dtype=${DECODE_MAMBA_SSM_DTYPE:-default} decode_skip_lock=${DECODE_MAMBA_SKIP_DECODE_LOCK}"
 echo "[$(date -u +%FT%TZ)] QuickReduce: prefill=${PREFILL_QUICK_REDUCE_QUANTIZATION} decode=${DECODE_QUICK_REDUCE_QUANTIZATION}"
+echo "[$(date -u +%FT%TZ)] AITER allreduce fusion: prefill=${PREFILL_AITER_ALLREDUCE_FUSION} decode=${DECODE_AITER_ALLREDUCE_FUSION}"
 echo "[$(date -u +%FT%TZ)] Shared experts fusion: prefill=${PREFILL_SHARED_EXPERTS_FUSION} decode=${DECODE_SHARED_EXPERTS_FUSION}"
 echo "[$(date -u +%FT%TZ)] Prefill ragged MQA logits: flydsl=${PREFILL_FLYDSL_FP8_MQA_LOGITS}"
 echo "[$(date -u +%FT%TZ)] MoRI: qp_per_transfer=${MORI_QP_PER_TRANSFER} transfer_shards=${MORI_TRANSFER_SHARDS}"
