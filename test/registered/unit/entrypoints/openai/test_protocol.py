@@ -261,6 +261,22 @@ class TestChatCompletionRequest(unittest.TestCase):
             {"thinking": True, "enable_thinking": True},
         )
 
+    def test_chat_completion_max_thinking_tokens(self):
+        messages = [{"role": "user", "content": "Hello"}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            max_thinking_tokens=8192,
+        )
+        self.assertEqual(request.max_thinking_tokens, 8192)
+
+        with self.assertRaises(ValidationError):
+            ChatCompletionRequest(
+                model="test-model",
+                messages=messages,
+                max_thinking_tokens=-1,
+            )
+
     def test_chat_completion_reasoning_effort_high_enables_thinking(self):
         """Top-level reasoning_effort='high' enables thinking."""
         messages = [{"role": "user", "content": "Hello"}]

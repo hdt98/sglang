@@ -451,6 +451,27 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
 
+    def test_convert_to_internal_request_forwards_max_thinking_tokens(self):
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            max_thinking_tokens=8192,
+        )
+        with patch.object(self.chat, "_process_messages") as proc_mock:
+            proc_mock.return_value = MessageProcessingResult(
+                "Test prompt",
+                [1, 2, 3],
+                None,
+                None,
+                [],
+                ["</s>"],
+                None,
+            )
+
+            adapted, _ = self.chat._convert_to_internal_request(request)
+
+        self.assertEqual(adapted.max_thinking_tokens, 8192)
+
     def test_chat_applies_pd_header_overrides(self):
         request = ChatCompletionRequest(
             model="x",
