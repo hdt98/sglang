@@ -91,7 +91,23 @@ def _eagle_prefill_tail_tokens(
     """Per-seq tail token for EAGLE prefill rotation; uses next prompt token for
     non-final chunks (chunked-prefill chain consistency, see PR #26329)."""
     tail_tokens = next_token_ids.to(batch.input_ids.dtype)
-    next_prompt_token = batch.chunked_req_next_prompt_token
+    next_prompt_tokens = getattr(batch, "chunked_req_next_prompt_tokens", None)
+    if next_prompt_tokens is not None:
+        assert len(next_prompt_tokens) == tail_tokens.shape[0], (
+            f"Expected one chunked-prefill tail token per request, got "
+            f"{len(next_prompt_tokens)} for batch size {tail_tokens.shape[0]}"
+        )
+        if any(token is not None for token in next_prompt_tokens):
+            tail_tokens = tail_tokens.clone()
+            for i, next_prompt_token in enumerate(next_prompt_tokens):
+                if next_prompt_token is not None:
+                    # Keep the scalar as a kernel argument. Assigning a Python
+                    # scalar through scalar indexing issues a pageable H2D copy.
+                    tail_tokens[i : i + 1].fill_(next_prompt_token)
+        return tail_tokens
+
+    # Compatibility for batches constructed before chunked_reqs was populated.
+    next_prompt_token = getattr(batch, "chunked_req_next_prompt_token", None)
     if next_prompt_token is not None:
         for i, r in enumerate(batch.reqs):
             if r is batch.chunked_req:

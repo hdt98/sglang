@@ -46,7 +46,7 @@ class SchedulerLoadInquirer:
     waiting_queue_prefix_matched: Callable
     get_recent_cache_hit_rate: Callable
     get_stats: Callable
-    get_chunked_req: Callable
+    get_chunked_reqs: Callable
     get_disagg_prefill_bootstrap_queue: Callable
     get_disagg_prefill_inflight_queue: Callable
     get_disagg_decode_prealloc_queue: Callable
@@ -56,6 +56,14 @@ class SchedulerLoadInquirer:
     get_total_prefill_uncached_tokens: Callable
     get_total_prefill_busy_us: Callable
     get_decode_moment_totals: Callable
+
+    def _chunked_reqs(self):
+        get_chunked_reqs = getattr(self, "get_chunked_reqs", None)
+        if get_chunked_reqs is not None:
+            return get_chunked_reqs()
+        get_chunked_req = getattr(self, "get_chunked_req", None)
+        req = get_chunked_req() if get_chunked_req is not None else None
+        return [req] if req is not None else []
 
     def _get_num_pending_tokens(self, chunk_deduct: int = 0) -> int:
         """Get the total number of tokens pending prefill.
@@ -72,9 +80,11 @@ class SchedulerLoadInquirer:
                 0 is correct.
         """
         num_pending_tokens = sum(req.seqlen for req in self.get_waiting_queue())
-        if self.get_chunked_req() is not None:
-            req = self.get_chunked_req()
-            num_pending_tokens += req.seqlen - len(req.prefix_indices) - chunk_deduct
+        chunked_pending_tokens = sum(
+            req.seqlen - len(req.prefix_indices)
+            for req in SchedulerLoadInquirer._chunked_reqs(self)
+        )
+        num_pending_tokens += max(0, chunked_pending_tokens - chunk_deduct)
         return num_pending_tokens
 
     def get_num_waiting_uncached_tokens(self) -> int:
@@ -89,9 +99,8 @@ class SchedulerLoadInquirer:
                 num_tokens += max(0, req.seqlen - req.num_matched_prefix_tokens)
             else:
                 num_tokens += int(req.seqlen * cache_miss_rate)
-        cr = self.get_chunked_req()
-        if cr is not None:
-            num_tokens += max(0, cr.seqlen - len(cr.prefix_indices))
+        for req in SchedulerLoadInquirer._chunked_reqs(self):
+            num_tokens += max(0, req.seqlen - len(req.prefix_indices))
         return num_tokens
 
     def get_loads(self) -> LoadSnapshot:

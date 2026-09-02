@@ -7,6 +7,12 @@ from unittest.mock import Mock, patch
 import numpy as np
 import torch
 
+from sglang.srt.disaggregation import decode as disagg_decode
+from sglang.srt.disaggregation import (
+    decode_schedule_batch_mixin as disagg_decode_batch,
+)
+from sglang.srt.disaggregation import prefill as disagg_prefill
+from sglang.srt.disaggregation import utils as disagg_utils
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.staging_handler import (
@@ -26,6 +32,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
     KVArgsRegisterInfo,
     MooncakeKVManager,
 )
+from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     get_dsv4_c128_state_indices,
@@ -411,20 +418,29 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
         override.install()
         self.addCleanup(override.restore)
 
-        with envs.SGLANG_DSA_FUSE_TOPK.override(True), patch(
-            "sglang.srt.layers.attention.dsa.utils.is_cuda", return_value=True
+        local_slots = [[309, 101, -1], [801, 990, -1]]
+        unremapped = [[2, 0, -1], [1, 3, -1]]
+        for platform, cuda, hip, fused, expected in (
+            ("cuda", True, False, True, local_slots),
+            ("hip", False, True, True, local_slots),
+            ("other", False, False, False, unremapped),
         ):
-            self.assertTrue(
-                should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend=True)
-            )
-            draft_input = build_eagle_disagg_draft_input(
-                batch, torch.tensor([11, 12], dtype=torch.int64), None
-            )
+            with self.subTest(platform=platform), envs.SGLANG_DSA_FUSE_TOPK.override(
+                True
+            ), patch(
+                "sglang.srt.layers.attention.dsa.utils.is_cuda", return_value=cuda
+            ), patch(
+                "sglang.srt.layers.attention.dsa.utils.is_hip", return_value=hip
+            ):
+                self.assertEqual(
+                    should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend=True),
+                    fused,
+                )
+                draft_input = build_eagle_disagg_draft_input(
+                    batch, torch.tensor([11, 12], dtype=torch.int64), None
+                )
 
-        self.assertEqual(
-            draft_input.dsa_topk_indices.tolist(),
-            [[309, 101, -1], [801, 990, -1]],
-        )
+                self.assertEqual(draft_input.dsa_topk_indices.tolist(), expected)
 
     def test_future_map_initializes_seed_buffer_after_seedless_payload(self):
         future_map = object.__new__(FutureMap)
@@ -445,6 +461,304 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
         )
         self.assertEqual(future_map.dsa_topk_indices_buf.shape, (4, 3))
         self.assertEqual(future_map.dsa_topk_indices_buf.dtype, torch.int32)
+
+
+class TestHybridMambaCheckpointHandoff(unittest.TestCase):
+    def setUp(self):
+        self.spec_config = SimpleNamespace(speculative_algorithm="EAGLE")
+        self.get_spec_patch = patch.object(
+            disagg_prefill, "get_spec", return_value=self.spec_config
+        )
+        self.get_spec_patch.start()
+        self.addCleanup(self.get_spec_patch.stop)
+
+    @staticmethod
+    def _make_metadata_req(checkpoint_seqlen=None, metadata_buffer_index=0):
+        return SimpleNamespace(
+            metadata_buffer_index=metadata_buffer_index,
+            output_ids=[101],
+            cached_tokens=0,
+            cached_tokens_device=0,
+            cached_tokens_host=0,
+            cached_tokens_storage=0,
+            multimodal_inputs=None,
+            return_logprob=False,
+            return_sampling_mask=False,
+            hidden_states_tensor=None,
+            bootstrap_room=9,
+            disagg_mamba_checkpoint_seqlen=checkpoint_seqlen,
+        )
+
+    def test_prefill_snapshots_checkpoint_after_radix_cache_donation(self):
+        req = SimpleNamespace(
+            mamba_last_track_seqlen=512,
+            disagg_decode_prefix_len=0,
+            last_node=None,
+        )
+        tree_core = Mock()
+        tree_core.get_component_device_value.return_value = torch.tensor([17])
+        tree_cache = SimpleNamespace(
+            disable=False,
+            tree_core=tree_core,
+            _components_tuple=(),
+        )
+
+        def donate_checkpoint(cached_req, _tree_cache):
+            cached_req.last_node = 73
+            cached_req.mamba_last_track_seqlen = None
+
+        with patch.object(
+            disagg_prefill,
+            "maybe_cache_unfinished_req",
+            side_effect=donate_checkpoint,
+        ):
+            disagg_prefill._cache_unfinished_req_with_mamba_checkpoint(
+                req, tree_cache
+            )
+
+        self.assertEqual(req.disagg_mamba_checkpoint_seqlen, 512)
+        self.assertTrue(
+            torch.equal(req.disagg_mamba_checkpoint_index, torch.tensor([17]))
+        )
+
+    def test_prefill_does_not_handoff_checkpoint_behind_decode_prefix(self):
+        req = SimpleNamespace(
+            mamba_last_track_seqlen=431424,
+            disagg_decode_prefix_len=433152,
+            last_node=None,
+        )
+        tree_core = Mock()
+        tree_core.get_component_device_value.return_value = torch.tensor([17])
+        tree_cache = SimpleNamespace(
+            disable=False,
+            tree_core=tree_core,
+            _components_tuple=(),
+        )
+
+        def donate_checkpoint(cached_req, _tree_cache):
+            cached_req.last_node = 73
+            cached_req.mamba_last_track_seqlen = None
+
+        with patch.object(
+            disagg_prefill,
+            "maybe_cache_unfinished_req",
+            side_effect=donate_checkpoint,
+        ):
+            disagg_prefill._cache_unfinished_req_with_mamba_checkpoint(
+                req, tree_cache
+            )
+
+        self.assertIsNone(req.disagg_mamba_checkpoint_index)
+        self.assertIsNone(req.disagg_mamba_checkpoint_seqlen)
+
+    def test_dflash_keeps_local_checkpoint_without_handing_it_to_decode(self):
+        self.spec_config.speculative_algorithm = "DFLASH"
+        req = SimpleNamespace(
+            mamba_last_track_seqlen=512,
+            disagg_decode_prefix_len=0,
+            last_node=None,
+        )
+        tree_core = Mock()
+        tree_core.get_component_device_value.return_value = torch.tensor([17])
+        tree_cache = SimpleNamespace(
+            disable=False,
+            tree_core=tree_core,
+            _components_tuple=(),
+        )
+
+        def donate_checkpoint(cached_req, _tree_cache):
+            cached_req.last_node = 73
+            cached_req.mamba_last_track_seqlen = None
+
+        with patch.object(
+            disagg_prefill,
+            "maybe_cache_unfinished_req",
+            side_effect=donate_checkpoint,
+        ):
+            disagg_prefill._cache_unfinished_req_with_mamba_checkpoint(
+                req, tree_cache
+            )
+
+        self.assertEqual(req.last_node, 73)
+        self.assertIsNone(req.disagg_mamba_checkpoint_index)
+        self.assertIsNone(req.disagg_mamba_checkpoint_seqlen)
+
+    def test_prefill_fake_transfer_does_not_snapshot_checkpoint(self):
+        req = SimpleNamespace(
+            mamba_last_track_seqlen=512,
+            last_node=None,
+            skip_radix_cache_insert=True,
+        )
+
+        with patch.object(disagg_prefill, "maybe_cache_unfinished_req"):
+            disagg_prefill._cache_unfinished_req_with_mamba_checkpoint(
+                req, SimpleNamespace(disable=False)
+            )
+
+        self.assertIsNone(req.disagg_mamba_checkpoint_index)
+        self.assertIsNone(req.disagg_mamba_checkpoint_seqlen)
+
+    def test_metadata_carries_checkpoint_depth_and_clears_reused_slot(self):
+        buffers = MetadataBuffers(
+            size=2,
+            hidden_size=2,
+            hidden_states_dtype=torch.float32,
+        )
+        buffers.set_buf(self._make_metadata_req(512))
+        self.assertEqual(buffers.cached_tokens[0, 7].item(), 512)
+
+        buffers.set_buf(self._make_metadata_req(None))
+        self.assertEqual(buffers.cached_tokens[0, 7].item(), -1)
+
+    def test_state_indices_order_active_before_checkpoint(self):
+        pool = SimpleNamespace(
+            req_index_to_mamba_index_mapping=torch.tensor([4]),
+            translate_mamba_indices=lambda indices: indices + 100,
+        )
+        req = SimpleNamespace(req_pool_idx=0)
+
+        indices = disagg_utils.get_mamba_state_transfer_indices(
+            pool,
+            req,
+            checkpoint_index=torch.tensor([9]),
+        )
+
+        np.testing.assert_array_equal(
+            indices,
+            np.array([104, 109], dtype=np.int32),
+        )
+
+    def test_active_only_sender_can_target_checkpoint_aware_decode(self):
+        self.assertEqual(
+            disagg_utils.pair_mamba_state_indices([4], [8, 9]),
+            [(4, 8)],
+        )
+
+    def test_checkpoint_sender_requires_checkpoint_destination(self):
+        with self.assertRaisesRegex(
+            RuntimeError, "destination for every Mamba state row"
+        ):
+            disagg_utils.pair_mamba_state_indices([4, 5], [8])
+
+    def test_decode_restores_checkpoint_depth_before_prebuilt_cache_insert(self):
+        req = SimpleNamespace(
+            rid="r1",
+            bootstrap_host="127.0.0.1",
+            mamba_ping_pong_track_buffer=torch.tensor([33]),
+            mamba_last_track_idx=0,
+            mamba_last_track_seqlen=None,
+        )
+        cached_tokens = torch.zeros(16, dtype=torch.int32)
+        cached_tokens[7] = 512
+
+        disagg_decode._restore_mamba_checkpoint_metadata(req, cached_tokens)
+
+        self.assertEqual(req.mamba_last_track_seqlen, 512)
+        self.assertEqual(req.disagg_mamba_checkpoint_seqlen, 512)
+
+    def test_decode_fake_transfer_ignores_stale_checkpoint_metadata(self):
+        req = SimpleNamespace(
+            rid="HEALTH_CHECK_reused_metadata",
+            bootstrap_host=disagg_utils.FAKE_BOOTSTRAP_HOST,
+            mamba_ping_pong_track_buffer=torch.tensor([33]),
+            mamba_last_track_idx=0,
+            mamba_last_track_seqlen=None,
+            disagg_mamba_checkpoint_seqlen=None,
+        )
+        cached_tokens = torch.zeros(16, dtype=torch.int32)
+        cached_tokens[7] = 103936
+
+        disagg_decode._restore_mamba_checkpoint_metadata(req, cached_tokens)
+
+        self.assertIsNone(req.mamba_last_track_seqlen)
+        self.assertIsNone(req.disagg_mamba_checkpoint_seqlen)
+
+    def test_decode_confirms_received_checkpoint_entered_radix_tree(self):
+        req = SimpleNamespace(
+            rid="r1",
+            last_node=73,
+            cache_protected_len=512,
+            mamba_last_track_seqlen=None,
+            disagg_mamba_checkpoint_seqlen=512,
+        )
+        tree_core = Mock()
+        tree_core.get_component_device_value.return_value = torch.tensor([17])
+
+        disagg_decode_batch._confirm_received_mamba_checkpoint_cached(
+            req, SimpleNamespace(tree_core=tree_core)
+        )
+
+        self.assertIsNone(req.disagg_mamba_checkpoint_seqlen)
+
+    def test_decode_rejects_checkpoint_missing_from_radix_tree(self):
+        req = SimpleNamespace(
+            rid="r1",
+            last_node=73,
+            cache_protected_len=512,
+            mamba_last_track_seqlen=None,
+            disagg_mamba_checkpoint_seqlen=512,
+        )
+        tree_core = Mock()
+        tree_core.get_component_device_value.return_value = None
+
+        with self.assertRaisesRegex(RuntimeError, "not present in decode radix"):
+            disagg_decode_batch._confirm_received_mamba_checkpoint_cached(
+                req, SimpleNamespace(tree_core=tree_core)
+            )
+
+    def test_mooncake_copies_active_and_checkpoint_rows(self):
+        manager = object.__new__(MooncakeKVManager)
+        manager.pp_size = 1
+        manager._transfer_data = Mock(return_value=0)
+        req = SimpleNamespace(mooncake_session_id="session")
+
+        result = manager._send_mamba_state(
+            req,
+            [2, 7],
+            [1000],
+            [100],
+            [5000],
+            [3, 9],
+        )
+
+        self.assertEqual(result, 0)
+        manager._transfer_data.assert_called_once_with(
+            "session",
+            [
+                (1200, 5300, 100),
+                (1700, 5900, 100),
+            ],
+        )
+
+    def test_nixl_copies_active_and_checkpoint_rows(self):
+        manager = object.__new__(NixlKVManager)
+        manager.pp_size = 1
+        manager.kv_args = SimpleNamespace(gpu_id=0)
+        manager.agent = Mock()
+        manager.agent.get_xfer_descs.side_effect = lambda addrs, _: addrs
+        manager.agent.initialize_xfer.return_value = "handle"
+        manager.agent.transfer.return_value = "DONE"
+
+        result = manager._send_mamba_state(
+            "decode",
+            [2, 7],
+            [1000],
+            [100],
+            [5000],
+            [3, 9],
+            4,
+            "notif",
+        )
+
+        self.assertEqual(result, "handle")
+        self.assertEqual(
+            manager.agent.get_xfer_descs.call_args_list[0].args,
+            ([(1200, 100, 0), (1700, 100, 0)], "VRAM"),
+        )
+        self.assertEqual(
+            manager.agent.get_xfer_descs.call_args_list[1].args,
+            ([(5300, 100, 4), (5900, 100, 4)], "VRAM"),
+        )
 
 
 class TestDSV4C128StateIndices(unittest.TestCase):

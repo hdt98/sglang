@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
@@ -16,6 +17,34 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.schedule_batch import ScheduleBatch
+
+
+def _confirm_received_mamba_checkpoint_cached(req, tree_cache) -> None:
+    """Confirm that decode inserted the transferred prompt checkpoint."""
+    checkpoint_seqlen = getattr(req, "disagg_mamba_checkpoint_seqlen", None)
+    if checkpoint_seqlen is None:
+        return
+
+    if req.last_node is None or req.cache_protected_len < checkpoint_seqlen:
+        raise RuntimeError(
+            "Transferred Mamba checkpoint is not present in decode radix for "
+            f"request {req.rid}: checkpoint={checkpoint_seqlen}, "
+            f"cached={req.cache_protected_len}"
+        )
+
+    tree_core = getattr(tree_cache, "tree_core", None)
+    checkpoint_index = (
+        tree_core.get_component_device_value(req.last_node, ComponentType.MAMBA)
+        if tree_core is not None
+        else getattr(req.last_node, "mamba_value", None)
+    )
+    if checkpoint_index is None:
+        raise RuntimeError(
+            "Transferred Mamba checkpoint is not present in decode radix for "
+            f"request {req.rid}"
+        )
+
+    req.disagg_mamba_checkpoint_seqlen = None
 
 
 class ScheduleBatchDisaggregationDecodeMixin:
@@ -119,6 +148,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
         for req in self.reqs:
             last_tokens.append(req.output_ids[-1])
             maybe_cache_unfinished_req(req, self.tree_cache)
+            _confirm_received_mamba_checkpoint_cached(req, self.tree_cache)
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:

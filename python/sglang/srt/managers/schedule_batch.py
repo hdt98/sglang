@@ -1196,6 +1196,8 @@ class Req(ReqDllmMixin):
         # At-rest device-resident prefix end, snapshotted on the request's
         # first prefill batch; the cached-prefix early-send never goes past it.
         self.early_send_prefix_end: Optional[int] = None
+        self.disagg_mamba_checkpoint_index: Optional[torch.Tensor] = None
+        self.disagg_mamba_checkpoint_seqlen: Optional[int] = None
         self.metadata_buffer_index: int = -1
         # Used in overlap sequence to signal that an optimistic request should
         # abort chunking. Set in create_sender, consumed in process_batch_result.
@@ -1709,6 +1711,8 @@ class Req(ReqDllmMixin):
         self.mamba_branching_seqlen = None
         self.mamba_cow_src_index = None
         self.mamba_needs_clear = False
+        self.disagg_mamba_checkpoint_index = None
+        self.disagg_mamba_checkpoint_seqlen = None
         self.already_computed = 0
         assert self.kv is None, "expect it is already released"
         self.kv_committed_len = 0
@@ -2039,6 +2043,24 @@ def _compute_chunked_req_next_prompt_token(
     return None
 
 
+def _compute_chunked_req_next_prompt_tokens(
+    reqs: List[Req],
+    chunked_reqs: List[Req],
+    vocab_size: int,
+) -> Optional[List[Optional[int]]]:
+    if not chunked_reqs:
+        return None
+    chunked_req_ids = {id(req) for req in chunked_reqs}
+    return [
+        (
+            _compute_chunked_req_next_prompt_token(req, vocab_size)
+            if id(req) in chunked_req_ids
+            else None
+        )
+        for req in reqs
+    ]
+
+
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -2071,6 +2093,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For chunked prefill in PP
     chunked_req: Optional[Req] = None
     chunked_req_next_prompt_token: Optional[int] = None
+    chunked_reqs: Optional[List[Req]] = None
+    chunked_req_next_prompt_tokens: Optional[List[Optional[int]]] = None
     contains_last_prefill_chunk: bool = True
 
     # For DP attention
@@ -2239,7 +2263,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         spec_algorithm: SpeculativeAlgorithm,
         chunked_req: Optional[Req] = None,
         dllm_config: Optional[DllmConfig] = None,
+        chunked_reqs: Optional[List[Req]] = None,
     ):
+        if chunked_reqs is None:
+            chunked_reqs = [chunked_req] if chunked_req is not None else []
+        else:
+            chunked_reqs = list(chunked_reqs)
+            if chunked_req is None and len(chunked_reqs) == 1:
+                chunked_req = chunked_reqs[0]
+
         return_logprob = any(req.return_logprob for req in reqs)
 
         return_hidden_states_mode = get_batch_return_hidden_states_mode(reqs)
@@ -2261,6 +2293,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             chunked_req=chunked_req,
             chunked_req_next_prompt_token=_compute_chunked_req_next_prompt_token(
                 chunked_req,
+                model_config.vocab_size,
+            ),
+            chunked_reqs=chunked_reqs,
+            chunked_req_next_prompt_tokens=_compute_chunked_req_next_prompt_tokens(
+                reqs,
+                chunked_reqs,
                 model_config.vocab_size,
             ),
             dllm_config=dllm_config,
@@ -3379,6 +3417,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             launch_ts=self.launch_ts,
             after_idle_gap=self.after_idle_gap,
             extend_num_tokens=self.extend_num_tokens,
+            chunked_req=self.chunked_req,
+            chunked_req_next_prompt_token=self.chunked_req_next_prompt_token,
+            chunked_reqs=(
+                self.chunked_reqs[:] if self.chunked_reqs is not None else None
+            ),
+            chunked_req_next_prompt_tokens=(
+                self.chunked_req_next_prompt_tokens[:]
+                if self.chunked_req_next_prompt_tokens is not None
+                else None
+            ),
         )
 
     def maybe_evict_swa(self):

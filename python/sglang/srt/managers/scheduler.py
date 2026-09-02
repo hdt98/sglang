@@ -209,6 +209,7 @@ from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
+    select_request_chunk_tokens,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -1190,7 +1191,16 @@ class Scheduler(
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
         self.chunked_req = None
+        self.disagg_chunked_reqs: List[Req] = []
         self._pending_chunked_abort_req = None
+        self._pending_chunked_abort_reqs: List[Req] = []
+        self.allow_multiple_chunked_reqs = (
+            DisaggregationMode(get_disagg().disaggregation_mode)
+            == DisaggregationMode.PREFILL
+            and get_schedule().chunked_prefill_request_quantum is not None
+            and not self.enable_overlap
+            and self.ps.pp_size == 1
+        )
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
@@ -1323,6 +1333,7 @@ class Scheduler(
         self.mm_receiver = None
         self.disagg_prefill_bootstrap_queue = None
         self.disagg_prefill_inflight_queue = None
+        self.disagg_prefill_max_inflight_transfers = None
         self.disagg_decode_prealloc_queue = None
         self.disagg_decode_transfer_queue = None
 
@@ -1452,6 +1463,14 @@ class Scheduler(
             self.disagg_prefill_inflight_queue: List[Req] = []
             # Requests with a sent chunk that are not yet on the inflight queue.
             self.disagg_prefill_pending_chunk_rids: Set[str] = set()
+            self.disagg_prefill_max_inflight_transfers = (
+                get_disagg().disaggregation_prefill_max_inflight_transfers
+            )
+            if self.disagg_prefill_max_inflight_transfers is not None:
+                logger.info(
+                    "PD prefill transfer-aware admission is enabled with %d slots",
+                    self.disagg_prefill_max_inflight_transfers,
+                )
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
@@ -2201,7 +2220,7 @@ class Scheduler(
             ),
             get_recent_cache_hit_rate=lambda: self.metrics_reporter.recent_cache_hit_rate,
             get_stats=lambda: self.metrics_reporter.stats,
-            get_chunked_req=lambda: self.chunked_req,
+            get_chunked_reqs=self.active_chunked_reqs,
             get_disagg_prefill_bootstrap_queue=lambda: self.disagg_prefill_bootstrap_queue,
             get_disagg_prefill_inflight_queue=lambda: self.disagg_prefill_inflight_queue,
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
@@ -3021,6 +3040,38 @@ class Scheduler(
     def stash_chunked_request(self, req: Req):
         maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
+    def active_chunked_reqs(self) -> List[Req]:
+        if getattr(self, "allow_multiple_chunked_reqs", False):
+            return list(getattr(self, "disagg_chunked_reqs", ()))
+        chunked_req = getattr(self, "chunked_req", None)
+        return [chunked_req] if chunked_req is not None else []
+
+    def set_active_chunked_reqs(self, reqs: List[Req]) -> None:
+        if getattr(self, "allow_multiple_chunked_reqs", False):
+            self.disagg_chunked_reqs = list(reqs)
+            self.chunked_req = None
+            return
+        assert len(reqs) <= 1
+        self.chunked_req = reqs[0] if reqs else None
+
+    def _disagg_prefill_transfer_pressure(self) -> int:
+        """Count unique requests already occupying a PD handoff slot."""
+        transfer_rids = {
+            req.rid
+            for req in (getattr(self, "disagg_prefill_inflight_queue", None) or ())
+        }
+        transfer_rids.update(
+            getattr(self, "disagg_prefill_pending_chunk_rids", ())
+        )
+        transfer_rids.update(req.rid for req in self.active_chunked_reqs())
+        return len(transfer_rids)
+
+    def _disagg_prefill_new_req_transfer_budget(self) -> Optional[int]:
+        limit = getattr(self, "disagg_prefill_max_inflight_transfers", None)
+        if limit is None:
+            return None
+        return max(0, limit - self._disagg_prefill_transfer_pressure())
+
     def process_pending_chunked_abort(self) -> None:
         """Abort an in-flight chunked-prefill request once it is safe to do so.
 
@@ -3035,37 +3086,49 @@ class Scheduler(
         is excluded from streaming and its logprob offset is still accounted).
         Mirrors ``handle_bootstrap_failure``.
         """
-        req = self._pending_chunked_abort_req
-        if req is None:
-            return
-        if self.chunked_req is not req:
-            if req.finished() or req.req_pool_idx is None:
-                self._pending_chunked_abort_req = None
-                return
-            # The request moved to another scheduler queue after abort_request
-            # deferred it, so retry against its current location.
-            self._pending_chunked_abort_req = None
-            self.abort_request(AbortReq(rid=req.rid))
-            return
-
-        prepare_abort(req, "Aborted")
-        req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
-        req.to_finish = None
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.clear_pending_chunk_send(req)
-            req.disagg_kv_sender.abort()
-            maybe_release_metadata_buffer(
-                req, self.req_to_metadata_buffer_idx_allocator
+        pending_reqs = (
+            self._pending_chunked_abort_reqs[:]
+            if getattr(self, "allow_multiple_chunked_reqs", False)
+            else (
+                [self._pending_chunked_abort_req]
+                if self._pending_chunked_abort_req is not None
+                else []
             )
-            req.pending_bootstrap = False
-        if self.enable_hicache_storage:
-            self.tree_cache.release_aborted_request(req.rid)
-        release_kv_cache(req, self.tree_cache, is_insert=False)
+        )
+        if not pending_reqs:
+            return
 
-        self.chunked_req = None
+        for req in pending_reqs:
+            if not any(active_req is req for active_req in self.active_chunked_reqs()):
+                if not req.finished() and req.req_pool_idx is not None:
+                    self.abort_request(AbortReq(rid=req.rid))
+                continue
+
+            prepare_abort(req, "Aborted")
+            req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
+            req.to_finish = None
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                self.clear_pending_chunk_send(req)
+                req.disagg_kv_sender.abort()
+                maybe_release_metadata_buffer(
+                    req, self.req_to_metadata_buffer_idx_allocator
+                )
+                req.pending_bootstrap = False
+            if self.enable_hicache_storage:
+                self.tree_cache.release_aborted_request(req.rid)
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+            self.set_active_chunked_reqs(
+                [
+                    active_req
+                    for active_req in self.active_chunked_reqs()
+                    if active_req is not req
+                ]
+            )
+            self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
+            logger.debug(f"Abort chunked prefill request. {req.rid=}")
+
         self._pending_chunked_abort_req = None
-        self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
-        logger.debug(f"Abort chunked prefill request. {req.rid=}")
+        self._pending_chunked_abort_reqs = []
 
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
@@ -3302,16 +3365,17 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             running_batch.batch_is_full = False
 
+        chunked_reqs = self.active_chunked_reqs()
         if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
-        ) and self.chunked_req is None:
+        ) and not chunked_reqs:
             return None, running_batch
 
         running_bs = len(running_batch.reqs)
         # Skipped during a chunked prefill: that pass must proceed regardless.
         if (
             self.min_free_slots_delayer is not None
-            and self.chunked_req is None
+            and not chunked_reqs
             and self.min_free_slots_delayer.should_delay(
                 running_bs=running_bs,
                 num_allocatable_reqs=self.get_num_allocatable_reqs(running_bs),
@@ -3326,7 +3390,7 @@ class Scheduler(
         # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
         if (
             self.get_num_allocatable_reqs(running_bs) <= 0
-            and self.chunked_req is None
+            and not chunked_reqs
             and not self.enable_priority_preemption
         ):
             running_batch.batch_is_full = True
@@ -3343,8 +3407,8 @@ class Scheduler(
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
-        if self.chunked_req is not None and self.enable_dynamic_chunking:
-            history_len = len(self.chunked_req.prefix_indices)
+        if chunked_reqs and self.enable_dynamic_chunking:
+            history_len = len(chunked_reqs[0].prefix_indices)
             dynamic_size = self.predict_next_chunk_size(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
@@ -3374,11 +3438,23 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            request_chunk_tokens=select_request_chunk_tokens(
+                get_schedule().chunked_prefill_request_quantum,
+                get_schedule().chunked_prefill_request_quantum_queue_threshold,
+                len(self.waiting_queue),
+            ),
+            allow_multiple_chunked_reqs=self.allow_multiple_chunked_reqs,
         )
 
-        if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+        remaining_chunked_reqs = []
+        for req in chunked_reqs:
+            req.init_next_round_input()
+            if adder.add_chunked_req(req) is not None:
+                remaining_chunked_reqs.append(req)
+
+        # Existing partial prefills above must always advance. The remaining
+        # budget applies only to requests that have not started prefill yet.
+        new_req_transfer_budget = self._disagg_prefill_new_req_transfer_budget()
 
         if self.enable_lora:
             running_loras = {
@@ -3399,6 +3475,8 @@ class Scheduler(
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if adder.chunk_budget_exhausted():
+                break
+            if new_req_transfer_budget == 0:
                 break
 
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
@@ -3448,11 +3526,20 @@ class Scheduler(
                     req.swa_host_hit_length = (
                         self.tree_cache.staged_prefetch_swa_tokens(req.rid)
                     )
+            can_run_count_before = len(adder.can_run_list)
             res = adder.add_one_req(
                 req,
-                has_chunked_req=(self.chunked_req is not None),
+                has_chunked_req=(
+                    bool(remaining_chunked_reqs)
+                    or adder.new_chunked_req is not None
+                ),
                 truncation_align_size=self.truncation_align_size,
             )
+            if (
+                new_req_transfer_budget is not None
+                and len(adder.can_run_list) > can_run_count_before
+            ):
+                new_req_transfer_budget -= 1
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
@@ -3499,13 +3586,14 @@ class Scheduler(
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
 
-        if adder.new_chunked_req is not None:
-            # Update chunked prefill
-            assert self.chunked_req is None
-            self.chunked_req = adder.new_chunked_req
-
-        if self.chunked_req is not None:
-            self.chunked_req.inflight_middle_chunks += 1
+        remaining_chunked_reqs.extend(adder.new_chunked_reqs)
+        self.set_active_chunked_reqs(remaining_chunked_reqs)
+        chunked_req_ids = {id(req) for req in remaining_chunked_reqs}
+        batch_chunked_reqs = [
+            req for req in can_run_list if id(req) in chunked_req_ids
+        ]
+        for req in batch_chunked_reqs:
+            req.inflight_middle_chunks += 1
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
@@ -3519,10 +3607,12 @@ class Scheduler(
             self.enable_overlap,
             self.spec_algorithm,
             chunked_req=self.chunked_req,
+            chunked_reqs=batch_chunked_reqs,
         )
 
         new_batch.contains_last_prefill_chunk = (
-            self.chunked_req is None or len(can_run_list) != 1
+            not batch_chunked_reqs
+            or len(batch_chunked_reqs) != len(can_run_list)
         )
 
         if self.enable_hierarchical_cache:
@@ -3544,9 +3634,7 @@ class Scheduler(
             self.enable_priority_scheduling,
             num_pending_tokens=self.load_inquirer._get_num_pending_tokens(
                 chunk_deduct=(
-                    self.chunked_req.extend_range.length
-                    if self.chunked_req is not None
-                    else 0
+                    sum(req.extend_range.length for req in batch_chunked_reqs)
                 ),
             ),
         )
@@ -4244,7 +4332,7 @@ class Scheduler(
         # Batch running status
         idle = (
             self.running_batch.is_empty()
-            and self.chunked_req is None
+            and not self.active_chunked_reqs()
             and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
@@ -4620,7 +4708,7 @@ class Scheduler(
         live_reqs = {
             *self.collect_inflight_reqs(),
             *self.waiting_queue,
-            *([self.chunked_req] if self.chunked_req is not None else []),
+            *Scheduler.active_chunked_reqs(self),
         }
         if self.hisparse_coordinator is not None:
             live_reqs.update(
@@ -4641,13 +4729,19 @@ class Scheduler(
         }
 
     def abort_request(self, recv_req: AbortReq):
-        if (chunked_req := self.chunked_req) is not None:
+        for chunked_req in self.active_chunked_reqs():
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
-                self._pending_chunked_abort_req = chunked_req
+                if self.allow_multiple_chunked_reqs:
+                    if not any(
+                        req is chunked_req for req in self._pending_chunked_abort_reqs
+                    ):
+                        self._pending_chunked_abort_reqs.append(chunked_req)
+                else:
+                    self._pending_chunked_abort_req = chunked_req
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
         # Abort requests still waiting for encoder embeddings (EPD language-only)
-        if self.mm_receiver is not None:
+        if getattr(self, "mm_receiver", None) is not None:
             self.mm_receiver.abort_waiting_requests(recv_req)
 
         # Delete requests in the waiting queue

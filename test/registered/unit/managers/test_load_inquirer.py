@@ -65,6 +65,25 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
             120,
         )
 
+    def test_waiting_tokens_include_all_partial_requests(self):
+        waiting_req = SimpleNamespace(seqlen=100, num_matched_prefix_tokens=20)
+        chunked_reqs = [
+            SimpleNamespace(seqlen=50, prefix_indices=range(10)),
+            SimpleNamespace(seqlen=80, prefix_indices=range(20)),
+        ]
+        inquirer = SimpleNamespace(
+            disaggregation_mode=DisaggregationMode.NULL,
+            get_waiting_queue=lambda: [waiting_req],
+            waiting_queue_prefix_matched=lambda: True,
+            get_chunked_reqs=lambda: chunked_reqs,
+            get_recent_cache_hit_rate=lambda: 0.75,
+        )
+
+        self.assertEqual(
+            SchedulerLoadInquirer.get_num_waiting_uncached_tokens(inquirer),
+            180,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

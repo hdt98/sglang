@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -98,6 +98,7 @@ class KPoolExtendPlan:
     ragged_k_scale: Optional[torch.Tensor]
     ragged_paged_page_table: Optional[torch.Tensor]
     ragged_paged_page_table_row_index: Optional[torch.Tensor]
+    ragged_segments: Tuple[Tuple[int, int, int, int], ...]
     cp: Optional[KPoolCpInfo] = None
 
 
@@ -450,6 +451,21 @@ def _kpool_plan_to_gpu(
         ragged_k_scale=ragged_k_scale,
         ragged_paged_page_table=ragged_paged_page_table,
         ragged_paged_page_table_row_index=ragged_paged_page_table_row_index,
+        ragged_segments=tuple(
+            (
+                q_start,
+                q_start + q_len,
+                page_start * slots_per_page,
+                (page_start + page_count) * slots_per_page,
+            )
+            for q_start, q_len, page_start, page_count in zip(
+                cpu.cu_q_len_excl,
+                cpu.ragged_q_len,
+                cpu.cu_pages_excl,
+                cpu.ragged_pool_pages,
+                strict=True,
+            )
+        ),
         cp=_kpool_cp_owner_rank(forward_batch, n_pool, device),
     )
 

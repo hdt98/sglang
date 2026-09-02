@@ -845,6 +845,29 @@ class ServerArgs:
         "The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
         NS("schedule"),
     ] = None
+    chunked_prefill_request_quantum: A[
+        Optional[int],
+        (
+            "The maximum number of fresh tokens assigned to one partially-prefilled "
+            "request in a prefill batch. By default, one request may consume the "
+            "entire chunked-prefill budget. Set this below --chunked-prefill-size "
+            "to share that budget. A non-overlap disaggregated PREFILL worker with "
+            "pipeline parallelism 1 can admit several long partial requests in the "
+            "same batch; other workers retain a single partial request."
+        ),
+        NS("schedule"),
+    ] = None
+    chunked_prefill_request_quantum_queue_threshold: A[
+        Optional[int],
+        (
+            "Apply --chunked-prefill-request-quantum only when at least this "
+            "many requests are waiting. Below the threshold, an active partial "
+            "request may consume the full chunked-prefill budget. This preserves "
+            "completion locality at low load while bounding head-of-line blocking "
+            "during backlog bursts."
+        ),
+        NS("schedule"),
+    ] = None
     prefill_decode_interval: A[
         int,
         "The number of decode rounds to run after a prefill batch before scheduling the next prefill. In data-parallel attention mode, the interval is synchronized across all DP ranks. Set to 0 to disable.",
@@ -3265,6 +3288,18 @@ class ServerArgs:
         "The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
         NS("disagg"),
     ] = 1
+    disaggregation_prefill_max_inflight_transfers: A[
+        Optional[int],
+        (
+            "Maximum number of prefill requests allowed to occupy PD handoff "
+            "slots at once. The count includes active chunked prefills, requests "
+            "with sent middle chunks, and completed prefills whose KV transfer is "
+            "still in progress. Existing chunked prefills continue, while new "
+            "waiting requests pause at the limit. Unset means no transfer-aware "
+            "admission limit."
+        ),
+        NS("disagg"),
+    ] = None
     optimistic_prefill_attempts: A[
         int,
         "Number of optimistic prefill forward passes that skip the bootstrap wait.",
@@ -10013,6 +10048,15 @@ class ServerArgs:
                 "pp-max-micro-batch-size, so the threshold may never be reached"
             )
 
+        if cfg.disaggregation_prefill_max_inflight_transfers is not None:
+            assert cfg.disaggregation_prefill_max_inflight_transfers > 0, (
+                "disaggregation_prefill_max_inflight_transfers must be positive"
+            )
+            assert cfg.disaggregation_mode == "prefill", (
+                "disaggregation_prefill_max_inflight_transfers requires "
+                "disaggregation_mode='prefill'"
+            )
+
         assert not (
             cfg.dp_size > 1 and cfg.nnodes != 1 and not cfg.enable_dp_attention
         ), "multi-node data parallel is not supported unless dp attention!"
@@ -10050,6 +10094,42 @@ class ServerArgs:
             assert (
                 cfg.chunked_prefill_size % cfg.page_size == 0
             ), "chunked_prefill_size must be divisible by page_size"
+            if cfg.chunked_prefill_request_quantum is not None:
+                assert cfg.chunked_prefill_request_quantum > 0, (
+                    "chunked_prefill_request_quantum must be positive"
+                )
+                assert (
+                    cfg.chunked_prefill_request_quantum % cfg.page_size == 0
+                ), "chunked_prefill_request_quantum must be divisible by page_size"
+                assert (
+                    cfg.chunked_prefill_request_quantum <= cfg.chunked_prefill_size
+                ), (
+                    "chunked_prefill_request_quantum must not exceed "
+                    "chunked_prefill_size"
+                )
+                if cfg.chunked_prefill_request_quantum_queue_threshold is not None:
+                    assert (
+                        cfg.chunked_prefill_request_quantum_queue_threshold > 0
+                    ), (
+                        "chunked_prefill_request_quantum_queue_threshold must be "
+                        "positive"
+                    )
+            else:
+                assert (
+                    cfg.chunked_prefill_request_quantum_queue_threshold is None
+                ), (
+                    "chunked_prefill_request_quantum_queue_threshold requires "
+                    "chunked_prefill_request_quantum"
+                )
+        else:
+            assert cfg.chunked_prefill_request_quantum is None, (
+                "chunked_prefill_request_quantum requires chunked prefill on a "
+                "non-decode worker"
+            )
+            assert cfg.chunked_prefill_request_quantum_queue_threshold is None, (
+                "chunked_prefill_request_quantum_queue_threshold requires chunked "
+                "prefill on a non-decode worker"
+            )
 
         # Check pdmux
         if cfg.enable_pdmux:

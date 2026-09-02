@@ -44,6 +44,55 @@ never substituted for either decode-throughput gate.
 - Role-local KDA sizing and tuning
 - `sglang-agentx-benchmark` is the only workload used for frontier claims
 
+## 2026-09-02 correctness checkpoint
+
+The performance-only C36 result is not promotable. The FP8 PD deployment
+failed the mandatory GSM8K gate, so the correctness work below takes precedence
+over further frontier claims.
+
+| Cell | Configuration delta | GSM8K |
+|---|---|---:|
+| Alpha reference | MI355 MXFP4 endpoint | 0.99 |
+| r150 | FP8 PD baseline | 0.87 |
+| r151 | QuickReduce disabled | 0.86 |
+| r153 | EAGLE disabled | 0.79 |
+| r155 | AITER MHC disabled | 0.87 |
+| r158 | Non-PD FP8 TP4 control | 0.99 |
+
+r158 exonerates the FP8 checkpoint, FP8 KV cache, TileLang DSA, AITER MoE, and
+the base serving path. The remaining suspects are PD-specific: CP-interleave,
+MoRI state transfer, matched draft-state handoff, decode EAGLE interaction,
+decode radix cache, and scheduler/cache state.
+
+r159 attempted the no-CP isolation but omitted the matched prefill draft-state
+handoff. It is not a valid correctness cell: decode rejected transfers with
+`state component count mismatch (local=3, remote=5)`. r160 repeats that cell
+with `PREFILL_CP_STRATEGY=none` and `ENABLE_PREFILL_DRAFT_STATE=1`; it is
+healthy at startup but currently reports the same mismatch, so its GSM8K run is
+diagnostic rather than promotion evidence. The next source-level step is to
+explain why the prefill draft DSA pool does not register the two additional
+state components expected by decode.
+
+Reproducible Messi commands:
+
+```bash
+docker exec -e RUN_STAMP=r160_pd_nocp_draftstate \\
+  -e PREFILL_CP_STRATEGY=none -e ENABLE_PREFILL_DRAFT_STATE=1 \\
+  -e PYTHONPATH=/tmp/sglang-src/python \\
+  glm53-pd-fresh-messi-20260829 \\
+  bash /tmp/sglang-src/scripts/pd/launch_pd_glm53_flash_pr36607.sh
+```
+
+```bash
+PYTHONPATH=/tmp/sglang-src/python OPENAI_API_KEY=dummy \\
+OPENAI_BASE_URL=http://127.0.0.1:31000/v1 \\
+python3 -m sglang.test.run_eval --eval-name gsm8k --num-examples 100 \\
+  --api chat --num-threads 8 --base-url http://127.0.0.1:31000
+```
+
+Run evidence is under `/data/sonle5/pd_runs/pd_glm53_pr36607_r160_pd_nocp_draftstate`
+and `/tmp/gsm8k_r160.log` inside the Messi container.
+
 ## Best verified point
 
 The best verified point is still the r22 canonical smoke at C8. It passes all

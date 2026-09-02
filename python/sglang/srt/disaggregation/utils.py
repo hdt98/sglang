@@ -119,6 +119,64 @@ def get_dsv4_c128_state_indices(
     return np.array([page], dtype=np.int32)
 
 
+def get_mamba_state_transfer_indices(
+    req_to_token_pool,
+    req: Req,
+    *,
+    checkpoint_index: Optional[torch.Tensor] = None,
+) -> np.ndarray:
+    """Return ordered physical rows for PD Mamba/KDA state transfer.
+
+    The active prompt-end state is always first.  When available, the second
+    row is the last prompt-aligned radix checkpoint; decode registers the same
+    order so a missing checkpoint can safely degrade to an active-only copy.
+    """
+    active_index = torch.as_tensor(
+        req_to_token_pool.req_index_to_mamba_index_mapping[req.req_pool_idx]
+    ).reshape(-1)
+    if active_index.numel() != 1:
+        raise RuntimeError(
+            "PD Mamba state transfer requires one active row per request, "
+            f"got {active_index.numel()}"
+        )
+
+    indices = [active_index]
+    if checkpoint_index is not None:
+        checkpoint_index = torch.as_tensor(
+            checkpoint_index, device=active_index.device
+        ).reshape(-1)
+        if checkpoint_index.numel() != 1:
+            raise RuntimeError(
+                "PD Mamba checkpoint transfer requires one checkpoint row, "
+                f"got {checkpoint_index.numel()}"
+            )
+        indices.append(checkpoint_index)
+
+    physical_indices = req_to_token_pool.translate_mamba_indices(
+        torch.cat(indices)
+    )
+    return physical_indices.to(dtype=torch.int32).cpu().numpy()
+
+
+def pair_mamba_state_indices(src_indices, dst_indices) -> List[Tuple[int, int]]:
+    """Pair active and optional checkpoint Mamba rows in wire order."""
+    src = np.asarray(src_indices, dtype=np.int64).ravel().tolist()
+    dst = np.asarray(dst_indices, dtype=np.int64).ravel().tolist()
+    if not src:
+        return []
+    if len(src) not in (1, 2) or len(dst) not in (1, 2):
+        raise RuntimeError(
+            "PD Mamba state transfer expects active plus at most one checkpoint "
+            f"row, got src={len(src)} dst={len(dst)}"
+        )
+    if len(src) > len(dst):
+        raise RuntimeError(
+            "Decode did not register a destination for every Mamba state row: "
+            f"src={len(src)} dst={len(dst)}"
+        )
+    return list(zip(src, dst[: len(src)]))
+
+
 class DisaggregationMode(Enum):
     NULL = "null"
     PREFILL = "prefill"
@@ -482,9 +540,11 @@ class MetadataBuffers:
 
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
-        # counts and slots 4-6 are reused for multimodal prompt token counts
-        # (slots 7-15 remain spare). This avoids adding new RDMA buffers.
-        # Slot map: 0=cached 1=device 2=host 3=storage 4=image 5=audio 6=video.
+        # counts, slots 4-6 hold multimodal prompt token counts, and slot 7
+        # carries the optional prompt-aligned Mamba/KDA checkpoint depth.
+        # Slots 8-15 remain spare. This avoids adding a new RDMA buffer.
+        # Slot map: 0=cached 1=device 2=host 3=storage 4=image 5=audio 6=video
+        # 7=mamba checkpoint seqlen (-1 when absent).
         self.cached_tokens[req.metadata_buffer_index][0] = req.cached_tokens
         self.cached_tokens[req.metadata_buffer_index][1] = req.cached_tokens_device
         self.cached_tokens[req.metadata_buffer_index][2] = req.cached_tokens_host
@@ -499,6 +559,12 @@ class MetadataBuffers:
         self.cached_tokens[req.metadata_buffer_index][4] = image_t
         self.cached_tokens[req.metadata_buffer_index][5] = audio_t
         self.cached_tokens[req.metadata_buffer_index][6] = video_t
+        checkpoint_seqlen = getattr(
+            req, "disagg_mamba_checkpoint_seqlen", None
+        )
+        self.cached_tokens[req.metadata_buffer_index][7] = (
+            -1 if checkpoint_seqlen is None else checkpoint_seqlen
+        )
         if req.return_logprob:
             if req.logprob.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (

@@ -46,6 +46,7 @@ from sglang.srt.disaggregation.utils import (
     get_dsa_tail_state_indices,
     get_dsv4_c128_state_indices,
     get_kv_class,
+    get_mamba_state_transfer_indices,
     is_aborted,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
@@ -69,11 +70,13 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.runtime_context import (
     get_disagg,
     get_parallel,
     get_schedule,
+    get_spec,
 )
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
@@ -87,6 +90,96 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+
+
+def _clear_mamba_checkpoint_handoff(req: Req) -> None:
+    """Clear per-attempt checkpoint metadata before a prefill retry/reuse."""
+    req.disagg_mamba_checkpoint_index = None
+    req.disagg_mamba_checkpoint_seqlen = None
+
+
+def _mamba_checkpoint_index_from_tree(req: Req, tree_cache):
+    """Return the active-pool row donated to the prompt's radix checkpoint.
+
+    Int8 checkpoint pools use different storage descriptors, so they cannot be
+    sent through the active Mamba/KDA state registration and intentionally fall
+    back to active-only handoff.
+    """
+    if (
+        req.last_node is None
+        or getattr(tree_cache, "int8_ckpt_pool", None) is not None
+    ):
+        return None
+
+    tree_core = getattr(tree_cache, "tree_core", None)
+    if tree_core is not None:
+        components = getattr(tree_core, "components_by_type", None)
+        if isinstance(components, dict):
+            mamba_component = components.get(ComponentType.MAMBA)
+            if (
+                mamba_component is not None
+                and getattr(mamba_component, "int8_ckpt_pool", None) is not None
+            ):
+                return None
+        return tree_core.get_component_device_value(
+            req.last_node, ComponentType.MAMBA
+        )
+
+    return getattr(req.last_node, "mamba_value", None)
+
+
+def _cache_unfinished_req_with_mamba_checkpoint(req: Req, tree_cache) -> None:
+    """Cache an unfinished prefill request and retain its donated KDA row.
+
+    Mamba radix insertion donates the last prompt-aligned ping-pong row and
+    clears ``mamba_last_track_seqlen``.  PD still needs that row and depth on
+    decode so the received prompt can seed decode's radix tree for later turns.
+    """
+    _clear_mamba_checkpoint_handoff(req)
+    checkpoint_seqlen = getattr(req, "mamba_last_track_seqlen", None)
+    maybe_cache_unfinished_req(req, tree_cache)
+    if checkpoint_seqlen is None or getattr(req, "skip_radix_cache_insert", False):
+        return
+
+    # PD decode radix currently supports EAGLE only. DFlash-family decode uses
+    # chunk cache and therefore registers only the active KDA row; keep the
+    # donated checkpoint in prefill's local radix tree, but do not advertise a
+    # second state row that decode cannot receive.
+    speculative_algorithm = get_spec().speculative_algorithm
+    if speculative_algorithm is not None and speculative_algorithm != "EAGLE":
+        return
+
+    # Decode already owns a reusable KDA state through its advertised prefix.
+    # A checkpoint at or behind that boundary cannot extend decode's radix
+    # coverage, and handing it off would make decode try to recede a protected
+    # Full-KV prefix to an older KDA boundary.
+    if checkpoint_seqlen <= getattr(req, "disagg_decode_prefix_len", 0):
+        return
+
+    if getattr(tree_cache, "disable", False):
+        track_buffer = getattr(req, "mamba_ping_pong_track_buffer", None)
+        track_idx = getattr(req, "mamba_last_track_idx", None)
+        checkpoint_index = (
+            None
+            if track_buffer is None or track_idx is None
+            else track_buffer[track_idx].reshape(1)
+        )
+    else:
+        checkpoint_index = _mamba_checkpoint_index_from_tree(req, tree_cache)
+
+    if checkpoint_index is None:
+        return
+    checkpoint_index = torch.as_tensor(checkpoint_index).reshape(-1)
+    if checkpoint_index.numel() != 1 or int(checkpoint_index[0].item()) < 0:
+        logger.warning(
+            "Skipping invalid PD Mamba checkpoint row for request %s: %s",
+            req.rid,
+            checkpoint_index.tolist(),
+        )
+        return
+
+    req.disagg_mamba_checkpoint_index = checkpoint_index.clone()
+    req.disagg_mamba_checkpoint_seqlen = int(checkpoint_seqlen)
 
 
 def should_force_retry(req: Req) -> bool:
@@ -723,7 +816,7 @@ class SchedulerDisaggregationPrefillMixin:
                     continue
 
                 req.output_ids.append(next_token_id)
-                maybe_cache_unfinished_req(req, self.tree_cache)
+                _cache_unfinished_req_with_mamba_checkpoint(req, self.tree_cache)
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
                     req.output_topk_p = draft_input.topk_p[i]
@@ -781,7 +874,9 @@ class SchedulerDisaggregationPrefillMixin:
                 # still self.chunked_req, or its final chunk (extend_range
                 # reaching the end of the input) is in flight. A yielded req
                 # is neither, so do its deferred release here.
-                still_chunking = self.chunked_req is req or (
+                still_chunking = any(
+                    active_req is req for active_req in self.active_chunked_reqs()
+                ) or (
                     req.extend_range is not None
                     and req.extend_range.end >= len(req.origin_input_ids)
                 )
@@ -1054,19 +1149,20 @@ class SchedulerDisaggregationPrefillMixin:
         running_batch: ScheduleBatch,
     ) -> None:
         chunked_req_to_exclude = set()
-        if (req := self.chunked_req) is not None:
+        next_chunked_reqs = []
+        for req in self.active_chunked_reqs():
             chunked_req_to_exclude.add(req)
             maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
             if not self.check_bootstrap(req):
                 if is_aborted(req):
                     # bootstrap failed
-                    self.chunked_req = None
+                    continue
                 elif self.has_bootstrapped_waiting_req():
                     # optimistic request yields to waiting requests
-                    self.chunked_req = None
                     if not self.enable_overlap:
                         self.optimistic_release_and_requeue(req)
+                    continue
                 # else: still bootstrapping, keep computing without sending
             elif self.enable_overlap:
                 # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
@@ -1076,15 +1172,24 @@ class SchedulerDisaggregationPrefillMixin:
                 )
             else:
                 self.send_kv_chunk(req)
+            next_chunked_reqs.append(req)
 
-            if self.chunked_req is not None:
-                running_batch.batch_is_full = False
+        self.set_active_chunked_reqs(next_chunked_reqs)
+        if next_chunked_reqs:
+            running_batch.batch_is_full = False
 
         if last_batch and last_batch.forward_mode.is_extend():
-            if last_batch.chunked_req:
+            last_batch_chunked_reqs = last_batch.chunked_reqs
+            if last_batch_chunked_reqs is None:
+                last_batch_chunked_reqs = (
+                    [last_batch.chunked_req]
+                    if last_batch.chunked_req is not None
+                    else []
+                )
+            if last_batch_chunked_reqs:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
-                chunked_req_to_exclude.add(last_batch.chunked_req)
+                chunked_req_to_exclude.update(last_batch_chunked_reqs)
 
             last_bs = last_batch.batch_size()
             last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))
@@ -1183,13 +1288,13 @@ class SchedulerDisaggregationPrefillMixin:
 
             def _mamba_payload():
                 return [
-                    self.req_to_token_pool.translate_mamba_indices(
-                        self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                            req.req_pool_idx
-                        ]
+                    get_mamba_state_transfer_indices(
+                        self.req_to_token_pool,
+                        req,
+                        checkpoint_index=getattr(
+                            req, "disagg_mamba_checkpoint_index", None
+                        ),
                     )
-                    .cpu()
-                    .numpy()
                 ]
 
             def _swa_payload():
@@ -1342,6 +1447,7 @@ class SchedulerDisaggregationPrefillMixin:
         req.early_send_prefix_end = None
         req.hidden_states_tensor = None
         req.output_dsa_topk_indices = None
+        _clear_mamba_checkpoint_handoff(req)
         req.pending_bootstrap = True
         req.time_stats.reset_prefill_retry_time()
         if req.prefill_attempt_count >= max_attempts:

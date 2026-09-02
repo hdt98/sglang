@@ -129,12 +129,16 @@ class NgramEmbeddingManager:
                 ),
                 ignore_tokens=None,
             )
-            # Mark the chunked (not-yet-finished) prefill request so sample()
-            # skips writing its pseudo next-token into the ngram token table.
-            # Use self.chunked_req identity (not req.is_chunked) to avoid
-            # overlap-scheduling timing issues.
-            if chunked_req is not None:
-                skip_token_table_update = [req is chunked_req for req in batch.reqs]
+            # Mark all chunked (not-yet-finished) prefill requests so sample()
+            # skips writing their pseudo next-tokens into the ngram token table.
+            chunked_reqs = batch.chunked_reqs
+            if chunked_reqs is None:
+                chunked_reqs = [chunked_req] if chunked_req is not None else []
+            if chunked_reqs:
+                chunked_req_ids = {id(req) for req in chunked_reqs}
+                skip_token_table_update = [
+                    id(req) in chunked_req_ids for req in batch.reqs
+                ]
                 batch.ne_skip_token_table_update = (
                     torch.tensor(
                         skip_token_table_update, dtype=torch.bool, device=device

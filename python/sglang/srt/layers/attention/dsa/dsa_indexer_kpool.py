@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
@@ -55,8 +56,60 @@ from sglang.srt.runtime_context import get_parallel, get_server_args
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
+logger = logging.getLogger(__name__)
+
+_RAGGED_LOGITS_WORKSPACES: Dict[Tuple[str, Optional[int]], torch.Tensor] = {}
+_SEGMENTED_RAGGED_LOGGED_DEVICES = set()
+
+
+def _next_power_of_two(value: int) -> int:
+    if value <= 0:
+        return 1
+    return 1 << (value - 1).bit_length()
+
+
+def _get_ragged_logits_workspace(
+    num_rows: int, num_cols: int, device: torch.device
+) -> torch.Tensor:
+    """Return one grow-only, shape-bucketed logits allocation per device.
+
+    All indexer layers execute serially on the same worker stream, so the next
+    layer can safely overwrite this storage after the preceding Top-K launch.
+    Power-of-two buckets avoid retaining a different multi-GiB allocation for
+    every long-context chunk width.
+    """
+    key = (device.type, device.index)
+    current = _RAGGED_LOGITS_WORKSPACES.get(key)
+    aligned_cols = ceil_align(num_cols, 256)
+    if (
+        current is None
+        or current.shape[0] < num_rows
+        or current.shape[1] < aligned_cols
+    ):
+        rows = _next_power_of_two(
+            max(num_rows, current.shape[0] if current is not None else 0)
+        )
+        cols = _next_power_of_two(
+            max(aligned_cols, current.shape[1] if current is not None else 0)
+        )
+        current = torch.empty(
+            (rows, cols), dtype=torch.float32, device=device
+        )
+        _RAGGED_LOGITS_WORKSPACES[key] = current
+        logger.info(
+            "Allocated reusable DSA ragged-logits workspace on %s: "
+            "shape=(%d, %d), capacity=%.2f GiB",
+            device,
+            rows,
+            cols,
+            current.numel() * current.element_size() / 2**30,
+        )
+    return current
+
 
 class IndexerKPool(MultiPlatformOp):
+    _last_ragged_allocator_shape: Dict[int, Tuple[int, int]] = {}
+
     def __init__(
         self,
         hidden_size: int,
@@ -90,6 +143,11 @@ class IndexerKPool(MultiPlatformOp):
         self.compress_gate_stream = None
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         self.cp_size = get_parallel().attn_cp_size if self.dsa_enable_prefill_cp else 1
+        self.kpool_cache_trim_threshold = (
+            envs.SGLANG_DSA_KPOOL_CACHE_TRIM_THRESHOLD.get()
+        )
+        self.reuse_ragged_logits = envs.SGLANG_DSA_REUSE_RAGGED_LOGITS.get()
+        self.segment_ragged_logits = envs.SGLANG_DSA_SEGMENT_RAGGED_LOGITS.get()
         self.skip_rope = skip_rope
 
         self.index_kpool = config.index_kpool
@@ -185,6 +243,11 @@ class IndexerKPool(MultiPlatformOp):
     ) -> torch.Tensor:
         if is_hip():
             assert self.hip_ragged_mqa_logits is not None
+            kwargs: Dict[str, Any] = {"clean_logits": clean_logits}
+            if getattr(self, "reuse_ragged_logits", False):
+                kwargs["out"] = _get_ragged_logits_workspace(
+                    q_fp8.shape[0], k_fp8.shape[0], q_fp8.device
+                )
             return self.hip_ragged_mqa_logits(
                 q_fp8,
                 k_fp8,
@@ -192,7 +255,7 @@ class IndexerKPool(MultiPlatformOp):
                 weights,
                 starts,
                 ends,
-                clean_logits=clean_logits,
+                **kwargs,
             )
 
         return deep_gemm.fp8_mqa_logits(
@@ -743,6 +806,7 @@ class IndexerKPool(MultiPlatformOp):
         row_starts: Optional[torch.Tensor] = None,
         out_rows: Optional[int] = None,
         page_table_row_index: Optional[torch.Tensor] = None,
+        logits_are_clean: bool = False,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
             topk_from_pooled_history_logits,
@@ -771,6 +835,7 @@ class IndexerKPool(MultiPlatformOp):
             row_starts=row_starts,
             out_rows=out_rows,
             page_table_row_index=page_table_row_index,
+            logits_are_clean=logits_are_clean,
         )
 
     def _get_kpool_decode_metadata(
@@ -1009,6 +1074,112 @@ class IndexerKPool(MultiPlatformOp):
         need_chunk = (logits_bytes * 2 > free_mem) or (logits_bytes > total_mem * 0.3)
         return need_chunk, free_mem
 
+    def _maybe_trim_ragged_allocator(self, plan, device: torch.device) -> bool:
+        """Release inactive blocks once when a ragged batch shape changes.
+
+        Long-context chunked prefill changes the logits width on every chunk.
+        The HIP caching allocator can retain each retired shape even though the
+        next layer only needs one logits buffer. Coordinate across all indexer
+        layers by device and trim only at a configured reserved-memory high
+        watermark. Active model, KV, KDA, and scratch allocations are untouched.
+        """
+        threshold = self.kpool_cache_trim_threshold
+        if threshold <= 0:
+            return False
+
+        device_index = device.index
+        if device_index is None:
+            return False
+
+        shape = (plan.ragged_total_k_rows, int(plan.seq_lens_expanded.shape[0]))
+        if self._last_ragged_allocator_shape.get(device_index) == shape:
+            return False
+        self._last_ragged_allocator_shape[device_index] = shape
+
+        total = torch.cuda.get_device_properties(device_index).total_memory
+        reserved = torch.cuda.memory_reserved(device_index)
+        allocated = torch.cuda.memory_allocated(device_index)
+        inactive = max(0, reserved - allocated)
+        if reserved < total * threshold or inactive < 1 << 30:
+            return False
+
+        torch.cuda.empty_cache()
+        logger.info(
+            "Trimmed inactive DSA K-pool allocator blocks at shape=%s: "
+            "reserved=%.2f GiB allocated=%.2f GiB inactive=%.2f GiB",
+            shape,
+            reserved / 2**30,
+            allocated / 2**30,
+            inactive / 2**30,
+        )
+        return True
+
+    def _run_segmented_ragged_topk(
+        self,
+        q_fp8: torch.Tensor,
+        k_fp8: torch.Tensor,
+        k_scale: torch.Tensor,
+        weights: torch.Tensor,
+        ks_per_q: torch.Tensor,
+        ke_per_q: torch.Tensor,
+        pool_lens: torch.Tensor,
+        seq_lens: torch.Tensor,
+        total_q: int,
+        segments: Tuple[Tuple[int, int, int, int], ...],
+        page_table: Optional[torch.Tensor],
+        topk_offsets: Optional[torch.Tensor],
+        page_table_row_index: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Run ragged MQA and Top-K without cross-request logits columns."""
+        results = []
+        for q_start, q_end, k_start, k_end in segments:
+            q_slice = slice(q_start, q_end)
+            local_ks = (ks_per_q[q_slice] - k_start).contiguous()
+            local_ke = (ke_per_q[q_slice] - k_start).contiguous()
+            logits = self._fp8_mqa_logits(
+                q_fp8[q_slice].contiguous(),
+                k_fp8[k_start:k_end].contiguous(),
+                k_scale[k_start:k_end].contiguous(),
+                weights[q_slice].contiguous(),
+                local_ks,
+                local_ke,
+                clean_logits=True,
+            )
+
+            local_page_table = page_table
+            local_page_table_row_index = page_table_row_index
+            if local_page_table_row_index is not None:
+                local_page_table_row_index = local_page_table_row_index[q_slice]
+            elif local_page_table is not None and local_page_table.shape[0] >= q_end:
+                local_page_table = local_page_table[q_slice]
+
+            results.append(
+                self._topk_from_kpool_logits(
+                    logits,
+                    pool_lens[q_slice],
+                    seq_lens=seq_lens[q_slice],
+                    page_table=local_page_table,
+                    topk_offsets=(
+                        topk_offsets[q_slice] if topk_offsets is not None else None
+                    ),
+                    row_starts=local_ks,
+                    page_table_row_index=local_page_table_row_index,
+                    logits_are_clean=True,
+                )
+            )
+
+        result = torch.cat(results, dim=0)
+        if result.shape[0] == total_q:
+            return result
+        padded = torch.full(
+            (total_q, result.shape[1]),
+            -1,
+            dtype=result.dtype,
+            device=result.device,
+        )
+        padded[: result.shape[0]] = result
+        return padded
+
     def _get_topk_ragged_kpool_plan(
         self,
         forward_batch: ForwardBatch,
@@ -1027,6 +1198,7 @@ class IndexerKPool(MultiPlatformOp):
         weights = weights.squeeze(-1)
 
         device = q_fp8.device
+        self._maybe_trim_ragged_allocator(plan, device)
         total_q = q_fp8.shape[0]
         seq_lens_expanded = plan.seq_lens_expanded
         pool_lens = plan.pooled_seq_lens_expanded
@@ -1048,6 +1220,8 @@ class IndexerKPool(MultiPlatformOp):
             n_real <= total_q
         ), f"plan has more real rows ({n_real}) than q_fp8 ({total_q})"
 
+        k_fp8 = None
+        k_scale = None
         if total_k_rows > 0:
             k_u8 = plan.ragged_k_u8
             k_scale = plan.ragged_k_scale
@@ -1062,17 +1236,6 @@ class IndexerKPool(MultiPlatformOp):
                 scale_out=k_scale,
             )
             k_fp8 = k_u8.view(torch.float8_e4m3fn)
-            logits = self._fp8_mqa_logits(
-                q_fp8[:n_real].contiguous(),
-                k_fp8.contiguous(),
-                k_scale.contiguous(),
-                weights[:n_real].contiguous(),
-                ks_per_q,
-                ke_per_q,
-                clean_logits=True,
-            )
-        else:
-            logits = torch.empty((n_real, 0), dtype=torch.float32, device=device)
 
         topk_method = metadata.topk_transform_method
         attn_metadata = metadata.attn_metadata
@@ -1094,6 +1257,65 @@ class IndexerKPool(MultiPlatformOp):
                 if topk_offsets_all is not None and row_select is not None:
                     topk_offsets_all = topk_offsets_all.index_select(0, row_select)
 
+        if (
+            is_hip()
+            and getattr(self, "segment_ragged_logits", False)
+            and row_select is None
+            and len(plan.ragged_segments) > 1
+            and total_k_rows > 0
+            and all(
+                k_end > k_start
+                for _, _, k_start, k_end in plan.ragged_segments
+            )
+        ):
+            assert k_fp8 is not None and k_scale is not None
+            device_key = (device.type, device.index)
+            if device_key not in _SEGMENTED_RAGGED_LOGGED_DEVICES:
+                _SEGMENTED_RAGGED_LOGGED_DEVICES.add(device_key)
+                segmented_elements = sum(
+                    (q_end - q_start) * (k_end - k_start)
+                    for q_start, q_end, k_start, k_end in plan.ragged_segments
+                )
+                rectangular_elements = n_real * total_k_rows
+                logger.info(
+                    "Enabled segmented DSA ragged logits on %s: segments=%d, "
+                    "rectangular_elements=%d, segmented_elements=%d, reduction=%.2fx",
+                    device,
+                    len(plan.ragged_segments),
+                    rectangular_elements,
+                    segmented_elements,
+                    rectangular_elements / max(segmented_elements, 1),
+                )
+            return self._run_segmented_ragged_topk(
+                q_fp8=q_fp8,
+                k_fp8=k_fp8,
+                k_scale=k_scale,
+                weights=weights,
+                ks_per_q=ks_per_q,
+                ke_per_q=ke_per_q,
+                pool_lens=pool_lens,
+                seq_lens=seq_lens_expanded,
+                total_q=total_q,
+                segments=plan.ragged_segments,
+                page_table=page_table_all,
+                topk_offsets=topk_offsets_all,
+                page_table_row_index=page_table_row_index_all,
+            )
+
+        if total_k_rows > 0:
+            assert k_fp8 is not None and k_scale is not None
+            logits = self._fp8_mqa_logits(
+                q_fp8[:n_real].contiguous(),
+                k_fp8.contiguous(),
+                k_scale.contiguous(),
+                weights[:n_real].contiguous(),
+                ks_per_q,
+                ke_per_q,
+                clean_logits=True,
+            )
+        else:
+            logits = torch.empty((n_real, 0), dtype=torch.float32, device=device)
+
         return self._topk_from_kpool_logits(
             logits,
             pool_lens,
@@ -1103,6 +1325,7 @@ class IndexerKPool(MultiPlatformOp):
             row_starts=ks_per_q,
             out_rows=total_q,
             page_table_row_index=page_table_row_index_all,
+            logits_are_clean=True,
         )
 
     def _get_topk_ragged_with_cp(
@@ -1212,6 +1435,7 @@ class IndexerKPool(MultiPlatformOp):
             topk_offsets=None,
             row_starts=ks,
             out_rows=out_rows,
+            logits_are_clean=True,
         )
 
     def _get_topk_ragged_kpool(
@@ -1451,6 +1675,7 @@ class IndexerKPool(MultiPlatformOp):
                 seq_lens=local_seqlens,
                 page_table=page_table_local,
                 topk_offsets=topk_offsets_local,
+                logits_are_clean=True,
             )
 
             topk_result[q_slice] = local_topk

@@ -2,23 +2,42 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 import sglang.srt.managers.schedule_policy as schedule_policy
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import (
+    Req,
+    _compute_chunked_req_next_prompt_tokens,
+)
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
     estimate_prefill_extend_tile_metrics,
+    select_request_chunk_tokens,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefResult,
     IncLockRefResult,
 )
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.srt.speculative.eagle_utils import _eagle_prefill_tail_tokens
 from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+
+
+class TestRequestChunkQuantumSelection(unittest.TestCase):
+    def test_disabled_quantum_stays_disabled(self):
+        self.assertIsNone(select_request_chunk_tokens(None, None, 12))
+
+    def test_quantum_applies_without_queue_threshold(self):
+        self.assertEqual(select_request_chunk_tokens(4096, None, 0), 4096)
+
+    def test_quantum_applies_only_at_queue_threshold(self):
+        self.assertIsNone(select_request_chunk_tokens(6144, 4, 3))
+        self.assertEqual(select_request_chunk_tokens(6144, 4, 4), 6144)
 
 
 class _RecordingDelayer:
@@ -463,6 +482,177 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(len(adder2.can_run_list), 2)
         self.assertEqual(adder2.rem_chunk_tokens, 0)  # 3 - 3 = 0
         self.assertEqual(result3, AddReqResult.OTHER)
+
+    def test_request_quantum_leaves_batch_budget_for_complete_suffix(self):
+        self.mock_token_allocator.full_available_size.return_value = 100_000
+        self.mock_token_allocator.available_size.return_value = 100_000
+        adder = self.create_adder(
+            self.create_running_batch(),
+            rem_input_tokens=16,
+            rem_chunk_tokens=16,
+            request_chunk_tokens=4,
+        )
+
+        chunked_req = self._create_delayer_req(20)
+        self.assertIs(adder.add_chunked_req(chunked_req), chunked_req)
+        chunked_req.set_extend_range.assert_called_once_with(0, 4)
+        self.assertEqual(adder.rem_chunk_tokens, 12)
+
+        short_req = self._create_delayer_req(8)
+        result = adder.add_one_req(
+            short_req,
+            has_chunked_req=True,
+            truncation_align_size=None,
+        )
+
+        self.assertEqual(result, AddReqResult.CONTINUE)
+        short_req.set_extend_range.assert_called_once_with(0, 8)
+        self.assertEqual(adder.can_run_list, [chunked_req, short_req])
+        self.assertEqual(adder.rem_chunk_tokens, 4)
+
+    def test_request_quantum_defers_second_partial_request(self):
+        self.mock_token_allocator.full_available_size.return_value = 100_000
+        self.mock_token_allocator.available_size.return_value = 100_000
+        adder = self.create_adder(
+            self.create_running_batch(),
+            rem_input_tokens=16,
+            rem_chunk_tokens=16,
+            request_chunk_tokens=4,
+        )
+        req = self._create_delayer_req(20)
+
+        result = adder.add_one_req(
+            req,
+            has_chunked_req=True,
+            truncation_align_size=None,
+        )
+
+        self.assertEqual(result, AddReqResult.OTHER)
+        req.set_extend_range.assert_not_called()
+        self.assertEqual(adder.can_run_list, [])
+
+    def test_request_quantum_admits_multiple_partial_requests_when_enabled(self):
+        self.mock_token_allocator.full_available_size.return_value = 100_000
+        self.mock_token_allocator.available_size.return_value = 100_000
+        adder = self.create_adder(
+            self.create_running_batch(),
+            rem_input_tokens=16,
+            rem_chunk_tokens=16,
+            request_chunk_tokens=4,
+            allow_multiple_chunked_reqs=True,
+        )
+
+        first_req = self._create_delayer_req(20)
+        first_result = adder.add_one_req(
+            first_req,
+            has_chunked_req=False,
+            truncation_align_size=None,
+        )
+        second_req = self._create_delayer_req(20)
+        second_result = adder.add_one_req(
+            second_req,
+            has_chunked_req=True,
+            truncation_align_size=None,
+        )
+
+        self.assertEqual(first_result, AddReqResult.CONTINUE)
+        self.assertEqual(second_result, AddReqResult.CONTINUE)
+        first_req.set_extend_range.assert_called_once_with(0, 4)
+        second_req.set_extend_range.assert_called_once_with(0, 4)
+        self.assertEqual(adder.can_run_list, [first_req, second_req])
+        self.assertEqual(adder.new_chunked_reqs, [first_req, second_req])
+        self.assertEqual(adder.rem_chunk_tokens, 8)
+
+    def test_multiple_partial_requests_defer_after_chunk_budget_is_spent(self):
+        self.mock_token_allocator.full_available_size.return_value = 100_000
+        self.mock_token_allocator.available_size.return_value = 100_000
+        adder = self.create_adder(
+            self.create_running_batch(),
+            rem_input_tokens=4,
+            rem_chunk_tokens=4,
+            request_chunk_tokens=4,
+            allow_multiple_chunked_reqs=True,
+        )
+
+        first_req = self._create_delayer_req(20)
+        second_req = self._create_delayer_req(20)
+
+        self.assertIs(adder.add_chunked_req(first_req), first_req)
+        self.assertIs(adder.add_chunked_req(second_req), second_req)
+
+        first_req.set_extend_range.assert_called_once_with(0, 4)
+        second_req.set_extend_range.assert_not_called()
+        self.assertEqual(adder.can_run_list, [first_req])
+        self.assertEqual(adder.rem_chunk_tokens, 0)
+
+    def test_multiple_partial_requests_capture_each_next_prompt_token(self):
+        first_req = SimpleNamespace(
+            extend_range=Range(0, 2),
+            origin_input_ids=[10, 11, 12],
+        )
+        complete_req = SimpleNamespace(
+            extend_range=Range(0, 2),
+            origin_input_ids=[20, 21],
+        )
+        second_req = SimpleNamespace(
+            extend_range=Range(0, 1),
+            origin_input_ids=[30, 31],
+        )
+
+        self.assertEqual(
+            _compute_chunked_req_next_prompt_tokens(
+                [first_req, complete_req, second_req],
+                [first_req, second_req],
+                vocab_size=100,
+            ),
+            [12, None, 31],
+        )
+
+    def test_multiple_partial_requests_rotate_each_eagle_tail_token(self):
+        batch = SimpleNamespace(
+            input_ids=torch.empty(0, dtype=torch.int64),
+            chunked_req_next_prompt_tokens=[12, None, 31],
+        )
+        next_token_ids = torch.tensor([90, 91, 92], dtype=torch.int64)
+
+        tail_tokens = _eagle_prefill_tail_tokens(batch, next_token_ids)
+
+        self.assertTrue(torch.equal(tail_tokens, torch.tensor([12, 91, 31])))
+        self.assertTrue(torch.equal(next_token_ids, torch.tensor([90, 91, 92])))
+
+    def test_request_quantum_limits_new_partial_and_preserves_suffix_batching(self):
+        self.mock_token_allocator.full_available_size.return_value = 100_000
+        self.mock_token_allocator.available_size.return_value = 100_000
+        adder = self.create_adder(
+            self.create_running_batch(),
+            rem_input_tokens=16,
+            rem_chunk_tokens=16,
+            request_chunk_tokens=4,
+        )
+
+        long_req = self._create_delayer_req(20)
+        result = adder.add_one_req(
+            long_req,
+            has_chunked_req=False,
+            truncation_align_size=None,
+        )
+
+        self.assertEqual(result, AddReqResult.CONTINUE)
+        self.assertIs(adder.new_chunked_req, long_req)
+        long_req.set_extend_range.assert_called_once_with(0, 4)
+        self.assertEqual(adder.rem_chunk_tokens, 12)
+
+        short_req = self._create_delayer_req(8)
+        result = adder.add_one_req(
+            short_req,
+            has_chunked_req=adder.new_chunked_req is not None,
+            truncation_align_size=None,
+        )
+
+        self.assertEqual(result, AddReqResult.CONTINUE)
+        short_req.set_extend_range.assert_called_once_with(0, 8)
+        self.assertEqual(adder.can_run_list, [long_req, short_req])
+        self.assertEqual(adder.rem_chunk_tokens, 4)
 
     def _build_hybrid_swa_chunked_req(
         self,

@@ -508,6 +508,19 @@ class AddReqResult(Enum):
     OTHER = auto()  # Other reasons to stop adding requests
 
 
+def select_request_chunk_tokens(
+    configured_quantum: Optional[int],
+    queue_threshold: Optional[int],
+    waiting_queue_len: int,
+) -> Optional[int]:
+    """Return the per-request prefill quantum for the current queue depth."""
+    if configured_quantum is None:
+        return None
+    if queue_threshold is not None and waiting_queue_len < queue_threshold:
+        return None
+    return configured_quantum
+
+
 class PrefillAdder:
     def __init__(
         self,
@@ -527,6 +540,8 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
+        request_chunk_tokens: Optional[int] = None,
+        allow_multiple_chunked_reqs: bool = False,
     ):
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
@@ -536,6 +551,8 @@ class PrefillAdder:
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
+        self.request_chunk_tokens = request_chunk_tokens
+        self.allow_multiple_chunked_reqs = allow_multiple_chunked_reqs
         self.dllm_config = dllm_config
 
         if self.dllm_config is not None:
@@ -550,6 +567,7 @@ class PrefillAdder:
         self.can_run_list = []
         self.preempt_list = []
         self.new_chunked_req = None
+        self.new_chunked_reqs = []
         self.log_hit_tokens = 0
         self.reprocessed_log_hit_tokens = 0
         self.log_device_hit_tokens = 0
@@ -1017,12 +1035,19 @@ class PrefillAdder:
                 _rem_tokens = min(
                     _rem_tokens, int(self.rem_swa_tokens) - self.page_size
                 )
-            # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
-            # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
+            # The singular scheduler must add its chunked_req to avoid leaking it,
+            # so it may fall back to the remaining chunk budget. The multi-request
+            # scheduler retains deferred requests explicitly and must not append a
+            # zero-token batch member once that budget is spent.
             if _rem_tokens <= 0:
-                if self.is_hybrid_swa:
+                if self.is_hybrid_swa or (
+                    self.allow_multiple_chunked_reqs and self.rem_chunk_tokens <= 0
+                ):
                     return req
                 _rem_tokens = self.rem_chunk_tokens
+
+        if self.request_chunk_tokens is not None:
+            _rem_tokens = min(_rem_tokens, self.request_chunk_tokens)
 
         # A mid-chunk rank prefills this pass regardless of the delayer
         # verdict, so report prefillable=True and ignore the result.
@@ -1389,7 +1414,19 @@ class PrefillAdder:
                     storage_hit_len=req.storage_hit_length,
                 )
             else:
+                # The general scheduler still carries one chunked_req. A
+                # non-overlap disaggregated-prefill worker can opt into the
+                # per-batch chunked_reqs representation and admit several
+                # partial requests under the same token budget.
+                if has_chunked_req and not self.allow_multiple_chunked_reqs:
+                    return AddReqResult.OTHER
+
                 # Make sure at least one page is available
+                if self.request_chunk_tokens is not None:
+                    chunk_tokens_limit = min(
+                        chunk_tokens_limit,
+                        self.request_chunk_tokens,
+                    )
                 trunc_len = chunk_tokens_limit // self.page_size * self.page_size
 
                 if trunc_len <= 0:
@@ -1424,7 +1461,9 @@ class PrefillAdder:
                 )
 
                 self.can_run_list.append(req)
-                self.new_chunked_req = req
+                self.new_chunked_reqs.append(req)
+                if self.new_chunked_req is None:
+                    self.new_chunked_req = req
 
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(

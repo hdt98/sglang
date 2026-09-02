@@ -236,11 +236,16 @@ def _resolve_dflash_draft_cell_size(
                 get_spec().speculative_draft_attention_backend
             ),
         )
+        parallel_config = get_parallel().config
         return dflash_draft_cell_size_per_token(
             draft_model_config=draft_model_config,
             draft_num_layers=draft_num_layers,
             draft_kv_cache_dtype=draft_kv_cache_dtype,
-            tp_size=get_parallel().config.tp_size,
+            # DFlashAttention shards Q/K/V with the model TP group, including
+            # on prefill ranks that also run context parallelism. The draft KV
+            # budget must use that same physical head geometry; attn_tp_size
+            # would incorrectly treat the draft as replicated under CP.
+            tp_size=parallel_config.tp_size,
         )
     except Exception as e:  # noqa: BLE001
         logger.warning(

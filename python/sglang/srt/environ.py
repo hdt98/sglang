@@ -1409,6 +1409,18 @@ class Envs:
         False, deprecated_name="SGLANG_NSA_HIP_DISABLE_PRESHUFFLE"
     )
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
+    # Opt in to reclaiming inactive allocator blocks between changing ragged
+    # K-pool prefill shapes. A value in (0, 1] is the reserved-memory fraction
+    # that triggers a trim; 0 disables the path.
+    SGLANG_DSA_KPOOL_CACHE_TRIM_THRESHOLD = EnvFloat(0.0)
+    # Reuse a grow-only, power-of-two bucketed FP32 workspace for ROCm ragged
+    # MQA logits. Requires an AITER fp8_mqa_logits implementation that accepts
+    # the optional ``out=`` buffer.
+    SGLANG_DSA_REUSE_RAGGED_LOGITS = EnvBool(False)
+    # Compute each request's ROCm ragged MQA logits and Top-K independently.
+    # This avoids the masked cross-request area in the concatenated [sum(Q),
+    # sum(K)] logits matrix while preserving multi-request prefill scheduling.
+    SGLANG_DSA_SEGMENT_RAGGED_LOGITS = EnvBool(False)
     # Opt in to AITER's gfx942 FlyDSL ragged MQA-logits kernel. This replaces
     # the Triton DSA-indexer kernel during prefill while preserving its API and
     # masking semantics.

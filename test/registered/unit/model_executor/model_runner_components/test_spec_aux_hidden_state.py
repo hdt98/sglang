@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
 from sglang.srt.model_executor.model_runner_components import spec_aux_hidden_state
 from sglang.srt.runtime_context import get_context
@@ -64,6 +65,49 @@ def test_draft_worker_does_not_budget_itself():
         **_resolve_kwargs(), is_draft_worker=True
     )
     assert config.eagle_draft_num_layers is None
+
+
+def test_dflash_draft_kv_budget_uses_model_tp_under_cp(monkeypatch):
+    """Draft QKV remains model-TP sharded when the same ranks also run CP."""
+    monkeypatch.setattr(
+        spec_aux_hidden_state,
+        "get_model",
+        lambda: SimpleNamespace(kv_cache_dtype="fp8_e4m3"),
+    )
+    monkeypatch.setattr(
+        spec_aux_hidden_state,
+        "get_spec",
+        lambda: SimpleNamespace(
+            speculative_draft_kv_cache_dtype=None,
+            speculative_draft_attention_backend="triton",
+        ),
+    )
+    monkeypatch.setattr(
+        spec_aux_hidden_state,
+        "get_parallel",
+        lambda: SimpleNamespace(
+            config=SimpleNamespace(
+                tp_size=4,
+                dp_size=1,
+                attn_cp_size=4,
+                enable_dp_attention=True,
+            )
+        ),
+    )
+    draft_model_config = SimpleNamespace(
+        dtype=torch.bfloat16,
+        head_dim=128,
+        v_head_dim=128,
+        get_num_kv_heads=lambda tp_size: 8 // tp_size,
+    )
+
+    cell_size = spec_aux_hidden_state._resolve_dflash_draft_cell_size(
+        draft_model_config=draft_model_config,
+        draft_num_layers=5,
+    )
+
+    # Eight global heads / TP4 * K/V 128-wide * five layers * FP8 byte.
+    assert cell_size == 2 * (128 + 128) * 5
 
 
 @pytest.mark.parametrize(

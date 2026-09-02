@@ -240,31 +240,42 @@ def _topk_unfused(
     row_starts: Optional[torch.Tensor] = None,
     topk_op: Callable[..., Tuple[torch.Tensor, torch.Tensor]] = torch.topk,
     topk_op_kwargs: Optional[Dict[str, object]] = None,
+    score_is_masked: bool = False,
 ) -> torch.Tensor:
     batch_size, max_score_len = score.shape
     topk_indices = score.new_full((batch_size, topk), -1, dtype=torch.int32)
     if batch_size == 0 or topk == 0 or max_score_len == 0:
         return topk_indices
 
+    if score_is_masked:
+        masked_logits = score
+    else:
+        if row_starts is None:
+            row_starts = torch.zeros_like(
+                lengths, dtype=torch.int32, device=score.device
+            )
+        else:
+            row_starts = row_starts.to(dtype=torch.int32, device=score.device)
+        lengths = lengths.to(dtype=torch.int32, device=score.device)
+
+        col_indices = torch.arange(
+            max_score_len, dtype=torch.int32, device=score.device
+        )
+        col_indices = col_indices.unsqueeze(0)
+        row_starts_unsqueezed = row_starts.unsqueeze(1)
+        row_ends_unsqueezed = (row_starts + lengths).unsqueeze(1)
+        valid_mask = (col_indices >= row_starts_unsqueezed) & (
+            col_indices < row_ends_unsqueezed
+        )
+        masked_logits = score.masked_fill(~valid_mask, float("-inf"))
+    valid_topk = min(topk, max_score_len)
+    topk_kwargs = topk_op_kwargs or {}
+    topk_scores, topk_col_indices = topk_op(masked_logits, valid_topk, **topk_kwargs)
     if row_starts is None:
         row_starts = torch.zeros_like(lengths, dtype=torch.int32, device=score.device)
     else:
         row_starts = row_starts.to(dtype=torch.int32, device=score.device)
-    lengths = lengths.to(dtype=torch.int32, device=score.device)
-
-    col_indices = torch.arange(max_score_len, dtype=torch.int32, device=score.device)
-    col_indices = col_indices.unsqueeze(0)
-    row_starts_unsqueezed = row_starts.unsqueeze(1)
-    row_ends_unsqueezed = (row_starts + lengths).unsqueeze(1)
-    valid_mask = (col_indices >= row_starts_unsqueezed) & (
-        col_indices < row_ends_unsqueezed
-    )
-
-    masked_logits = score.masked_fill(~valid_mask, float("-inf"))
-    valid_topk = min(topk, max_score_len)
-    topk_kwargs = topk_op_kwargs or {}
-    topk_scores, topk_col_indices = topk_op(masked_logits, valid_topk, **topk_kwargs)
-    topk_local_indices = topk_col_indices.to(torch.int32) - row_starts_unsqueezed
+    topk_local_indices = topk_col_indices.to(torch.int32) - row_starts.unsqueeze(1)
     topk_local_indices = topk_local_indices.masked_fill(
         topk_scores == float("-inf"), -1
     )

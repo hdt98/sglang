@@ -159,7 +159,7 @@ def transform_index_page_table_prefill_kernel(
     topk_indices_ptr: torch.Tensor,
     cu_seqlens_q_ptr: torch.Tensor,
     result_ptr: torch.Tensor,
-    page_table_stride_0: tl.constexpr,
+    page_table_stride_0: int,
     page_table_stride_1: tl.constexpr,
     topk_indices_stride_0: tl.constexpr,
     topk_indices_stride_1: tl.constexpr,
@@ -261,6 +261,44 @@ def transform_index_page_table_decode_fast(
             num_warps=4,
         )
     return result
+
+
+def precompile_transform_index_page_table_prefill(
+    *,
+    context_length: int,
+    index_topk: int,
+    index_kpool: int,
+    device: torch.device,
+) -> None:
+    """Load the DSA prefill page-table specializations before KV allocation."""
+    assert context_length > 0
+    assert index_topk > 0
+    assert index_kpool > 0
+
+    # Triton creates separate runtime-scalar ABIs for generic and 16-byte-aligned
+    # strides. Cover both without allocating a full-context dummy page table.
+    for page_table_width in (16, 17):
+        page_table = torch.zeros(
+            (4, page_table_width), dtype=torch.int32, device=device
+        )
+        for topk in sorted({index_topk, index_topk + index_kpool - 1}):
+            for extend_len in (1, 2, 4):
+                topk_indices = torch.full(
+                    (extend_len, topk), -1, dtype=torch.int32, device=device
+                )
+                cu_seqlens_q = torch.tensor(
+                    [0, extend_len], dtype=torch.int32, device=device
+                )
+                for page_table_is_expanded in (False, True):
+                    transform_index_page_table_prefill_fast(
+                        page_table=page_table[
+                            : extend_len if page_table_is_expanded else 1
+                        ],
+                        topk_indices=topk_indices,
+                        extend_lens_cpu=[extend_len],
+                        page_table_is_expanded=page_table_is_expanded,
+                        cu_seqlens_q=cu_seqlens_q,
+                    )
 
 
 def transform_index_page_table_prefill_fast(

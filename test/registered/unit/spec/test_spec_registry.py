@@ -1,8 +1,8 @@
 """Unit tests for the speculative algorithm plugin registry."""
 
 import unittest
-from types import SimpleNamespace
-from unittest.mock import MagicMock
+from types import ModuleType, SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
@@ -70,6 +70,28 @@ class TestFromString(_RegistryIsolated):
             SpeculativeAlgorithm.from_string("my_foo"),
             SpeculativeAlgorithm.from_string("MY_FOO"),
         )
+
+
+class TestDisaggregatedDraftInput(CustomTestCase):
+    def test_dflash_dispatches_to_dflash_handoff_builder(self):
+        batch = MagicMock()
+        last_tokens = MagicMock()
+        future_map = MagicMock()
+        expected = MagicMock()
+        build = MagicMock(return_value=expected)
+        module = ModuleType("sglang.srt.speculative.dflash_disaggregation")
+        module.build_dflash_family_disagg_draft_input = build
+
+        with patch.dict(
+            "sys.modules",
+            {"sglang.srt.speculative.dflash_disaggregation": module},
+        ):
+            actual = SpeculativeAlgorithm.DFLASH.build_disagg_draft_input(
+                batch, last_tokens, future_map
+            )
+
+        self.assertIs(actual, expected)
+        build.assert_called_once_with(batch, last_tokens, future_map)
 
 
 class TestRegister(_RegistryIsolated):
@@ -234,6 +256,8 @@ class TestServerArgsHook(_RegistryIsolated):
             speculative_draft_window_size=None,
             speculative_skip_dp_mlp_sync=False,
             speculative_adaptive=False,
+            disaggregation_mode="null",
+            disaggregation_decode_enable_radix_cache=False,
         )
 
         handle_speculative_decoding(server_args)

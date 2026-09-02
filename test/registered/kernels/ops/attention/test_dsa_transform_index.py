@@ -5,6 +5,7 @@ import torch
 
 import sglang.kernels.ops.attention.dsa.transform_index as transform_index_module
 from sglang.kernels.ops.attention.dsa.transform_index import (
+    precompile_transform_index_page_table_prefill,
     transform_index_page_table_decode_fast,
     transform_index_page_table_prefill_fast,
 )
@@ -37,7 +38,7 @@ class TestDSATransformIndex(CustomTestCase):
         self, rows: int, context_length: int, topk: int = TOPK
     ) -> torch.Tensor:
         topk = (
-            torch.arange(topk, dtype=torch.int64, device=self.device)
+            torch.arange(topk, dtype=torch.int32, device=self.device)
             .remainder(context_length)
             .repeat(rows, 1)
         )
@@ -193,6 +194,39 @@ class TestDSATransformIndex(CustomTestCase):
                 extend_lens_cpu=extend_lens_cpu,
                 cu_seqlens_q=cu_seqlens_q,
             )
+
+    def test_precompile_prefill_specializations(self):
+        with patch.object(
+            transform_index_module,
+            "transform_index_page_table_prefill_fast",
+        ) as transform:
+            precompile_transform_index_page_table_prefill(
+                context_length=64,
+                index_topk=8,
+                index_kpool=3,
+                device=self.device,
+            )
+
+        specializations = {
+            (
+                call.kwargs["page_table"].stride(0),
+                call.kwargs["topk_indices"].shape[1],
+                call.kwargs["topk_indices"].dtype,
+                call.kwargs["extend_lens_cpu"][0],
+                call.kwargs["page_table_is_expanded"],
+            )
+            for call in transform.call_args_list
+        }
+        self.assertEqual(
+            specializations,
+            {
+                (page_table_width, topk, torch.int32, extend_len, expanded)
+                for page_table_width in (16, 17)
+                for topk in (8, 10)
+                for extend_len in (1, 2, 4)
+                for expanded in (False, True)
+            },
+        )
 
     def test_mixed_lengths_padding_and_empty_batch(self):
         self._check_case(

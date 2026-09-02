@@ -54,6 +54,7 @@ from sglang.srt.disaggregation.utils import (
     get_dsa_tail_state_indices,
     get_dsv4_c128_state_indices,
     get_kv_class,
+    get_mamba_state_transfer_indices,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce,
@@ -119,6 +120,43 @@ CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 def _bootstrap_addr(req: Req) -> str:
     # FIXME: make a property of a req
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
+
+
+def _decode_mamba_checkpoint_index(req: Req):
+    """Return decode's reserved destination for a prompt checkpoint, if any."""
+    track_buffer = getattr(req, "mamba_ping_pong_track_buffer", None)
+    track_idx = getattr(req, "mamba_last_track_idx", None)
+    if track_buffer is None or track_idx is None:
+        return None
+    checkpoint_index = torch.as_tensor(track_buffer[track_idx]).reshape(-1)
+    if checkpoint_index.numel() != 1 or int(checkpoint_index[0].item()) < 0:
+        return None
+    return checkpoint_index
+
+
+def _restore_mamba_checkpoint_metadata(req: Req, cached_tokens: torch.Tensor) -> None:
+    """Restore the transferred prompt checkpoint depth before radix insertion."""
+    if _is_fake_transfer(req):
+        # Fake warmup/health transfers do not receive metadata from prefill, so
+        # their recycled buffer row is not authoritative.
+        req.mamba_last_track_seqlen = None
+        req.disagg_mamba_checkpoint_seqlen = None
+        return
+
+    checkpoint_seqlen = (
+        int(cached_tokens[7].item()) if cached_tokens.numel() > 7 else -1
+    )
+    if checkpoint_seqlen <= 0:
+        req.mamba_last_track_seqlen = None
+        return
+
+    if _decode_mamba_checkpoint_index(req) is None:
+        raise RuntimeError(
+            "Prefill sent a Mamba checkpoint depth but decode has no reserved "
+            f"checkpoint row for request {req.rid}"
+        )
+    req.mamba_last_track_seqlen = checkpoint_seqlen
+    req.disagg_mamba_checkpoint_seqlen = checkpoint_seqlen
 
 
 class DecodeReqToTokenPool:
@@ -1434,13 +1472,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             def _mamba_payload():
                 return [
-                    self.req_to_token_pool.translate_mamba_indices(
-                        self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                            decode_req.req.req_pool_idx
-                        ]
+                    get_mamba_state_transfer_indices(
+                        self.req_to_token_pool,
+                        decode_req.req,
+                        checkpoint_index=_decode_mamba_checkpoint_index(
+                            decode_req.req
+                        ),
                     )
-                    .cpu()
-                    .numpy()
                 ]
 
             def _swa_payload():
@@ -2251,6 +2289,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.req.mm_image_tokens = cached_tokens[4].item()
         decode_req.req.mm_audio_tokens = cached_tokens[5].item()
         decode_req.req.mm_video_tokens = cached_tokens[6].item()
+        _restore_mamba_checkpoint_metadata(decode_req.req, cached_tokens)
         if not self.spec_algorithm.is_none():
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index

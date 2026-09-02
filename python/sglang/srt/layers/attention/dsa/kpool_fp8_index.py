@@ -609,6 +609,7 @@ def topk_from_pooled_history_logits(
     row_starts: torch.Tensor | None = None,
     out_rows: int | None = None,
     page_table_row_index: torch.Tensor | None = None,
+    logits_are_clean: bool = False,
 ) -> torch.Tensor:
     """Select full-pool groups, expand to tokens, and optionally append tail."""
     assert logits.ndim == 2
@@ -649,6 +650,7 @@ def topk_from_pooled_history_logits(
             row_starts=row_starts,
             out_rows=out_rows,
             page_table_row_index=page_table_row_index,
+            logits_are_clean=logits_are_clean,
         )
 
     if group_topk in (128, 160, 192, 224, 256, 512):
@@ -734,6 +736,7 @@ def _topk_from_pooled_history_logits_unfused(
     row_starts: torch.Tensor | None = None,
     out_rows: int | None = None,
     page_table_row_index: torch.Tensor | None = None,
+    logits_are_clean: bool = False,
 ) -> torch.Tensor:
     from sglang.srt.layers.attention.dsa.dsa_topk_backend import _topk_unfused
 
@@ -745,6 +748,7 @@ def _topk_from_pooled_history_logits_unfused(
         row_starts=row_starts,
         topk_op=torch.topk,
         topk_op_kwargs={"dim": -1},
+        score_is_masked=logits_are_clean,
     )
     group_valid = selected_groups >= 0
 

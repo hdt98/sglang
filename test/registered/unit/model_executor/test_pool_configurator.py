@@ -255,6 +255,21 @@ class TestDefaultConfigurator(CustomTestCase):
         self.assertIsNone(config.full_max_total_num_tokens)
         self.assertIsNone(config.swa_max_total_num_tokens)
 
+    def test_dflash_draft_mha_pool_uses_model_tp_under_cp(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        configurator = object.__new__(KVCacheConfigurator)
+        configurator.is_draft_worker = True
+        configurator.spec_algorithm = MagicMock()
+        configurator.spec_algorithm.is_dflash_family.return_value = True
+
+        with get_parallel().override(tp_size=4, attn_tp_size=1):
+            self.assertEqual(configurator.mha_pool_tp_size, 4)
+
+        configurator.spec_algorithm.is_dflash_family.return_value = False
+        with get_parallel().override(tp_size=4, attn_tp_size=1):
+            self.assertEqual(configurator.mha_pool_tp_size, 1)
+
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         side_effect=(576, 656),

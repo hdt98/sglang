@@ -3,7 +3,7 @@
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -178,6 +178,66 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
             s, running_batch=s.running_batch, last_batch=s.last_batch
         )
         self.assertIsNone(s.chunked_req)
+
+    def test_multi_partial_gate_uses_config_before_disagg_runtime_init(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.model_config = SimpleNamespace(is_multimodal=False)
+        scheduler.enable_overlap = False
+        scheduler.ps = SimpleNamespace(pp_size=1)
+        schedule = SimpleNamespace(
+            chunked_prefill_size=8192,
+            chunked_prefill_request_quantum=4096,
+            prefill_decode_interval=0,
+            enable_mixed_chunk=False,
+            enable_dynamic_chunking=False,
+        )
+        disagg = SimpleNamespace(disaggregation_mode="prefill")
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler.get_resolved_model_impl",
+                return_value="sglang",
+            ),
+            patch("sglang.srt.managers.scheduler.get_schedule", return_value=schedule),
+            patch("sglang.srt.managers.scheduler.get_disagg", return_value=disagg),
+        ):
+            scheduler.init_chunked_prefill()
+
+        self.assertTrue(scheduler.allow_multiple_chunked_reqs)
+        self.assertEqual(scheduler.disagg_chunked_reqs, [])
+
+    def test_prefill_transfer_budget_counts_unique_handoff_requests(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.allow_multiple_chunked_reqs = True
+        scheduler.disagg_prefill_max_inflight_transfers = 3
+        scheduler.disagg_prefill_inflight_queue = [
+            SimpleNamespace(rid="inflight"),
+            SimpleNamespace(rid="shared"),
+        ]
+        scheduler.disagg_prefill_pending_chunk_rids = {"pending", "shared"}
+        scheduler.disagg_chunked_reqs = [
+            SimpleNamespace(rid="pending"),
+            SimpleNamespace(rid="active"),
+        ]
+
+        self.assertEqual(scheduler._disagg_prefill_transfer_pressure(), 4)
+        self.assertEqual(scheduler._disagg_prefill_new_req_transfer_budget(), 0)
+
+    def test_prefill_transfer_budget_is_default_off(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.disagg_prefill_max_inflight_transfers = None
+
+        self.assertIsNone(scheduler._disagg_prefill_new_req_transfer_budget())
+
+    def test_prefill_transfer_budget_preserves_one_new_slot(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.allow_multiple_chunked_reqs = True
+        scheduler.disagg_prefill_max_inflight_transfers = 2
+        scheduler.disagg_prefill_inflight_queue = []
+        scheduler.disagg_prefill_pending_chunk_rids = {"active"}
+        scheduler.disagg_chunked_reqs = [SimpleNamespace(rid="active")]
+
+        self.assertEqual(scheduler._disagg_prefill_new_req_transfer_budget(), 1)
 
 
 if __name__ == "__main__":
