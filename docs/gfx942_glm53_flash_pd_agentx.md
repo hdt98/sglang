@@ -66,18 +66,29 @@ decode radix cache, and scheduler/cache state.
 
 r159 attempted the no-CP isolation but omitted the matched prefill draft-state
 handoff. It is not a valid correctness cell: decode rejected transfers with
-`state component count mismatch (local=3, remote=5)`. r160 repeats that cell
-with `PREFILL_CP_STRATEGY=none` and `ENABLE_PREFILL_DRAFT_STATE=1`; it is
-healthy at startup but currently reports the same mismatch, so its GSM8K run is
-diagnostic rather than promotion evidence. The next source-level step is to
-explain why the prefill draft DSA pool does not register the two additional
-state components expected by decode.
+`state component count mismatch (local=3, remote=5)`. The r159 prefill log
+confirms the root cause: `speculative_algorithm: None` on the prefill role, so
+prefill had no draft worker and registered only three state components
+(MAMBA, DSA, DSA_TAIL) while decode with EAGLE registered five (adding draft
+DSA and draft DSA_TAIL). The launcher already handles this correctly when
+`ENABLE_PREFILL_DRAFT_STATE=1` copies the decode speculative args to prefill.
+
+r160 was the intended no-CP isolation with `PREFILL_CP_STRATEGY=none` and
+`ENABLE_PREFILL_DRAFT_STATE=1`, but it never started: both roles died with
+EADDRINUSE because the launcher hardcoded ports 31000-31500 while the MXFP4
+reference endpoint occupied them. The launcher now honors
+`PREFILL_PORT`/`DECODE_PORT`/`PREFILL_NCCL_PORT`/`DECODE_NCCL_PORT`/
+`BOOTSTRAP_PORT`/`ROUTER_PORT` overrides, so the next isolation cell can run
+alongside the reference endpoint. No r160 GSM8K sample exists.
 
 Reproducible Messi commands:
 
 ```bash
 docker exec -e RUN_STAMP=r160_pd_nocp_draftstate \\
   -e PREFILL_CP_STRATEGY=none -e ENABLE_PREFILL_DRAFT_STATE=1 \\
+  -e PREFILL_PORT=32100 -e DECODE_PORT=32200 \\
+  -e PREFILL_NCCL_PORT=32300 -e DECODE_NCCL_PORT=32400 \\
+  -e BOOTSTRAP_PORT=32500 -e ROUTER_PORT=32000 \\
   -e PYTHONPATH=/tmp/sglang-src/python \\
   glm53-pd-fresh-messi-20260829 \\
   bash /tmp/sglang-src/scripts/pd/launch_pd_glm53_flash_pr36607.sh
