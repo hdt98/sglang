@@ -81,6 +81,21 @@ reference endpoint occupied them. The launcher now honors
 `BOOTSTRAP_PORT`/`ROUTER_PORT` overrides, so the next isolation cell can run
 alongside the reference endpoint. No r160 GSM8K sample exists.
 
+r161 repeated the r160 intent on the freed standard ports and passed the
+correctness gate: GSM8K 0.99 on 100 examples (latency 40.2 s, output
+throughput 442 tok/s), with prefill `speculative_algorithm: EAGLE` confirmed
+in the prefill log. This is the first passing FP8 PD correctness sample. The
+isolation table now reads: CP-interleave on gives 0.87 (r150) and CP off with
+matched draft-state handoff gives 0.99 (r161), so CP-interleave is the
+remaining correctness suspect in the PD path. Next bisect: r162 repeats the
+frontier CP-interleave prefill on the current branch to confirm, then
+isolates the CP-path patches (owner-read/FP16-view gather is env-gated and
+off by default).
+
+Evidence: `/data/sonle5/pd_runs/pd_glm53_pr36607_r161_pd_nocp_draftstate/`
+(gsm8k_r161.log/json, prefill/decode/router logs), mirrored to
+`kimlong:/data/sonle5/glm53_gfx942_pd_artifacts/pd_runs/`.
+
 Reproducible Messi commands:
 
 ```bash
