@@ -1,0 +1,50 @@
+--- a/python/sglang/srt/layers/attention/dsa/dsa_indexer_kpool.py
++++ b/python/sglang/srt/layers/attention/dsa/dsa_indexer_kpool.py
+@@ -1238,15 +1238,38 @@
+             ke = torch.div(tail_tokens, pool_size, rounding_mode="floor").to(
+                 torch.int32
+             )
+-            logits = self._fp8_mqa_logits(
+-                q_work,
+-                k_fp8.contiguous(),
+-                k_scale.contiguous(),
+-                weights_work,
+-                ks,
+-                ke,
+-                clean_logits=True,
+-            )
++            # cp path: bound by _mqa_logits_chunk_rows for the same reason the
++            # ragged path is -- aiter's fp8_mqa_logits aborts in LLVM once the
++            # [num_q x num_k] fp32 output spans 2 GiB (upstream issue #37478).
++            k_fp8_c = k_fp8.contiguous()
++            k_scale_c = k_scale.contiguous()
++            chunk_rows = self._mqa_logits_chunk_rows(actual_seq_q, pool_kv_len)
++            if chunk_rows >= actual_seq_q:
++                logits = self._fp8_mqa_logits(
++                    q_work,
++                    k_fp8_c,
++                    k_scale_c,
++                    weights_work,
++                    ks,
++                    ke,
++                    clean_logits=True,
++                )
++            else:
++                logits_chunks = []
++                for start in range(0, actual_seq_q, chunk_rows):
++                    end = min(start + chunk_rows, actual_seq_q)
++                    logits_chunks.append(
++                        self._fp8_mqa_logits(
++                            q_work[start:end].contiguous(),
++                            k_fp8_c,
++                            k_scale_c,
++                            weights_work[start:end].contiguous(),
++                            ks[start:end],
++                            ke[start:end],
++                            clean_logits=True,
++                        )
++                    )
++                logits = torch.cat(logits_chunks, dim=0)
+             pool_lens = ke
+         else:
+             logits = torch.empty((actual_seq_q, 0), dtype=torch.float32, device=device)
