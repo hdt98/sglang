@@ -92,6 +92,21 @@ frontier CP-interleave prefill on the current branch to confirm, then
 isolates the CP-path patches (owner-read/FP16-view gather is env-gated and
 off by default).
 
+r162 confirmed it: CP-interleave prefill on the current branch scores GSM8K
+0.86 (std 0.347, latency 64.7 s), matching the r150 corruption, while the
+otherwise-identical no-CP r161 scores 0.99. CP-interleave is the PD
+correctness corrupter. The owner-read/FP16-view gather patch is env-gated
+(`SGLANG_DSA_KPOOL_OWNER_READ`, default off) and was inactive in both cells,
+so the bug lives in the CP-interleave path itself (scheduler representation,
+K-pool gather/scatter, or DSA tail handling under CP). The public Messi
+endpoint is redeployed as r163 with `PREFILL_CP_STRATEGY=none` plus the
+r149 serving knobs (glm45/glm47 parsers, strict tool level 1, strict
+thinking, request log level 3) until the CP bug is fixed; the CP perf
+frontier must be re-established after the fix.
+
+Evidence: `/data/sonle5/pd_runs/pd_glm53_pr36607_r162_cp_isolation/`
+(gsm8k_r162.log/json), mirrored to Kimlong NVMe.
+
 Evidence: `/data/sonle5/pd_runs/pd_glm53_pr36607_r161_pd_nocp_draftstate/`
 (gsm8k_r161.log/json, prefill/decode/router logs), mirrored to
 `kimlong:/data/sonle5/glm53_gfx942_pd_artifacts/pd_runs/`.
