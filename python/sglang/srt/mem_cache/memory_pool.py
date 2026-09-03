@@ -1130,6 +1130,16 @@ class MambaPool:
             ]
         return data_ptrs, data_lens, item_lens
 
+    def get_state_slot_strides(self):
+        """Get the byte distance between adjacent Mamba state slots."""
+        slot_strides = []
+        for _, state_tensor, _ in self._iter_transfer_state_tensors():
+            slot_stride = state_tensor.stride(1) * state_tensor.element_size()
+            slot_strides += [
+                slot_stride for _ in range(self.num_mamba_layers)
+            ]
+        return slot_strides
+
     def get_state_dim_per_tensor(self):
         """Get the sliceable dimension size for each state tensor.
 
@@ -3864,6 +3874,13 @@ class HybridLinearKVPool(KVCache):
             self.mamba_pool.get_contiguous_buf_infos()
         )
         return mamba_data_ptrs, mamba_data_lens, mamba_item_lens
+
+    def get_state_registration_buf_infos(self):
+        data_ptrs, data_lens, _ = self.get_state_buf_infos()
+        return data_ptrs, data_lens
+
+    def get_state_slot_strides(self):
+        return self.mamba_pool.get_state_slot_strides()
 
     def get_state_dim_per_tensor(self):
         """Get the sliceable dimension size for each mamba state tensor."""

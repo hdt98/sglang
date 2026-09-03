@@ -740,6 +740,14 @@ class Envs:
     # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
     SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
+    # Mori-specific staging intake: prefill writes into a decode-owned staging
+    # allocation, then decode copies staging -> KV locally. This avoids mapping
+    # decode's KV pool over XGMI IPC while prefill compute is active.
+    SGLANG_MORI_STAGING_BUFFER = EnvBool(False)
+    SGLANG_MORI_STAGING_POOL_SIZE_MB = EnvInt(4096)
+    # gfx950 XGMI-IPC stability probe: quiesce decode forward while KV
+    # transfers are in flight to test concurrent-kernel interference.
+    SGLANG_MORI_DECODE_QUIESCE = EnvBool(False)
     # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in
     # staging_buffer.py once Triton kernels are fully validated in production.
     SGLANG_STAGING_USE_TORCH = EnvBool(False)
@@ -1239,6 +1247,13 @@ class Envs:
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch
     # capacity).
     SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH = EnvBool(False)
+    # Kill-switch for the multi-step draft-decode CUDA graph. Target decode and
+    # draft-extend graphs remain enabled, so this is narrower than disabling
+    # decode graphs globally.
+    SGLANG_DISABLE_DRAFT_DECODE_CUDA_GRAPH = EnvBool(False)
+    # Kill-switch for EAGLE target-verify CUDA graphs. Draft-extend graphs may
+    # remain enabled, unlike the global decode-graph switch.
+    SGLANG_DISABLE_TARGET_VERIFY_CUDA_GRAPH = EnvBool(False)
     # Use the split-KV (flash-decode) kernel for EAGLE target-verify on the
     # Triton backend (ROCm). Only active at speculative topk == 1; falls back to
     # extend_attention_fwd for unsupported cases or when set false (e.g. for

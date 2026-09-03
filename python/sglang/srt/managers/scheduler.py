@@ -537,9 +537,6 @@ class Scheduler(
         if self.enable_pdmux:
             self.init_pdmux()
 
-        # Init tokenizer
-        self.init_tokenizer()
-
         # Init moe config and GEMM config (FP8 GEMM, etc.)
         self.init_moe_gemm_config()
 
@@ -552,6 +549,11 @@ class Scheduler(
 
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
+
+        # Init tokenizer after model-worker/distributed init. The processor load is
+        # expensive on multimodal checkpoints and otherwise staggers TP ranks past
+        # Gloo's connect timeout before all listeners are open.
+        self.init_tokenizer()
 
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)

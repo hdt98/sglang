@@ -207,5 +207,30 @@ class TestParseNvfp4Excludes(CustomTestCase):
         )
 
 
+class TestApplyWeightNameMapper(CustomTestCase):
+    """Fused-module excludes must expand to their unpacked shard names."""
+
+    def test_fused_exclude_expands_to_shards(self):
+        quark_config = _bare_config()
+        quark_config.exclude_layers = [
+            "visual.blocks.0.attn.qkv_proj",
+            "visual.blocks.0.mlp.gate_up_proj",
+        ]
+        quark_config.packed_modules_mapping = {
+            "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+            "gate_up_proj": ["gate_proj", "up_proj"],
+        }
+        mapper = unittest.mock.MagicMock()
+        mapper.apply_list.side_effect = lambda names: names
+
+        quark_config.apply_weight_name_mapper(mapper)
+
+        self.assertIn("visual.blocks.0.attn.q_proj", quark_config.exclude_layers)
+        self.assertIn("visual.blocks.0.attn.k_proj", quark_config.exclude_layers)
+        self.assertIn("visual.blocks.0.attn.v_proj", quark_config.exclude_layers)
+        self.assertIn("visual.blocks.0.mlp.gate_proj", quark_config.exclude_layers)
+        self.assertIn("visual.blocks.0.mlp.up_proj", quark_config.exclude_layers)
+
+
 if __name__ == "__main__":
     unittest.main()

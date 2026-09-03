@@ -170,7 +170,13 @@ class PrefillBootstrapQueue:
             self.scheduler.tp_worker.model_runner.effective_max_total_num_tokens
         )
         self.transfer_backend = transfer_backend
-        if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
+        generic_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        mori_staging = (
+            self.transfer_backend == TransferBackend.MORI
+            and envs.SGLANG_MORI_STAGING_BUFFER.get()
+        )
+        self.enable_staging = generic_staging or mori_staging
+        if generic_staging:
             if self.is_mla_backend:
                 raise RuntimeError(
                     "SGLANG_DISAGG_STAGING_BUFFER is designed for non-MLA models "
@@ -199,6 +205,26 @@ class PrefillBootstrapQueue:
                 raise RuntimeError(
                     "SGLANG_DISAGG_STAGING_BUFFER does not support "
                     "prefill context parallelism."
+                )
+        elif mori_staging:
+            if self.pp_size != 1:
+                raise RuntimeError(
+                    "SGLANG_MORI_STAGING_BUFFER currently requires pp_size=1; "
+                    "multiple pipeline writers would share one staging offset."
+                )
+            page_size = self.scheduler.token_to_kv_pool_allocator.page_size
+            chunked_prefill_size = get_schedule().chunked_prefill_size
+            cps = chunked_prefill_size or 8192
+            if cps <= 0 or cps % page_size != 0:
+                raise RuntimeError(
+                    f"SGLANG_MORI_STAGING_BUFFER requires a positive "
+                    f"chunked_prefill_size that is a multiple of page_size "
+                    f"({page_size}); got {chunked_prefill_size}."
+                )
+            if get_parallel().enable_prefill_context_parallel:
+                raise RuntimeError(
+                    "SGLANG_MORI_STAGING_BUFFER does not support prefill "
+                    "context parallelism."
                 )
         self.kv_manager = self._init_kv_manager()
 
@@ -263,6 +289,7 @@ class PrefillBootstrapQueue:
             num_draft_entries=num_draft_entries,
             num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
         )
+        kv_args.num_target_kv_entries = len(kv_data_ptrs) - num_draft_entries
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
             kv_args.total_kv_head_num = (

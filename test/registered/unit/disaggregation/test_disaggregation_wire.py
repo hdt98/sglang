@@ -40,6 +40,7 @@ from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MambaPool
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.eagle_disaggregation import (
     build_eagle_disagg_draft_input,
@@ -624,6 +625,45 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
                 self.assertEqual(kv_args.state_data_ptrs[-1], expected_infos[0])
                 self.assertEqual(kv_args.state_data_lens[-1], expected_infos[1])
                 self.assertEqual(kv_args.state_item_lens[-1], expected_infos[2])
+
+
+class TestHybridStateRegistration(unittest.TestCase):
+    def test_registration_infos_match_transferable_mamba_views(self):
+        pool = HybridLinearKVPool.__new__(HybridLinearKVPool)
+        pool.mamba_pool = SimpleNamespace(
+            get_contiguous_buf_infos=lambda: ([10, 20], [30, 40], [5, 6])
+        )
+
+        self.assertEqual(
+            pool.get_state_registration_buf_infos(),
+            ([10, 20], [30, 40]),
+        )
+
+    def test_hybrid_slot_strides_delegate_to_mamba_pool(self):
+        pool = HybridLinearKVPool.__new__(HybridLinearKVPool)
+        pool.mamba_pool = SimpleNamespace(
+            get_state_slot_strides=lambda: [128, 256]
+        )
+
+        self.assertEqual(pool.get_state_slot_strides(), [128, 256])
+
+
+class TestMambaStateSlotStrides(unittest.TestCase):
+    def test_slot_strides_use_slot_axis_not_item_length(self):
+        pool = MambaPool.__new__(MambaPool)
+        pool.num_mamba_layers = 2
+        raw = torch.zeros(200, dtype=torch.uint8)
+        state = torch.as_strided(
+            raw.view(torch.float32),
+            size=(2, 3, 4),
+            stride=(20, 10, 1),
+            storage_offset=0,
+        )
+        pool._iter_transfer_state_tensors = lambda: iter([("temporal", state, 0)])
+
+        # Each slot starts 10 float32 elements (40 bytes) apart, while one
+        # state item is only 16 bytes.
+        self.assertEqual(pool.get_state_slot_strides(), [40, 40])
 
 
 if __name__ == "__main__":

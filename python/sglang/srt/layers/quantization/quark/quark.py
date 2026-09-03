@@ -339,6 +339,7 @@ class QuarkConfig(QuantizationConfig):
         # selects block vs per-tensor FP8 within `Fp8LinearMethod`.
         self.excluded_fp8_config = excluded_fp8_config
         self.packed_modules_mapping = self.quant_config["packed_modules_mapping"]
+        self.exclude_layers = self._expand_fused_excludes(self.exclude_layers)
         self._online_quantized_layers = set()
 
         if isinstance(self.dequantization_config, Fp8Config):
@@ -374,7 +375,19 @@ class QuarkConfig(QuantizationConfig):
             expanded.append(name)
             if name.startswith("language_model."):
                 expanded.append(name.removeprefix("language_model."))
-        self.exclude_layers = list(dict.fromkeys(expanded))
+        self.exclude_layers = self._expand_fused_excludes(expanded)
+
+    def _expand_fused_excludes(self, names: list[str]) -> list[str]:
+        expanded = []
+        for name in names:
+            expanded.append(name)
+            parent, _, current = name.rpartition(".")
+            if current in self.packed_modules_mapping:
+                for shard_name in self.packed_modules_mapping[current]:
+                    expanded.append(
+                        f"{parent}.{shard_name}" if parent else shard_name
+                    )
+        return list(dict.fromkeys(expanded))
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
