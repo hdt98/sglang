@@ -2690,7 +2690,7 @@ class MoriDecodeStagingHandler(DecodeStagingHandler):
         prefix_tokens = decode_req.req.kv.cache_protected_len
         token_start = prefix_tokens + page_start * page_size
         token_end = token_start + num_pages * page_size
-        req_pool_idx = decode_req.req.req_pool_idx
+        req_pool_idx = decode_req.req.kv.req_pool_idx
         kv_indices = self.scheduler.req_to_token_pool.req_to_token[
             req_pool_idx, token_start:token_end
         ]
