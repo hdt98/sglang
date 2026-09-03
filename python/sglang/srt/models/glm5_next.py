@@ -336,7 +336,30 @@ class Glm5NextLinearAttention(nn.Module):
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
 
-        self.do_fuse_qkvbfg = quant_config is None and head_shard_size == self.tp_size
+        can_fuse_unquantized_projections = quant_config is None
+        if quant_config is not None:
+            exclude_layers = getattr(quant_config, "exclude_layers", None)
+            packed_modules_mapping = getattr(
+                quant_config,
+                "packed_modules_mapping",
+                None,
+            )
+            if exclude_layers is not None and packed_modules_mapping is not None:
+                from sglang.srt.layers.quantization.quark.utils import (
+                    should_ignore_layer,
+                )
+
+                can_fuse_unquantized_projections = all(
+                    should_ignore_layer(
+                        f"{prefix}.{projection}",
+                        ignore=exclude_layers,
+                        fused_mapping=packed_modules_mapping,
+                    )
+                    for projection in ("fused_qkvbfg_a_proj", "fused_fg_b_proj")
+                )
+        self.do_fuse_qkvbfg = (
+            can_fuse_unquantized_projections and head_shard_size == self.tp_size
+        )
         if self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
                 projection_size,
@@ -1484,6 +1507,13 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
+                logger.warning(
+                    "stacked loading %s shard=%s: param=%s ckpt=%s",
+                    name,
+                    shard_id,
+                    tuple(param.data.shape),
+                    tuple(loaded_weight.shape),
+                )
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
@@ -1564,6 +1594,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
+                    )
+                    logger.warning(
+                        "loading %s: param=%s ckpt=%s",
+                        name,
+                        tuple(param.data.shape),
+                        tuple(loaded_weight.shape),
                     )
                     weight_loader(param, loaded_weight)
 

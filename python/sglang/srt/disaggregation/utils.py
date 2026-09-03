@@ -50,6 +50,216 @@ FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 _IS_HIP = is_hip()
 
 
+def pair_mamba_state_indices(src_indices, dst_indices) -> List[Tuple[int, int]]:
+    """Pair active and optional checkpoint Mamba rows in wire order."""
+    src = np.asarray(src_indices, dtype=np.int64).ravel().tolist()
+    dst = np.asarray(dst_indices, dtype=np.int64).ravel().tolist()
+    if not src:
+        return []
+    if len(src) not in (1, 2) or len(dst) not in (1, 2):
+        raise RuntimeError(
+            "PD Mamba state transfer expects active plus at most one checkpoint "
+            f"row, got src={len(src)} dst={len(dst)}"
+        )
+    if len(src) > len(dst):
+        raise RuntimeError(
+            "Decode did not register a destination for every Mamba state row: "
+            f"src={len(src)} dst={len(dst)}"
+        )
+    return list(zip(src, dst[: len(src)]))
+
+
+def get_dsa_tail_state_indices(pool, req_pool_idx: int, seq_len: int) -> List[int]:
+    if getattr(pool, "use_dsa", False):
+        pool = pool.full_kv_pool
+    if not pool.kpool_use_compress:
+        return []
+
+    pool_size = int(pool.index_kpool)
+    tail_size = pool_size + int(getattr(pool, "tail_extra_slots", 0))
+    if pool_size <= 1 or tail_size < pool_size:
+        raise ValueError(
+            "DSA kpool-compress requires pool_size > 1 and "
+            f"tail_size >= pool_size, got pool_size={pool_size}, "
+            f"tail_size={tail_size}"
+        )
+
+    n_valid = int(seq_len) % pool_size
+    if n_valid == 0:
+        return []
+    start_phys = (int(seq_len) - n_valid) % tail_size
+    first_n = min(n_valid, tail_size - start_phys)
+    second_n = n_valid - first_n
+    return [
+        int(req_pool_idx),
+        start_phys,
+        first_n,
+        0,
+        second_n,
+        tail_size,
+    ]
+
+
+def slice_dsa_tail_dst_ptrs_for_pp(
+    src_ptrs: List[int],
+    dst_ptrs: List[int],
+    start_layer: int,
+    end_layer: Optional[int],
+) -> List[int]:
+    """Align ``[key layers..., score layers...]`` tail pointers across PP."""
+    if len(src_ptrs) == len(dst_ptrs):
+        return list(dst_ptrs)
+    if len(src_ptrs) % 2 != 0 or len(dst_ptrs) % 2 != 0:
+        raise ValueError(
+            "DSA tail pointer lists must contain equal key/score halves, got "
+            f"src={len(src_ptrs)}, dst={len(dst_ptrs)}"
+        )
+
+    src_layers = len(src_ptrs) // 2
+    dst_layers = len(dst_ptrs) // 2
+    expected_end = start_layer + src_layers
+    if end_layer is not None and end_layer - start_layer == src_layers:
+        expected_end = end_layer
+    if start_layer < 0 or expected_end > dst_layers:
+        raise ValueError(
+            "DSA tail pointer count mismatch: "
+            f"src={len(src_ptrs)}, dst={len(dst_ptrs)}, "
+            f"prefill_layers=[{start_layer}, {expected_end})"
+        )
+
+    return list(dst_ptrs[start_layer:expected_end]) + list(
+        dst_ptrs[dst_layers + start_layer : dst_layers + expected_end]
+    )
+
+
+def build_dsa_tail_transfer_blocks(
+    src_ptrs: List[int],
+    src_item_lens: List[int],
+    dst_ptrs: List[int],
+    src_indices: List[int],
+    dst_indices: List[int],
+    dst_item_lens: Optional[List[int]] = None,
+) -> List[Tuple[int, int, int]]:
+    """Build byte ranges for a request-scoped DSA tail ring transfer."""
+    if not src_indices and not dst_indices:
+        return []
+    if not src_indices or not dst_indices:
+        raise ValueError(
+            f"DSA tail slot index missing: src={src_indices}, dst={dst_indices}"
+        )
+    if len(src_indices) != 6 or len(dst_indices) != 6:
+        raise ValueError(
+            "DSA tail slot indices must be 6-tuples, "
+            f"got src={src_indices}, dst={dst_indices}"
+        )
+    if dst_item_lens is None:
+        dst_item_lens = src_item_lens
+    if not (
+        len(src_ptrs)
+        == len(dst_ptrs)
+        == len(src_item_lens)
+        == len(dst_item_lens)
+    ):
+        raise ValueError(
+            "DSA tail pointer metadata mismatch: "
+            f"src_ptrs={len(src_ptrs)}, dst_ptrs={len(dst_ptrs)}, "
+            f"src_item_lens={len(src_item_lens)}, "
+            f"dst_item_lens={len(dst_item_lens)}"
+        )
+
+    src_tail_size = int(src_indices[5])
+    dst_tail_size = int(dst_indices[5])
+    if src_tail_size <= 0 or dst_tail_size <= 0:
+        raise ValueError(
+            "DSA tail ring sizes must be positive: "
+            f"src={src_tail_size}, dst={dst_tail_size}"
+        )
+
+    def parse_segments(indices: List[int], tail_size: int, side: str):
+        segments = []
+        for seg in (1, 2):
+            off = int(indices[seg * 2 - 1])
+            n = int(indices[seg * 2])
+            if min(off, n) < 0:
+                raise ValueError(
+                    f"DSA tail {side} offsets and lengths must be non-negative"
+                )
+            if off + n > tail_size:
+                raise ValueError(
+                    f"DSA tail {side} segment {seg} exceeds ring size "
+                    f"{tail_size}: ({off}, {n})"
+                )
+            if n:
+                segments.append((off, n))
+        return segments
+
+    src_segments = parse_segments(src_indices, src_tail_size, "source")
+    dst_segments = parse_segments(dst_indices, dst_tail_size, "destination")
+    src_count = sum(n for _, n in src_segments)
+    dst_count = sum(n for _, n in dst_segments)
+    if src_count != dst_count:
+        raise ValueError(
+            f"DSA tail live-token count mismatch: src={src_count}, dst={dst_count}"
+        )
+
+    src_idx = int(src_indices[0])
+    dst_idx = int(dst_indices[0])
+    if src_idx < 0 or dst_idx < 0:
+        raise ValueError("DSA tail request row indices must be non-negative")
+
+    transfer_blocks = []
+    for src_ptr, src_row_bytes, dst_ptr, dst_row_bytes in zip(
+        src_ptrs, src_item_lens, dst_ptrs, dst_item_lens
+    ):
+        src_row_bytes = int(src_row_bytes)
+        dst_row_bytes = int(dst_row_bytes)
+        if src_row_bytes == 0 and dst_row_bytes == 0:
+            continue
+        if src_row_bytes <= 0 or src_row_bytes % src_tail_size != 0:
+            raise ValueError(
+                f"DSA source tail row size {src_row_bytes} is not divisible by "
+                f"{src_tail_size}"
+            )
+        if dst_row_bytes <= 0 or dst_row_bytes % dst_tail_size != 0:
+            raise ValueError(
+                f"DSA destination tail row size {dst_row_bytes} is not "
+                f"divisible by {dst_tail_size}"
+            )
+        src_slot_bytes = src_row_bytes // src_tail_size
+        dst_slot_bytes = dst_row_bytes // dst_tail_size
+        if src_slot_bytes != dst_slot_bytes:
+            raise ValueError(
+                "DSA tail slot-size mismatch: "
+                f"src={src_slot_bytes}, dst={dst_slot_bytes}"
+            )
+
+        slot_bytes = src_slot_bytes
+        src_row_base = int(src_ptr) + src_row_bytes * src_idx
+        dst_row_base = int(dst_ptr) + dst_row_bytes * dst_idx
+        src_seg_idx = dst_seg_idx = 0
+        src_consumed = dst_consumed = 0
+        while src_seg_idx < len(src_segments):
+            src_off, src_n = src_segments[src_seg_idx]
+            dst_off, dst_n = dst_segments[dst_seg_idx]
+            n = min(src_n - src_consumed, dst_n - dst_consumed)
+            transfer_blocks.append(
+                (
+                    src_row_base + (src_off + src_consumed) * slot_bytes,
+                    dst_row_base + (dst_off + dst_consumed) * slot_bytes,
+                    n * slot_bytes,
+                )
+            )
+            src_consumed += n
+            dst_consumed += n
+            if src_consumed == src_n:
+                src_seg_idx += 1
+                src_consumed = 0
+            if dst_consumed == dst_n:
+                dst_seg_idx += 1
+                dst_consumed = 0
+    return transfer_blocks
+
+
 def poll_and_all_reduce_pp(
     rids: Iterable[str],
     ready_poll: int,
@@ -114,6 +324,40 @@ def get_dsv4_c128_state_indices(
     return np.array([page], dtype=np.int32)
 
 
+def get_mamba_state_transfer_indices(
+    req_to_token_pool,
+    req: Req,
+    *,
+    checkpoint_index: Optional[torch.Tensor] = None,
+) -> np.ndarray:
+    """Return active and optional checkpoint Mamba rows in wire order."""
+    active_index = torch.as_tensor(
+        req_to_token_pool.req_index_to_mamba_index_mapping[req.req_pool_idx]
+    ).reshape(-1)
+    if active_index.numel() != 1:
+        raise RuntimeError(
+            "PD Mamba state transfer requires one active row per request, "
+            f"got {active_index.numel()}"
+        )
+
+    indices = [active_index]
+    if checkpoint_index is not None:
+        checkpoint_index = torch.as_tensor(
+            checkpoint_index, device=active_index.device
+        ).reshape(-1)
+        if checkpoint_index.numel() != 1:
+            raise RuntimeError(
+                "PD Mamba checkpoint transfer requires one checkpoint row, "
+                f"got {checkpoint_index.numel()}"
+            )
+        indices.append(checkpoint_index)
+
+    physical_indices = req_to_token_pool.translate_mamba_indices(
+        torch.cat(indices)
+    )
+    return physical_indices.to(dtype=torch.int32).cpu().numpy()
+
+
 class DisaggregationMode(Enum):
     NULL = "null"
     PREFILL = "prefill"
@@ -172,13 +416,12 @@ def unified_memory_disagg_move_gate(scheduler):
     )
 
 
-def should_bypass_dsa_cp_prefix_cache() -> bool:
-    """Bypass prefix cache under DSA Prefill CP until CP-aware radix resharding
-    exists; without it, cache hits let attention read non-local page rows."""
+def should_bypass_dsa_cp_prefix_cache(server_args) -> bool:
+    """Bypass prefix cache until DSA Prefill CP supports radix resharding."""
     return (
-        get_disagg().disaggregation_mode == DisaggregationMode.PREFILL.value
-        and get_parallel().attn_cp_size > 1
-        and get_parallel().enable_dsa_prefill_context_parallel
+        server_args.disaggregation_mode == DisaggregationMode.PREFILL.value
+        and server_args.attn_cp_size > 1
+        and server_args.enable_dsa_prefill_context_parallel
     )
 
 
@@ -1128,13 +1371,23 @@ def append_state_component(
     conv_shard_groups: Optional[List[Optional[List[int]]]] = None,
     slice_outer_counts: Optional[List[int]] = None,
     layer_ids: Optional[List[int]] = None,
+    registration_ptrs: Optional[List[int]] = None,
+    registration_lens: Optional[List[int]] = None,
+    slot_strides: Optional[List[int]] = None,
 ) -> None:
     """Append one state component. Caller orders state_types consistently
     on prefill and decode sides."""
     kv_args.state_types.append(state_type)
     kv_args.state_data_ptrs.append(data_ptrs)
     kv_args.state_data_lens.append(data_lens)
+    kv_args.state_registration_ptrs.append(
+        data_ptrs if registration_ptrs is None else registration_ptrs
+    )
+    kv_args.state_registration_lens.append(
+        data_lens if registration_lens is None else registration_lens
+    )
     kv_args.state_item_lens.append(item_lens)
+    kv_args.state_slot_strides.append(slot_strides or item_lens)
     kv_args.state_dim_per_tensor.append(dim_per_tensor or [])
     kv_args.state_conv_shard_groups.append(conv_shard_groups or [])
     kv_args.state_slice_outer_counts.append(slice_outer_counts or [])
@@ -1352,7 +1605,10 @@ def setup_state_kv_args(
     kv_args.state_types = []
     kv_args.state_data_ptrs = []
     kv_args.state_data_lens = []
+    kv_args.state_registration_ptrs = []
+    kv_args.state_registration_lens = []
     kv_args.state_item_lens = []
+    kv_args.state_slot_strides = []
     kv_args.state_dim_per_tensor = []
     kv_args.state_slice_outer_counts = []
     kv_args.state_layer_ids = []
@@ -1464,6 +1720,10 @@ def setup_state_kv_args(
             # Global layer ids let the sender pair src/dst entries when the
             # prefill PP stage registers only its own subset of mamba layers.
             layer_ids = token_to_kv_pool.get_state_layer_ids()
+            registration_ptrs, registration_lens = (
+                token_to_kv_pool.get_state_registration_buf_infos()
+            )
+            slot_strides = token_to_kv_pool.get_state_slot_strides()
             append_state_component(
                 kv_args,
                 StateType.MAMBA,
@@ -1474,6 +1734,9 @@ def setup_state_kv_args(
                 conv_shard_groups,
                 slice_outer_counts,
                 layer_ids,
+                registration_ptrs,
+                registration_lens,
+                slot_strides,
             )
             # Hybrid DSA pools keep their index cache and kpool tail in the
             # full-attention sub-pool rather than in the Mamba state above.

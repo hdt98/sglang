@@ -38,12 +38,15 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
         if hasattr(raw_quant_config, "to_dict"):
             raw_quant_config = raw_quant_config.to_dict()
         ignored = (
-            raw_quant_config.get("ignore", [])
+            raw_quant_config.get("exclude", []) + raw_quant_config.get("ignore", [])
             if isinstance(raw_quant_config, dict)
             else []
         )
-        nextn_layer_pattern = f"model.layers.{config.num_hidden_layers}.*"
-        if nextn_layer_pattern in ignored:
+        nextn_layer_prefix = f"model.layers.{config.num_hidden_layers}."
+        nextn_layer_pattern = f"{nextn_layer_prefix}.*"
+        if nextn_layer_pattern in ignored or any(
+            name.startswith(nextn_layer_prefix) for name in ignored
+        ):
             logger.warning(
                 "GLM5 NextN layer %s is checkpoint-declared unquantized; "
                 "using BF16 draft modules",
