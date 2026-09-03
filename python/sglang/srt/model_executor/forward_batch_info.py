@@ -51,7 +51,12 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_lora,
+    get_parallel,
+)
+from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -442,8 +447,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For DP attention
     is_extend_in_batch: bool = False
-    can_run_dp_cuda_graph: bool = False
-    can_run_dp_breakable_cuda_graph: bool = False
+    can_run_decode_cuda_graph: bool = False
+    can_run_dp_prefill_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
 
     # For two-batch overlap
@@ -699,7 +704,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.global_num_tokens_for_logprob_gpu = torch.tensor(
             global_num_tokens_for_logprob, dtype=torch.int64
         ).to(device, non_blocking=True)
-        self.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
+        self.can_run_decode_cuda_graph = batch.can_run_decode_cuda_graph
 
     @classmethod
     def init_new(
@@ -784,8 +789,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Scalar config / flags
             return_logprob=batch.return_logprob,
             is_extend_in_batch=batch.is_extend_in_batch,
-            can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
-            can_run_dp_breakable_cuda_graph=batch.can_run_dp_breakable_cuda_graph,
+            can_run_decode_cuda_graph=batch.can_run_decode_cuda_graph,
+            can_run_dp_prefill_cuda_graph=batch.can_run_dp_prefill_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
             spec_algorithm=batch.spec_algorithm,
@@ -922,7 +927,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if model_runner.lora_manager is not None:
             # In the non-LoRA overlap loading case, we fetch LoRA adapters into the memory pool
             # as a batch, right before running the batch
-            if not model_runner.server_args.enable_lora_overlap_loading:
+            if not get_lora().enable_lora_overlap_loading:
                 model_runner.lora_manager.fetch_new_loras(set(ret.lora_ids))
 
             model_runner.lora_manager.prepare_lora_batch(ret)
@@ -982,14 +987,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 pin_memory=is_pin_memory_available(batch.device),
             ).to(batch.device, non_blocking=True)
 
-    def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
+    def adjust_num_token_non_padded_for_attn_tp(self) -> None:
         """Make num_token_non_padded local to this attention-TP rank."""
         from sglang.srt.utils.common import require_mlp_tp_gather
 
         dp_rank = get_parallel().attn_dp_rank
         assert self.global_num_tokens_cpu is not None
 
-        if require_mlp_tp_gather(server_args):
+        if require_mlp_tp_gather():
             num_tokens_per_dp = self.global_num_tokens_cpu[dp_rank]
         else:
             num_tokens_per_dp = self.global_num_tokens_cpu[0]
@@ -1308,21 +1313,20 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ):
             # Joined ranks require real token counts instead of MAX_LEN padding.
             dp_padding_mode = DpPaddingMode.SUM_LEN
-        # Prefill breakable CUDA graph requires every DP rank to run the SAME
-        # captured shape. Under SUM_LEN each rank pads to its own local token
+        # Prefill CUDA graphs require every DP rank to run the same captured
+        # shape. Under SUM_LEN each rank pads to its own local token
         # count and can select a different capture bucket. This mismatches the
         # rank-coupled communication geometry: DP gather/combine uses
         # all_gather_into_tensor / reduce_scatter_tensor, while MoE backends may
         # use A2A dispatch/combine. Force MAX_LEN so every rank pads to the global
         # max and picks the same bucket.
         #
-        # Only force MAX_LEN when the batch fits a captured breakable prefill
-        # graph; larger prefills fall back to eager and keep the
-        # memory-efficient SUM_LEN. global_num_tokens is identical across ranks
-        # (all-gathered), so the decision is consistent cluster-wide.
-        prefill_cg = model_runner.server_args.cuda_graph_config.prefill
+        # Larger prefills fall back to eager and keep the memory-efficient
+        # SUM_LEN. global_num_tokens is identical across ranks (all-gathered),
+        # so the decision is consistent cluster-wide.
+        prefill_cg = get_exec().graph.cuda_graph_config.prefill
         if (
-            self.can_run_dp_breakable_cuda_graph
+            self.can_run_dp_prefill_cuda_graph
             and self.is_extend_in_batch
             and prefill_cg.bs
             and max(global_num_tokens) <= max(prefill_cg.bs)
@@ -1657,6 +1661,26 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     logits_output.hidden_states = logits_output.hidden_states[
                         :num_tokens
                     ]
+            elif (
+                self.spec_info.spec_input_type == SpecInputType.EAGLE_DRAFT_EXTEND
+                and not self.forward_mode.is_draft_extend_v2()
+            ):
+                if self.spec_info.num_correct_drafts is not None:
+                    self.spec_info.num_correct_drafts = (
+                        self.spec_info.num_correct_drafts[:bs]
+                    )
+                if self.spec_info.num_accept_tokens is not None:
+                    self.spec_info.num_accept_tokens = self.spec_info.num_accept_tokens[
+                        :bs
+                    ]
+                if self.extend_seq_lens is not None:
+                    self.extend_seq_lens = self.extend_seq_lens[:bs]
+                if logits_output.next_token_logits is not None:
+                    logits_output.next_token_logits = logits_output.next_token_logits[
+                        :bs
+                    ]
+                if logits_output.hidden_states is not None:
+                    logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_draft_extend_v2():  # draft extend_v2
                 bs = bs * self.spec_info.num_tokens_per_req
                 if logits_output.next_token_logits is not None:

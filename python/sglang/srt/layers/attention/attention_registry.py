@@ -3,6 +3,7 @@ import warnings
 from typing import TYPE_CHECKING
 
 from sglang.srt.configs.hybrid_arch import (
+    glm5_next_config,
     hybrid_gdn_config,
     hybrid_lightning_config,
     kimi_linear_config,
@@ -13,7 +14,10 @@ from sglang.srt.configs.linear_attn_model_registry import (
     get_linear_attn_config,
     import_backend_class,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_spec,
+)
 from sglang.srt.utils import get_device_capability, is_hip, is_musa, is_npu
 
 _is_musa = is_musa()
@@ -49,7 +53,7 @@ def create_flashinfer_backend(runner):
         )
 
         # Init streams
-        if runner.server_args.speculative_algorithm == "EAGLE":
+        if get_spec().speculative_algorithm == "EAGLE":
             if (
                 not hasattr(runner, "plan_stream_for_flashinfer")
                 or not runner.plan_stream_for_flashinfer
@@ -70,10 +74,7 @@ def create_flashinfer_backend(runner):
 def create_trtllm_mla_backend(runner):
     if not runner.use_mla_backend:
         raise ValueError("trtllm_mla backend can only be used with MLA models.")
-    if (
-        get_parallel().dcp_enabled
-        and runner.server_args.speculative_algorithm is not None
-    ):
+    if get_parallel().dcp_enabled and get_spec().speculative_algorithm is not None:
         _, decode_backend = runner.server_args.get_attention_backends()
         if decode_backend == "trtllm_mla":
             raise ValueError(
@@ -265,7 +266,7 @@ def create_hpc_ops_backend(runner):
         raise ValueError(
             "Cross attention is not supported in the hpc_ops attention backend."
         )
-    if runner.server_args.speculative_algorithm is not None:
+    if get_spec().speculative_algorithm is not None:
         raise ValueError(
             "hpc_ops backend does not support speculative decoding for now."
         )
@@ -319,6 +320,20 @@ def attn_backend_wrapper_for_draft_decode(runner: "ModelRunner", backend):
     if isinstance(hf_text_config, Dots3Config):
         return hf_text_config.wrap_draft_decode_attention_backend(backend)
     return backend
+
+
+@register_attention_backend("minicpm_flashattn")
+def create_minicpm_flashattn_backend(runner):
+    from sglang.srt.layers.attention.minicpm.backend import MiniCPMSparseBackend
+
+    return MiniCPMSparseBackend(runner, use_flashinfer=False)
+
+
+@register_attention_backend("minicpm_flashinfer")
+def create_minicpm_flashinfer_backend(runner):
+    from sglang.srt.layers.attention.minicpm.backend import MiniCPMSparseBackend
+
+    return MiniCPMSparseBackend(runner, use_flashinfer=True)
 
 
 def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBackend"):
@@ -378,6 +393,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             is_blackwell,
             is_npu,
             is_sm120_supported,
+            is_xpu,
         )
 
         if not is_npu():
@@ -389,6 +405,11 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 GDNAttnBackend,
                 flashinfer_gdn_prefill_default,
             )
+
+            if is_xpu():
+                from sglang.srt.hardware_backend.xpu.attention.xpu_gdn_backend import (
+                    XpuGDNAttnBackend as GDNAttnBackend,
+                )
         else:
             from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import (
                 AscendGDNAttnBackend as GDNAttnBackend,
@@ -479,6 +500,8 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 hybrid_backend_cls = AscendKDAHybridLinearAttnBackend
             else:
                 linear_attn_backend = KDAAttnBackend(runner)
+        elif glm5_next_config(runner.model_config) is not None:
+            linear_attn_backend = KDAAttnBackend(runner)
         elif hybrid_lightning_config(runner.model_config) is not None:
             linear_attn_backend = LightningAttentionBackend(runner)
         else:

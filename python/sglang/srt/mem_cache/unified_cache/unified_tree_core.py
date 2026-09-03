@@ -677,7 +677,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # nodes can also match, so we separately track the best device-resident
         # match for scheduler prefix indices and locking.
         node = self.root_node
-        child_key = key.child_key(self.page_size)
+        key_offset = 0
+        child_key = key.child_key_at(key_offset, self.page_size)
         value: list[torch.Tensor] = []
         best_match_node = node
         best_match_device_node = node
@@ -718,14 +719,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 best_match_device_value_len = len(value)
                 best_match_device_node = node
 
-        while len(key) > 0 and child_key in node.children:
+        while key_offset < len(key) and child_key in node.children:
             child = node.children[child_key]
 
             # HiCache: dead node (evicted + not backuped) — stop traversal
             if child.evicted and not child.backuped:
                 break
 
-            prefix_len = child.key.match(key, page_size=self.page_size)
+            prefix_len = child.key.match_at(key, key_offset, page_size=self.page_size)
             full_kv_hit_length += prefix_len
             if prefix_len < len(child.key):
                 node, action = self._split_node(child.key, child, prefix_len)
@@ -738,9 +739,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 value.append(child.component_data[BASE_COMPONENT_TYPE].value)
             node = child
             _update_best_if_valid(node)
-            key = key[prefix_len:]
-            if len(key):
-                child_key = key.child_key(self.page_size)
+            key_offset += prefix_len
+            if key_offset < len(key):
+                child_key = key.child_key_at(key_offset, self.page_size)
 
         return (
             value,
@@ -1224,7 +1225,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def evict_device_next_node(
         self, component_type: ComponentType, tracker: dict[ComponentType, int]
     ) -> EvictDeviceNextNodeResult:
-        """Return the next device leaf to evict for a component, or None when done."""
+        """Advance one component eviction step and report whether it progressed."""
         result = EvictDeviceNextNodeResult()
         # The walk reads running totals for its doneness check; the result
         # carries only this step's delta.
@@ -1236,6 +1237,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             delta = n - tracker.get(ct, 0)
             if delta:
                 result.tracker[ct] = delta
+        result.made_progress = result.node_id is not None or bool(result.tracker)
         return result
 
     def evict_device_end(self, component_type: ComponentType) -> None:
@@ -1982,19 +1984,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         node = self.node_by_id(node_id)
         cache_actions: list[CacheAction | ComponentAction] = []
         if self.is_write_back:
-            # Write-back may reclaim a duplicate host copy while H->D DMA is
-            # still reading it, so pin every source node until the ack.
-            for xfers in ([kv_xfer], *comp_xfers.values()):
-                for xfer in xfers:
-                    for nid in xfer.nodes_to_load or ():
-                        pinned = self.node_by_id(nid)
-                        # One live load-back per node; only the same anchor may
-                        # re-pin (a node can sit in Full and aux transfer lists).
-                        assert pinned.load_back_pending_id in (None, node_id), (
-                            f"node {nid} pinned by load-back "
-                            f"{pinned.load_back_pending_id}, new anchor {node_id}"
-                        )
-                        pinned.load_back_pending_id = node_id
+            # Pin Full KV host slots against duplicate reclaim until the ack.
+            # Auxiliary pools have independent host locks and may legitimately
+            # load the same radix node under a different anchor.
+            for nid in kv_xfer.nodes_to_load or ():
+                pinned = self.node_by_id(nid)
+                assert pinned.load_back_pending_id in (None, node_id), (
+                    f"node {nid} pinned by load-back "
+                    f"{pinned.load_back_pending_id}, new anchor {node_id}"
+                )
+                pinned.load_back_pending_id = node_id
         kv_xfer.device_indices = device_indices
         self.components_by_type[BASE_COMPONENT_TYPE].commit_hicache_transfer(
             node,

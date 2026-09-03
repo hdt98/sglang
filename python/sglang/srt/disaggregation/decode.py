@@ -51,6 +51,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     _is_fake_transfer,
+    get_dsa_tail_state_indices,
     get_dsv4_c128_state_indices,
     get_kv_class,
     is_dsv4_c128_online_enabled,
@@ -94,7 +95,11 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
-from sglang.srt.runtime_context import get_disagg, get_parallel
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_memory,
+    get_parallel,
+)
 from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
@@ -158,12 +163,27 @@ class DecodeReqToTokenPool:
         # here: HybridMambaDecodeReqToTokenPool borrows this __init__ while
         # inheriting ReqToTokenPool.alloc, which bumps it.
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
+        self._aux_cache: Any = None
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
 
     def available_size(self):
         return len(self.free_slots)
+
+    def reset_aux_cache_allocator(self) -> None:
+        pass
+
+    def schedulable_token_capacity(self, physical_capacity: int) -> int:
+        return physical_capacity
+
+    def alloc_aux_to_lengths(
+        self,
+        *,
+        req_pool_indices_cpu: torch.Tensor,
+        target_seq_lens_cpu: torch.Tensor,
+    ) -> None:
+        pass
 
     def alloc(self, reqs: List[Req]) -> Optional[List[int]]:
         # Indices of reqs that already have a req_pool_idx and will reuse
@@ -408,7 +428,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         required = ceil_align(swa_tail_len, page_size)
         available = self.token_to_kv_pool_allocator.swa_available_size()
         if available < required:
-            self.tree_cache.evict(EvictParams(swa_num_tokens=required - available))
+            self.tree_cache.evict_for_alloc(
+                EvictParams(swa_num_tokens=required - available)
+            )
             available = self.token_to_kv_pool_allocator.swa_available_size()
 
         if available < required:
@@ -477,7 +499,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             full_len = ceil_align(full_len, page_size)
             swa_len = ceil_align(swa_len, page_size)
         swa_reserved = self.num_reserved_decode_tokens
-        if self.scheduler.server_args.disable_radix_cache:
+        if get_memory().disable_radix_cache:
             swa_reserved = 0
         return (
             full_len + self.num_reserved_decode_tokens,
@@ -556,7 +578,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             req_to_token_pool=getattr(self, "req_to_token_pool", None),
         )
 
-        kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
+        kv_args.ib_device = get_disagg().disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.ps.gpu_id
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
@@ -608,7 +630,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
 
             # NOTE: fake transfer does not need to resolve prefill dp rank in the pending queue
-            if _is_fake_transfer(req, self.scheduler.server_args):
+            if _is_fake_transfer(req):
                 decode_req.kv_receiver.init(0)
                 return
 
@@ -663,9 +685,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self, req: Req, is_rebootstrap: bool = False
     ) -> DecodeRequest:
         backend = (
-            TransferBackend.FAKE
-            if _is_fake_transfer(req, self.scheduler.server_args)
-            else self.transfer_backend
+            TransferBackend.FAKE if _is_fake_transfer(req) else self.transfer_backend
         )
         kv_receiver_class = get_kv_class(backend, KVClassType.RECEIVER)
 
@@ -1071,6 +1091,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         preallocated_reqs = []
         indices_to_remove = set()
 
+        # The all-waiting shortcut stops receiver polling, so enforce its timeout here.
+        prealloc_timeout = float(
+            getattr(getattr(self, "kv_manager", None), "waiting_timeout", 0.0)
+        )
+        prealloc_now = time.perf_counter()
+
         # We need to make sure that the sum of inflight tokens and allocatable tokens is greater than maximum input+output length of each inflight request
         # Otherwise it is possible for one request running decode out of memory, while all other requests are in the transfer queue that cannot be retracted.
         retractable_tokens = sum(
@@ -1106,16 +1132,48 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             self.queue.sort(key=lambda r: r.req.priority * priority_sign)
 
-        # First, remove all failed requests from the queue
+        # First, remove all failed or timed-out requests from the queue.
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
+
+            bootstrap_done_time = getattr(
+                getattr(decode_req.req, "time_stats", None),
+                "bootstrap_done_time",
+                0.0,
+            )
+            prealloc_timed_out = (
+                not isinstance(decode_req.req.finished_reason, FINISH_ABORT)
+                and prealloc_timeout > 0
+                and getattr(decode_req, "waiting_for_input", False)
+                and bootstrap_done_time > 0
+                and prealloc_now - bootstrap_done_time > prealloc_timeout
+            )
+            if prealloc_timed_out:
+                elapsed = prealloc_now - bootstrap_done_time
+                error_message = (
+                    f"Decode preallocation timed out after {elapsed:.1f}s "
+                    f"(timeout={prealloc_timeout:.1f}s) for request "
+                    f"rank={self.tp_rank} {decode_req.req.rid=} "
+                    f"{decode_req.req.bootstrap_room=}"
+                )
+                logger.error(error_message)
+                prepare_abort(
+                    decode_req.req,
+                    error_message,
+                    status_code=HTTPStatus.GATEWAY_TIMEOUT,
+                )
+                if self.scheduler.metrics_reporter.enable_metrics:
+                    self.scheduler.metrics_collector.increment_prealloc_failed_reqs()
+
             if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
                 if not getattr(decode_req.req, "finished_output", False):
                     self.scheduler.output_streamer.stream_output(
                         [decode_req.req],
                         decode_req.req.return_logprob,
                     )
+                if prealloc_timed_out:
+                    decode_req.kv_receiver.abort()
                 decode_req.kv_receiver.clear()
                 decode_req.kv_receiver = None
                 failed_reqs.append(decode_req)
@@ -1387,6 +1445,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 device_page_size = self.token_to_kv_pool.page_size
                 return kv_to_page_indices(kv_indices_full, device_page_size)
 
+            def _dsa_tail_payload():
+                return get_dsa_tail_state_indices(
+                    self.token_to_kv_pool,
+                    decode_req.req.req_pool_idx,
+                    seq_len,
+                )
+
             def _swa_ring_payload():
                 # Mirror of prefill _swa_ring_payload using this side's req_pool_idx.
                 # Same window positions and order -> positional match with prefill.
@@ -1419,6 +1484,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 StateType.MAMBA: _mamba_payload,
                 StateType.SWA: _swa_payload,
                 StateType.DSA: _full_kv_pages_payload,
+                StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.C128_STATE: _c128_state_payload,
@@ -1455,7 +1521,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if (
                 self.scheduler.enable_hisparse
                 and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
-                and not _is_fake_transfer(decode_req.req, self.scheduler.server_args)
+                and not _is_fake_transfer(decode_req.req)
             ):
                 # alloc_logical_only() already allocated the shared logical pages
                 # used by C4 indexer and C128 KV. These device buffers do not use
@@ -1772,7 +1838,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and self._radix_full_available() < required_alloc_tokens
         ):
             num_to_evict = required_alloc_tokens - self._radix_full_available()
-            result = self.tree_cache.evict(EvictParams(num_tokens=num_to_evict))
+            result = self.tree_cache.evict_for_alloc(
+                EvictParams(num_tokens=num_to_evict)
+            )
             if self._radix_full_available() < required_alloc_tokens:
                 logger.warning(
                     f"Eviction insufficient: needed {required_alloc_tokens} tokens, "
@@ -2059,7 +2127,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             else 0
         )
 
-        if _is_fake_transfer(decode_req.req, self.scheduler.server_args):
+        if _is_fake_transfer(decode_req.req):
             pass
         elif actual_room == 0:
             # Should never happen: _poll_with_metadata_gate already confirmed
@@ -2197,7 +2265,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             self.gloo_group,
             decode_reqs=self.queue,
             metadata_buffers=self.metadata_buffers,
-            server_args=self.scheduler.server_args,
         )
 
     def _poll_with_staging(self) -> list:
@@ -2206,7 +2273,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             self.staging_handler,
             self.gloo_group,
             metadata_buffers=self.metadata_buffers,
-            server_args=self.scheduler.server_args,
         )
 
     def _init_staging_handler(self, kv_manager):

@@ -566,6 +566,10 @@ class ChatCompletionMessageContentVideoURL(BaseModel):
     url: str
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
+    fps: Optional[float] = None
+    max_frames: Optional[int] = None
+    max_tokens_per_frame: Optional[int] = None
+    max_image_tokens: Optional[int] = None
 
 
 class ChatCompletionMessageContentAudioURL(BaseModel):
@@ -866,6 +870,12 @@ class ChatCompletionRequest(BaseModel):
     return_token_ids: bool = False
     return_meta_info: bool = False
     return_sampling_mask: bool = False
+    max_thinking_tokens: Optional[int] = Field(
+        default=None,
+        description="Upper bound on tokens spent inside the thinking block. "
+        "On reaching it the reasoning block is closed and the model must begin "
+        "its answer. Requires --enable-strict-thinking.",
+    )
     reasoning_effort: ReasoningEffortType = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "

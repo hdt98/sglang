@@ -15,7 +15,11 @@ from sglang.srt.layers.quantization.base_config import (  # noqa: E501
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+from sglang.srt.layers.quantization.fp8 import (
+    Fp8Config,
+    Fp8LinearMethod,
+    Fp8MoEMethod,
+)
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.quark.schemes import (
     QuarkLinearScheme,
@@ -322,6 +326,14 @@ class QuarkConfig(QuantizationConfig):
         self.kv_cache_config = kv_cache_config
         self.pack_method = pack_method
         self.exclude_layers = cast(list[str], self.quant_config.get("exclude", []))
+        # Both are consumed by _is_draft_layer(), which has to tell an appended
+        # MTP/NextN draft layer from a target-model one. "No draft stack" is
+        # spelled None as often as it is spelled absent -- ModelConfig defaults
+        # the same field to None -- so coerce rather than let range() raise.
+        self.num_hidden_layers = getattr(hf_config, "num_hidden_layers", None)
+        self.num_nextn_predict_layers = int(
+            getattr(hf_config, "num_nextn_predict_layers", 0) or 0
+        )
         self.is_prequantized = is_prequantized
         self.dequantization_config = dequantization_config
         # Load-as-is FP8 config for excluded layers of a mixed-precision source
@@ -368,9 +380,59 @@ class QuarkConfig(QuantizationConfig):
                 expanded.append(name.removeprefix("language_model."))
         self.exclude_layers = list(dict.fromkeys(expanded))
 
+        layer_quant_config = self.quant_config.get("layer_quant_config")
+        if layer_quant_config:
+            self.quant_config["layer_quant_config"] = hf_to_sglang_mapper.apply_dict(
+                layer_quant_config
+            )
+
+        if self.kv_cache_group:
+            self.kv_cache_group = hf_to_sglang_mapper.apply_list(self.kv_cache_group)
+
+    @staticmethod
+    def _get_block_fp8_config(
+        layer_quant_config: Optional[dict[str, Any]],
+        packed_modules_mapping: dict[str, list[str]],
+    ) -> Optional[Fp8Config]:
+        if layer_quant_config is None:
+            return None
+
+        weight_config = layer_quant_config.get("weight") or {}
+        input_config = layer_quant_config.get("input_tensors") or {}
+        block_size = weight_config.get("block_size")
+        if not (
+            weight_config.get("dtype") in {"fp8_e4m3", "fp8_e4m3fn"}
+            and weight_config.get("qscheme") == "per_block"
+            and weight_config.get("is_dynamic") is False
+            and isinstance(block_size, list)
+            and len(block_size) == 2
+            and input_config.get("dtype") in {"fp8_e4m3", "fp8_e4m3fn"}
+            and input_config.get("is_dynamic") is True
+        ):
+            return None
+
+        return Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=block_size,
+            packed_modules_mapping=packed_modules_mapping,
+        )
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        explicit_layer_config = self._find_matched_layer_config(prefix, layer)
+        block_fp8_config = self._get_block_fp8_config(
+            explicit_layer_config, self.packed_modules_mapping
+        )
+        if block_fp8_config is not None:
+            if isinstance(layer, LinearBase):
+                return Fp8LinearMethod(block_fp8_config)
+            if isinstance(layer, FusedMoE):
+                return Fp8MoEMethod(block_fp8_config)
+
         # Check if the layer is skipped for quantization.
         if should_ignore_layer(
             prefix,
@@ -398,8 +460,6 @@ class QuarkConfig(QuantizationConfig):
         if isinstance(layer, RadixAttention):
             self._online_quantized_layers.add(prefix)
             return QuarkKVCacheMethod(self)
-
-        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
         if isinstance(layer, FusedMoE):
             self._online_quantized_layers.add(prefix)
@@ -555,6 +615,10 @@ class QuarkConfig(QuantizationConfig):
 
         return cls(
             quant_config=config,
+            # The requantization branch above takes hf_config off the same dict;
+            # the prequantized path needs it too, so _is_draft_layer() has the
+            # layer counts it compares against.
+            hf_config=config.get("hf_config"),
             kv_cache_group=kv_cache_group,
             kv_cache_config=kv_cache_config,
             pack_method=pack_method,
@@ -771,9 +835,9 @@ class QuarkConfig(QuantizationConfig):
         )
         return is_mx_fp4_weight and is_static_fp8_activation
 
-    def _find_matched_config(
+    def _find_matched_layer_config(
         self, layer_name: str, module: torch.nn.Module
-    ) -> dict[str, Any]:
+    ) -> Optional[dict[str, Any]]:
 
         proj_name = layer_name.split(".")[-1]
         if proj_name in self.packed_modules_mapping:
@@ -785,9 +849,17 @@ class QuarkConfig(QuantizationConfig):
                 for shard_proj_name in shard_proj_names
             ]
             shard_configs = [
-                self._find_matched_config(shard_name, module)
+                self._find_matched_layer_config(shard_name, module)
                 for shard_name in shard_names
             ]
+            if all(q_config is None for q_config in shard_configs):
+                return None
+            if any(q_config is None for q_config in shard_configs):
+                raise ValueError(
+                    f"Found a partially specified quantization configuration for "
+                    f"{shard_proj_names} in {layer_name}. SGLang requires all "
+                    "fused shards to use the same scheme."
+                )
             if not all(
                 deep_compare(q_config, shard_configs[0]) for q_config in shard_configs
             ):
@@ -812,10 +884,19 @@ class QuarkConfig(QuantizationConfig):
             if layer_type in layer_type_quant_config:
                 return layer_type_quant_config[layer_type]
 
-            global_quant_config = cast(
-                dict[str, Any], self.quant_config.get("global_quant_config")
-            )
-            return global_quant_config
+            return None
+
+    def _find_matched_config(
+        self, layer_name: str, module: torch.nn.Module
+    ) -> dict[str, Any]:
+        layer_config = self._find_matched_layer_config(layer_name, module)
+        if layer_config is not None:
+            return layer_config
+
+        global_quant_config = cast(
+            dict[str, Any], self.quant_config.get("global_quant_config")
+        )
+        return global_quant_config
 
     def _get_scheme_from_config(self, config: dict[str, Any]) -> "QuarkLinearScheme":
         if config.get("output_tensors") or config.get("bias"):
@@ -895,12 +976,34 @@ class QuarkConfig(QuantizationConfig):
     def get_scaled_act_names(self) -> List[str]:
         return []
 
+    def _is_draft_layer(self, layer: str) -> bool:
+        """Whether an excluded layer belongs to the MTP/NextN draft stack.
+
+        A draft layer is excluded from quantization in most checkpoints, and
+        says nothing about how the target model stores its own shared experts,
+        so it must not veto shared-expert fusion for the target model's layers.
+
+        Checkpoints spell it either as "mtp.*" or as extra entries appended to
+        the main decoder, model.layers.[num_hidden_layers ..
+        + num_nextn_predict_layers) -- the same range
+        get_spec_layer_idx_from_weight_name() walks in the MTP models.
+        """
+        if layer.startswith("mtp."):
+            return True
+        if self.num_hidden_layers is None:
+            return False
+        base = self.num_hidden_layers
+        return any(
+            layer.startswith(f"model.layers.{base + i}.")
+            for i in range(self.num_nextn_predict_layers)
+        )
+
     def can_fuse_shared_expert(self) -> bool:
         # Shared-expert body excluded from quant; the gate must not veto fusion.
         if any(
             "shared_expert" in layer
             and "shared_expert_gate" not in layer
-            and not layer.startswith("mtp.")
+            and not self._is_draft_layer(layer)
             for layer in self.exclude_layers
         ):
             return False

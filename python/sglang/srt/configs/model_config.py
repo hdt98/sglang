@@ -122,6 +122,8 @@ def is_deepseek_dsa(config) -> bool:
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
             "GlmMoeDsaForCausalLMNextN",
+            "Glm5NextForConditionalGenerationNextN",
+            "Glm5NextForConditionalGeneration",
             "LongcatFlashForCausalLM",
             "LongcatFlashForCausalLMNextN",
             "Dots3NoteForCausalLM",
@@ -132,7 +134,35 @@ def is_deepseek_dsa(config) -> bool:
 
 
 def is_kimi_k3(config) -> bool:
-    return _hf_arch(config) == "KimiK3ForConditionalGeneration"
+    return _hf_arch(config) in (
+        "KimiK3ForConditionalGeneration",
+        "KimiK3LinearForCausalLM",
+    )
+
+
+def uses_kda_attention(config) -> bool:
+    configs = [config]
+    get_text_config = getattr(config, "get_text_config", None)
+    if callable(get_text_config):
+        configs.append(get_text_config())
+    else:
+        text_config = _hf_attr(config, "text_config")
+        if text_config is not None:
+            configs.append(text_config)
+    for config in configs:
+        linear_attn_config = _hf_attr(config, "linear_attn_config")
+        if isinstance(linear_attn_config, dict) and linear_attn_config.get(
+            "kda_layers"
+        ):
+            return True
+        layer_types = _hf_attr(config, "layer_types") or []
+        if (
+            "linear_attention" in layer_types
+            and _hf_attr(config, "linear_num_heads") is not None
+            and _hf_attr(config, "linear_head_dim") is not None
+        ):
+            return True
+    return False
 
 
 def is_dspark_draft(config) -> bool:
@@ -245,6 +275,26 @@ def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
 def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config)
     return config.index_n_heads
+
+
+def get_dsa_index_kpool(config: PretrainedConfig) -> int:
+    return getattr(config, "index_kpool", 1)
+
+
+def get_dsa_mtp_topk_width(config: PretrainedConfig) -> int:
+    """Return the physical index width carried by DSA MTP IndexShare.
+
+    KPool selects ``index_topk`` history tokens and appends the unpooled tail,
+    whose maximum width is ``index_kpool - 1``.  Seed buffers must preserve
+    both parts so their shape matches the indexer's output.
+    """
+    index_kpool = get_dsa_index_kpool(config)
+    assert index_kpool >= 1, f"index_kpool must be positive, got {index_kpool}"
+    return get_dsa_index_topk(config) + index_kpool - 1
+
+
+def get_dsa_index_kpool_compress(config: PretrainedConfig) -> bool:
+    return getattr(config, "index_kpool_compress", False)
 
 
 REQUANTIZATION_METHODS = ["quark_mxfp4"]
@@ -586,46 +636,46 @@ class ModelConfig:
         context_length: Optional[int] = None,
         **kwargs,
     ):
+        from sglang.srt.arg_groups.overrides import resolving_view
+
+        cfg = resolving_view(server_args)
         quantization = (
-            server_args.speculative_draft_model_quantization
+            cfg.speculative_draft_model_quantization
             if is_draft_model
-            else server_args.quantization
+            else cfg.quantization
         )
         override_config_file = (
-            server_args.decrypted_draft_config_file
+            cfg.decrypted_draft_config_file
             if is_draft_model
-            else server_args.decrypted_config_file
+            else cfg.decrypted_config_file
         )
         return ModelConfig(
-            model_path=model_path or server_args.model_path,
-            trust_remote_code=server_args.trust_remote_code,
-            revision=model_revision or server_args.revision,
+            model_path=model_path or cfg.model_path,
+            trust_remote_code=cfg.trust_remote_code,
+            revision=model_revision or cfg.revision,
             context_length=(
-                context_length
-                if context_length is not None
-                else server_args.context_length
+                context_length if context_length is not None else cfg.context_length
             ),
-            model_override_args=server_args.json_model_override_args,
-            is_embedding=server_args.is_embedding,
-            enable_multimodal=server_args.enable_multimodal,
-            dtype=server_args.dtype,
+            model_override_args=cfg.json_model_override_args,
+            is_embedding=cfg.is_embedding,
+            enable_multimodal=cfg.enable_multimodal,
+            dtype=cfg.dtype,
             quantization=quantization,
-            model_impl=server_args.model_impl,
-            sampling_defaults=server_args.sampling_defaults,
-            quantize_and_serve=server_args.quantize_and_serve,
+            model_impl=cfg.model_impl,
+            sampling_defaults=cfg.sampling_defaults,
+            quantize_and_serve=cfg.quantize_and_serve,
             override_config_file=override_config_file,
-            is_multi_layer_eagle=server_args.enable_multi_layer_eagle,
-            language_only=server_args.language_only,
-            language_model_only=server_args.language_model_only,
-            encoder_only=server_args.encoder_only,
+            is_multi_layer_eagle=cfg.enable_multi_layer_eagle,
+            language_only=cfg.language_only,
+            language_model_only=cfg.language_model_only,
+            encoder_only=cfg.encoder_only,
             is_draft_model=is_draft_model,
             is_draft_quantization_explicit=(
-                is_draft_model
-                and server_args._speculative_draft_quantization_explicitly_set
+                is_draft_model and cfg._speculative_draft_quantization_explicitly_set
             ),
-            disable_hybrid_swa_memory=server_args.disable_hybrid_swa_memory,
-            model_config_parser=server_args.model_config_parser,
-            speculative_algorithm=server_args.speculative_algorithm,
+            disable_hybrid_swa_memory=cfg.disable_hybrid_swa_memory,
+            model_config_parser=cfg.model_config_parser,
+            speculative_algorithm=cfg.speculative_algorithm,
             **kwargs,
         )
 
@@ -677,6 +727,15 @@ class ModelConfig:
             and self.hf_config.architectures[0] == "Glm4MoeLiteForCausalLM"
         ):
             self.hf_config.architectures[0] = "Glm4MoeLiteForCausalLMNextN"
+
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "Glm5NextForConditionalGeneration"
+        ):
+            self.hf_config.architectures[0] = "Glm5NextForConditionalGenerationNextN"
+            self.hf_text_config.architectures = list(self.hf_config.architectures)
+            self.hf_text_config.num_nextn_predict_layers = 1
+            self.hf_text_config.linear_attn_config = None
 
         if is_draft_model and self.hf_config.architectures[0] in [
             "GlmOcrForConditionalGeneration",
@@ -910,6 +969,8 @@ class ModelConfig:
             or "Glm4MoeLiteForCausalLMNextN" in self.hf_config.architectures
             or "GlmMoeDsaForCausalLM" in self.hf_config.architectures
             or "GlmMoeDsaForCausalLMNextN" in self.hf_config.architectures
+            or "Glm5NextForConditionalGeneration" in self.hf_config.architectures
+            or "Glm5NextForConditionalGenerationNextN" in self.hf_config.architectures
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
             or "DotsVLMForCausalLM" in self.hf_config.architectures
@@ -990,6 +1051,7 @@ class ModelConfig:
             self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
         elif (
             "KimiLinearForCausalLM" in self.hf_config.architectures
+            or "KimiK3LinearForCausalLM" in self.hf_config.architectures
             or "KimiK3ForConditionalGeneration" in self.hf_config.architectures
         ):
             tc = self.hf_text_config
@@ -1011,7 +1073,10 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.v_head_dim = self.hf_config.v_head_dim
             self._init_mla_scaling(self.hf_config.rope_scaling)
-        elif "SarvamMLAForCausalLM" in self.hf_config.architectures:
+        elif (
+            "SarvamMLAForCausalLM" in self.hf_config.architectures
+            or "Glm5NextForConditionalGeneration" in self.hf_config.architectures
+        ):
             self.head_dim = (
                 self.hf_config.qk_nope_head_dim + self.hf_config.qk_rope_head_dim
             )
@@ -1064,12 +1129,21 @@ class ModelConfig:
             self.num_key_value_heads = self.num_attention_heads
         self.hidden_size = self.hf_text_config.hidden_size
         hc_mult = getattr(self.hf_text_config, "hc_mult", 1)
-        self.spec_hidden_size = (
-            self.hidden_size * hc_mult if hc_mult > 1 else self.hidden_size
-        )
+        if (
+            getattr(self.hf_config, "model_type", None) == "glm5_next"
+            or getattr(self.hf_text_config, "model_type", None) == "glm5_next_text"
+        ) and not getattr(self.hf_text_config, "mhc", False):
+            hc_mult = 1
         # mHC-flattened hidden size; None when not running an mHC model
         # (e.g. non-DeepSeek-V4 configs without ``hc_mult``).
-        self.hc_hidden_size = self.spec_hidden_size if hc_mult > 1 else None
+        self.hc_hidden_size = self.hidden_size * hc_mult if hc_mult > 1 else None
+        if hc_mult > 1 and not (
+            getattr(self.hf_config, "model_type", None) == "glm5_next"
+            or getattr(self.hf_text_config, "model_type", None) == "glm5_next_text"
+        ):
+            self.spec_hidden_size = self.hidden_size * hc_mult
+        else:
+            self.spec_hidden_size = self.hidden_size
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.num_attention_layers = self.num_hidden_layers
         if "LongcatFlashForCausalLM" in self.hf_config.architectures:
@@ -1865,6 +1939,7 @@ multimodal_model_archs = [
     "Gemma4UnifiedForConditionalGeneration",
     "Glm4vForConditionalGeneration",
     "Glm4vMoeForConditionalGeneration",
+    "Glm5NextForConditionalGeneration",
     "GlmOcrForConditionalGeneration",
     "GlmAsrForConditionalGeneration",
     "GlmImageForConditionalGeneration",
@@ -1932,6 +2007,7 @@ piecewise_cuda_graph_disabled_model_archs = [
     "DeepseekV4ForCausalLMNextN",
     "DeepseekV4ForCausalLMDSpark",
     "Qwen3NextForCausalLM",
+    "Glm5NextForConditionalGeneration",
     "BailingMoeV2_5ForCausalLM",
     "LLaDAModelLM",
 ]
