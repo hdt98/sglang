@@ -879,6 +879,14 @@ class ChatCompletionRequest(BaseModel):
         "models that expose a maximum-effort tier above 'high'; models that don't "
         "support it treat it the same as 'high'.",
     )
+    max_thinking_tokens: Optional[int] = Field(
+        default=None,
+        description="Upper bound on tokens the model may spend inside its "
+        "thinking block. Once the budget is reached the reasoning block is "
+        "closed and the model must begin its answer, so a hard task degrades "
+        "to a shorter rationale instead of consuming the whole output budget "
+        "and returning nothing. Requires --enable-strict-thinking.",
+    )
     task: Optional[
         Literal["action", "query", "authority", "domain", "title", "read_url"]
     ] = Field(
