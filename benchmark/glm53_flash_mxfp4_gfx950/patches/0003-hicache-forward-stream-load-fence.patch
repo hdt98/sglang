@@ -1,0 +1,43 @@
+diff --git a/srt/managers/cache_controller.py b/srt/managers/cache_controller.py
+index 41eb163834..556fb6cd2f 100644
+--- a/srt/managers/cache_controller.py
++++ b/srt/managers/cache_controller.py
+@@ -361,4 +361,7 @@ class HiCacheController:
+         self.load_queue: List[CacheOperation] = []
+         self.write_queue: List[CacheOperation] = []
+         self.ack_load_queue: List[HiCacheAck] = []
++        # Set by the scheduler to the forward stream; gates load-back H2D
++        # behind in-flight forwards (see start_loading).
++        self.load_fence_stream = None
+         self.ack_write_queue: List[HiCacheAck] = []
+@@ -922,6 +925,13 @@ class HiCacheController:
+         producer_event = self.layer_done_counter.events[producer_id]
+         producer_event.start_event.record()
+-
++        if self.load_fence_stream is not None:
++            # in overlap scheduling, reclaimed pages might still be written by the forward thread
++            # therefore a fence is needed for loading thread to prevent memory corruption
++            # todo: it's possible to use a finer-grained fence
++            self.l2_transfer_engine.host_to_device_stream.wait_stream(
++                self.load_fence_stream
++            )
++
+         completion = self.l2_transfer_engine.submit_host_to_device(
+             self._l2_load_transfers(host_indices, device_indices, pool_transfers),
+             start_event=producer_event.start_event,
+diff --git a/srt/managers/scheduler.py b/srt/managers/scheduler.py
+index 4fe7004f55..454f754544 100644
+--- a/srt/managers/scheduler.py
++++ b/srt/managers/scheduler.py
+@@ -565,5 +565,11 @@ class Scheduler(
+         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
+         self.disable_radix_cache = result.disable_radix_cache
+         self.tree_cache = result.tree_cache
++        if self.enable_hierarchical_cache:
++            cache_controller = self.tree_cache.cache_controller
++            if cache_controller is not None:
++                cache_controller.load_fence_stream = (
++                    self.tp_worker.model_runner.forward_stream
++                )
+         self.emit_metrics_constants()
+         self.maybe_init_hccl_dp_prewarm()
