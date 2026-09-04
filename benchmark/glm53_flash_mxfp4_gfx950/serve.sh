@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # GLM-5.3-Flash-MXFP4 baseline on 4x AMD Instinct MI355X (gfx950), TP4/EP4.
 #
-# NOTE: this model REQUIRES the candidate-v30 SGLang overlay. glm5_next
+# NOTE: this model REQUIRES the patched candidate-v30 SGLang overlay. glm5_next
 # (Glm5NextForConditionalGeneration) is not in upstream SGLang or in any
 # lmsysorg/sglang-rocm image -- the overlay is the implementation, not a tuning
-# patch. See README.md.
+# patch. Build the runtime tree with prepare_overlay.sh; see README.md.
 #
 # Weights: hf download OneNexus/GLM-5.3-Flash-MXFP4 \
 #            --revision 21e1124f735fd7b7836189d6c13d5eedfef3fb88
@@ -17,6 +17,14 @@ API_KEY="${SGLANG_API_KEY:?set SGLANG_API_KEY}"
 IMAGE="${IMAGE:-lmsysorg/sglang-rocm:v0.5.18-rocm724-mi35x-20260822}"
 PORT="${PORT:-30037}"
 GPUS="${GPUS:-4,5,6,7}"
+
+if ! grep -Fq 'batch.mamba_track_indices[freed_rows] = -1' \
+  "${OVERLAY_DIR}/srt/managers/schedule_batch.py" || \
+  ! grep -Fq 'def _select_finished_checkpoint(' \
+  "${OVERLAY_DIR}/srt/mem_cache/unified_cache/components/mamba_component.py"; then
+  echo "OVERLAY_DIR is unpatched; run prepare_overlay.sh first: ${OVERLAY_DIR}" >&2
+  exit 1
+fi
 
 docker run --rm --name glm53-flash-mxfp4 \
   --device /dev/kfd --device /dev/dri \

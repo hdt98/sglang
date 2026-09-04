@@ -1,0 +1,304 @@
+diff --git a/srt/managers/schedule_batch.py b/srt/managers/schedule_batch.py
+index e4dd731a0a..d81920f432 100755
+--- a/srt/managers/schedule_batch.py
++++ b/srt/managers/schedule_batch.py
+@@ -956,6 +956,9 @@ class Req(ReqDllmMixin):
+         self.mamba_last_track_seqlen: Optional[int] = (
+             None  # seq len of the last cached mamba state
+         )
++        # Seq len of the other ping-pong slot's state. None means what is in
++        # that slot cannot be named (never written, donated, freed).
++        self.mamba_prev_track_seqlen: Optional[int] = None
+         # the branching point seqlen to track mamba state. If set, given by prefix match,
+         # it will be the tracked seqlen in the ping pong buffer for the right prefill pass.
+         self.mamba_branching_seqlen: Optional[int] = None
+@@ -1244,12 +1247,22 @@ class Req(ReqDllmMixin):
+             or self.mamba_host_hit_length > 0
+         )
+
++    @property
++    def kv_key_capped_at_prompt(self) -> bool:
++        """Why a key can stop short: capped at the prompt, not at a stop."""
++        return get_serving().strip_thinking_cache and self.reasoning_tokens > 0
++
+     def effective_kv_committed_len(self) -> int:
+         # Report only the prompt prefix so thinking + answer fall into the
+         # overallocated range and are reclaimed by release_kv_cache. #22373.
+-        if get_serving().strip_thinking_cache and self.reasoning_tokens > 0:
++        if self.kv_key_capped_at_prompt:
+             return min(self.kv_committed_len, len(self.origin_input_ids))
+-        return self.kv_committed_len
++        # A verify step commits a whole accepted chunk, so output_ids can run
++        # past the stop; the client never sees those tokens, so nothing matches.
++        return min(
++            self.kv_committed_len,
++            len(self.origin_input_ids) + len(self.output_ids_through_stop),
++        )
+
+     def update_spec_correct_drafts_histogram(self, num_correct_drafts: int):
+         """Record one step accepted draft count (excludes bonus token) into the histogram."""
+@@ -1706,6 +1719,7 @@ class Req(ReqDllmMixin):
+         self.mamba_next_track_idx = None
+         self.mamba_last_track_idx = None
+         self.mamba_last_track_seqlen = None
++        self.mamba_prev_track_seqlen = None
+         self.mamba_branching_seqlen = None
+         self.mamba_cow_src_index = None
+         self.mamba_needs_clear = False
+@@ -1919,12 +1933,19 @@ def set_mamba_track_indices_from_reqs(
+     all_buffers = req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
+         batch.req_pool_indices
+     ]  # (bs, ping_pong_size), int64, on device
++    freed_rows = [
++        i for i, req in enumerate(batch.reqs) if req.mamba_next_track_idx is None
++    ]
+     if track_positions is None:
+-        # Guard: mamba_next_track_idx may be None for requests that haven't
+-        # gone through _alloc_ping_pong_buffer yet (e.g., spec v2 verify path).
+-        # Default to 0 (first ping-pong slot) to avoid TypeError.
++        # Keep the gather in bounds for requests that haven't allocated a
++        # ping-pong buffer yet (e.g., spec v2 verify path). Freed rows are
++        # invalidated below so they cannot scatter into a recycled slot.
+         track_positions = [
+-            req.mamba_next_track_idx if req.mamba_next_track_idx is not None else 0
++            (
++                req.mamba_next_track_idx
++                if req.mamba_next_track_idx is not None
++                else 0
++            )
+             for req in batch.reqs
+         ]
+     batch.mamba_track_buffer_indices = list(track_positions)
+@@ -1940,6 +1961,12 @@ def set_mamba_track_indices_from_reqs(
+     batch.mamba_track_indices = (
+         torch.gather(all_buffers, 1, idx).squeeze(1).to(torch.int64)
+     )
++    if freed_rows:
++        # Overlap can leave a request in TARGET_VERIFY after its Mamba state has
++        # been freed and reused by another request. The downstream scatter
++        # treats a negative destination as a no-op, while the old fallback to
++        # position 0 could overwrite the reused live slot.
++        batch.mamba_track_indices[freed_rows] = -1
+
+
+ def release_req(
+diff --git a/srt/managers/scheduler_components/batch_result_processor.py b/srt/managers/scheduler_components/batch_result_processor.py
+index 2deb7bb920..526914ef55 100644
+--- a/srt/managers/scheduler_components/batch_result_processor.py
++++ b/srt/managers/scheduler_components/batch_result_processor.py
+@@ -1095,6 +1095,9 @@ class SchedulerBatchResultProcessor:
+
+             if completed_mamba_boundary and not lazy:
+                 req.mamba_last_track_idx = batch.mamba_track_buffer_indices[i]
++                # The slot that stops being the latest still holds its
++                # checkpoint; name it so a short key can fall back to it.
++                req.mamba_prev_track_seqlen = req.mamba_last_track_seqlen
+                 req.mamba_last_track_seqlen = req.kv_committed_len - lookahead
+             elif (
+                 req.finished()
+@@ -1210,13 +1213,17 @@ class SchedulerBatchResultProcessor:
+         track_idx = req.mamba_next_track_idx
+         if not known_boundary and batch.mamba_track_buffer_indices is not None:
+             track_idx = batch.mamba_track_buffer_indices[i]
++        previous_track_seqlen = req.mamba_last_track_seqlen
+         if not known_boundary:
+             req.mamba_last_track_seqlen = track_seqlen
+         if lazy:
++            # Lazy frees the slot it stops tracking, so nothing names a
++            # previous checkpoint there; mamba_prev_track_seqlen stays None.
+             self.mamba_lazy_post_decode_at_boundary(req, batch, track_idx)
+         else:
+             if not known_boundary:
+                 req.mamba_last_track_idx = track_idx
++                req.mamba_prev_track_seqlen = previous_track_seqlen
+             req.mamba_next_track_idx = (
+                 batch.req_to_token_pool.get_mamba_ping_pong_other_idx(track_idx)
+             )
+diff --git a/srt/mem_cache/base_prefix_cache.py b/srt/mem_cache/base_prefix_cache.py
+index 15aee4c93e..12054328f3 100644
+--- a/srt/mem_cache/base_prefix_cache.py
++++ b/srt/mem_cache/base_prefix_cache.py
+@@ -67,6 +67,8 @@ class InsertParams:
+
+     # Mamba specific
+     mamba_value: Optional[torch.Tensor] = None
++    # The ping-pong slot prepare picked; cleanup keeps that same slot.
++    mamba_keep_idx: Optional[int] = None
+
+     # DSV4 NPU C128 sidecar pages, one page id per physical C128 page group.
+     c128_value: Optional[torch.Tensor] = None
+diff --git a/srt/mem_cache/common.py b/srt/mem_cache/common.py
+index 524950b3fb..2bc4241dd1 100644
+--- a/srt/mem_cache/common.py
++++ b/srt/mem_cache/common.py
+@@ -255,8 +255,13 @@ def _release_overallocated_kv_indices(
+     # strip_thinking_cache intentionally reports output tokens as overallocated
+     # so they fall into the free path below (#22373).
+     if spec_algo is None and not get_serving().strip_thinking_cache:
++        # A stop landing before the last committed token does the same, via
++        # effective_kv_committed_len().
++        stop_truncated = req.finished_len is not None and (
++            len(req.origin_input_ids) + req.finished_len < req.kv_committed_len
++        )
+         assert (
+-            start_p == end_p
++            start_p == end_p or stop_truncated
+         ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv.kv_allocated_len=}"
+
+     if page_size > 1:
+diff --git a/srt/mem_cache/mamba_radix_cache.py b/srt/mem_cache/mamba_radix_cache.py
+index a5afb89d41..90ebe1dd7f 100644
+--- a/srt/mem_cache/mamba_radix_cache.py
++++ b/srt/mem_cache/mamba_radix_cache.py
+@@ -560,6 +560,19 @@ class MambaRadixCache(BasePrefixCache):
+             req.req_pool_idx, :kv_len_to_handle
+         ]
+
++        # effective_kv_committed_len can stop the key short of the tracked state
++        # (a stop inside a committed spec chunk, or strip_thinking_cache).
++        if is_insert and self.enable_mamba_extra_buffer:
++            if (req.mamba_last_track_seqlen or 0) > len(token_ids):
++                logger.debug(
++                    "mamba checkpoint dropped: tracked state past the key "
++                    "(cache_len=%s, token_ids_len=%s, rid=%s)",
++                    req.mamba_last_track_seqlen,
++                    len(token_ids),
++                    req.rid,
++                )
++                is_insert = False
++
+         if is_insert:
+             if self.enable_mamba_extra_buffer:
+                 cache_len = req.mamba_last_track_seqlen
+diff --git a/srt/mem_cache/memory_pool.py b/srt/mem_cache/memory_pool.py
+index 16ad8c6722..541b8ef355 100644
+--- a/srt/mem_cache/memory_pool.py
++++ b/srt/mem_cache/memory_pool.py
+@@ -1479,6 +1479,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
+         )
+         buf[:n] = slots
+         req.mamba_ping_pong_track_buffer = buf
++        req.mamba_prev_track_seqlen = None
+         req.mamba_next_track_idx = 0
+         req.mamba_last_track_idx = (
+             0
+diff --git a/srt/mem_cache/storage/flexkv/flexkv_radix_cache.py b/srt/mem_cache/storage/flexkv/flexkv_radix_cache.py
+index a7a090cd96..3aed65183a 100644
+--- a/srt/mem_cache/storage/flexkv/flexkv_radix_cache.py
++++ b/srt/mem_cache/storage/flexkv/flexkv_radix_cache.py
+@@ -404,6 +404,9 @@ class FlexKVRadixCache(RadixCache):
+             kv_committed_len = len(req.origin_input_ids) + max(
+                 len(req.output_ids) - 1, 0
+             )
++        # super() already freed the KV past kv_len_to_handle, and a key beyond
++        # it names tokens the client never saw.
++        kv_committed_len = min(kv_committed_len, kv_len_to_handle)
+
+         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+         if not token_ids:
+diff --git a/srt/mem_cache/storage/lmcache/lmc_radix_cache.py b/srt/mem_cache/storage/lmcache/lmc_radix_cache.py
+index 5a24c5d19e..70e33968fd 100644
+--- a/srt/mem_cache/storage/lmcache/lmc_radix_cache.py
++++ b/srt/mem_cache/storage/lmcache/lmc_radix_cache.py
+@@ -460,6 +460,9 @@ class LMCRadixCache(RadixCache):
+             kv_committed_len = len(req.origin_input_ids) + max(
+                 len(req.output_ids) - 1, 0
+             )
++        # super() already freed the KV past kv_len_to_handle, and a key beyond
++        # it names tokens the client never saw.
++        kv_committed_len = min(kv_committed_len, kv_len_to_handle)
+
+         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+         kv_indices = self.req_to_token_pool.req_to_token[
+diff --git a/srt/mem_cache/unified_cache/components/mamba_component.py b/srt/mem_cache/unified_cache/components/mamba_component.py
+index 319c8c9366..25d9cb168e 100644
+--- a/srt/mem_cache/unified_cache/components/mamba_component.py
++++ b/srt/mem_cache/unified_cache/components/mamba_component.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+
++import logging
+ from collections import defaultdict
+ from typing import TYPE_CHECKING, Callable, Optional, Sequence
+
+@@ -55,6 +56,9 @@ if TYPE_CHECKING:
+     )
+
+
++logger = logging.getLogger(__name__)
++
++
+ class MambaComponent(TreeComponent):
+     component_type = ComponentType.MAMBA
+
+@@ -525,6 +529,30 @@ class MambaComponent(TreeComponent):
+         else:
+             self.cache.req_to_token_pool.mamba_allocator.free(mamba_value)
+
++    def _select_finished_checkpoint(
++        self, req: Req, token_ids_len: int
++    ) -> Optional[tuple[int, int]]:
++        # None means donate nothing, not "no slot found".
++        pool = self.cache.req_to_token_pool
++        keep_idx = pool.get_mamba_ping_pong_keep_idx(req)
++        cache_len = req.mamba_last_track_seqlen or 0
++
++        if req.kv_key_capped_at_prompt:
++            return cache_len, keep_idx
++        if cache_len <= token_ids_len:
++            return cache_len, keep_idx
++
++        # Overshoot: the latest state ran past the key. The other slot always
++        # holds a tensor; only this seqlen says whether a key can name it.
++        previous_cache_len = req.mamba_prev_track_seqlen
++        if (
++            pool.mamba_ping_pong_track_buffer_size != 2
++            or previous_cache_len is None
++            or previous_cache_len > token_ids_len
++        ):
++            return None
++        return previous_cache_len, pool.get_mamba_ping_pong_other_idx(keep_idx)
++
+     def prepare_for_caching_req(
+         self,
+         req: Req,
+@@ -554,9 +582,20 @@ class MambaComponent(TreeComponent):
+             if cache_len is None:
+                 cache_len = 0
+             if self.cache.enable_mamba_extra_buffer:
+-                keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_keep_idx(
+-                    req
+-                )
++                selected = self._select_finished_checkpoint(req, token_ids_len)
++                if selected is None:
++                    # An empty key stores nothing and frees the whole range --
++                    # the path a request that never crossed a boundary takes.
++                    logger.debug(
++                        "mamba checkpoint dropped: no slot names a state within "
++                        "the key (cache_len=%s, token_ids_len=%s, rid=%s)",
++                        req.mamba_last_track_seqlen,
++                        token_ids_len,
++                        req.rid,
++                    )
++                    return 0
++                cache_len, keep_idx = selected
++                insert_params.mamba_keep_idx = keep_idx
+                 active_value = (
+                     req.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(-1).clone()
+                 )
+@@ -629,11 +668,11 @@ class MambaComponent(TreeComponent):
+                 return
+
+             if self.cache.enable_mamba_extra_buffer:
+-                keep_idx = (
+-                    pool.get_mamba_ping_pong_keep_idx(req)
+-                    if mamba_value_inserted
+-                    else None
++                # Keep the slot prepare picked, so cleanup cannot pick another.
++                selected = (
++                    insert_params.mamba_keep_idx if insert_params is not None else None
+                 )
++                keep_idx = selected if mamba_value_inserted else None
+                 pool.free_mamba_cache(
+                     req, mamba_ping_pong_track_buffer_to_keep=keep_idx
+                 )

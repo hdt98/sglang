@@ -26,6 +26,31 @@ Consequences:
   the overlay's 48 changed files, 1 applies cleanly, 44 conflict, and 3 no
   longer exist upstream.
 
+## Prepare the overlay
+
+This fixing branch carries the cache-integrity changes in two forms:
+
+- the native upstream-tree implementation under `python/sglang`; and
+- `patches/0002-mamba-radix-finished-state-integrity.patch`, adapted to the
+  candidate-v30 overlay that the deployment actually imports.
+
+The overlay patch is based on candidate-v30 source commit
+`62b9a4a1c8fa9f84db0c39d518c7cde156ecb3a9`. Prepare a separate copy so the
+known-good source remains untouched:
+
+```bash
+BASE_OVERLAY_DIR=/path/to/candidate-v30/python/sglang \
+OUTPUT_DIR=/path/to/candidate-v30-mamba-fixed/python/sglang \
+./prepare_overlay.sh
+```
+
+The script rejects an incompatible patch or an existing output path, applies
+the patch, compiles the resulting Python tree, and verifies both integrity
+guards are present. The speculative-overshoot/checkpoint fix addresses a
+confirmed reachable cache-integrity defect. The freed-overlap-row guard is
+defensive hardening; instrumentation has not established that path as the
+specific Meridian trigger.
+
 ## Launch
 
 ```bash
@@ -34,7 +59,7 @@ hf download OneNexus/GLM-5.3-Flash-MXFP4 \
     --local-dir /data/models/GLM-5.3-Flash-MXFP4
 
 MODEL_DIR=/data/models/GLM-5.3-Flash-MXFP4 \
-OVERLAY_DIR=/path/to/candidate-v30/sglang \
+OVERLAY_DIR=/path/to/candidate-v30-mamba-fixed/python/sglang \
 AITER_JIT_DIR=/path/to/aiter-jit-cache \
 SGLANG_API_KEY=... ./serve.sh
 ```
@@ -110,7 +135,9 @@ of 79K-120K exceed the first of those.
 
 | File | Purpose |
 | --- | --- |
-| `serve.sh` | the baseline launch (requires the overlay) |
+| `prepare_overlay.sh` | copies and patches candidate-v30 without changing the source tree |
+| `serve.sh` | the baseline launch (requires the patched overlay) |
 | `probe.py` | correctness + decode + long-prefill smoke |
 | `run_agentx.sh` | AgentX replay, canonical flags |
 | `patches/0001-bound-kpool-cp-mqa-logits.patch` | bounds the kpool CP MQA-logits path (#37478) |
+| `patches/0002-mamba-radix-finished-state-integrity.patch` | ports the finished-request Mamba/radix integrity fixes to candidate-v30 |
