@@ -13,27 +13,44 @@ set -euo pipefail
 MODEL_DIR="${MODEL_DIR:?set MODEL_DIR to the GLM-5.3-Flash-MXFP4 checkout}"
 OVERLAY_DIR="${OVERLAY_DIR:?set OVERLAY_DIR to the candidate-v30 python/sglang tree}"
 AITER_JIT_DIR="${AITER_JIT_DIR:?set AITER_JIT_DIR to the pinned aiter jit cache}"
+TRANSFORMERS_DIR="${TRANSFORMERS_DIR:?set TRANSFORMERS_DIR to the pinned Transformers checkout}"
+TRANSFORMERS_RUNTIME_DIR="${TRANSFORMERS_RUNTIME_DIR:?set TRANSFORMERS_RUNTIME_DIR to the pinned processor dependencies}"
 API_KEY="${SGLANG_API_KEY:?set SGLANG_API_KEY}"
-IMAGE="${IMAGE:-lmsysorg/sglang-rocm:v0.5.18-rocm724-mi35x-20260822}"
+IMAGE="${IMAGE:-lmsysorg/sglang-rocm:v0.5.18-rocm724-mi35x-20260903}"
 PORT="${PORT:-30037}"
 GPUS="${GPUS:-4,5,6,7}"
+CPUSET_CPUS="${CPUSET_CPUS:-96-191}"
+CPUSET_MEMS="${CPUSET_MEMS:-1}"
 
 if ! grep -Fq 'batch.mamba_track_indices[freed_rows] = -1' \
   "${OVERLAY_DIR}/srt/managers/schedule_batch.py" || \
   ! grep -Fq 'def _select_finished_checkpoint(' \
-  "${OVERLAY_DIR}/srt/mem_cache/unified_cache/components/mamba_component.py"; then
+  "${OVERLAY_DIR}/srt/mem_cache/unified_cache/components/mamba_component.py" || \
+  ! grep -Fq 'cache_controller.load_fence_stream' \
+  "${OVERLAY_DIR}/srt/managers/scheduler.py"; then
   echo "OVERLAY_DIR is unpatched; run prepare_overlay.sh first: ${OVERLAY_DIR}" >&2
+  exit 1
+fi
+if [[ ! -f "${TRANSFORMERS_DIR}/src/transformers/models/glm5_next/processing_glm5_next.py" ]] || \
+  [[ ! -d "${TRANSFORMERS_RUNTIME_DIR}/tokenizers" ]] || \
+  [[ ! -f "${TRANSFORMERS_RUNTIME_DIR}/glm53_flash_chat_template.jinja" ]]; then
+  echo "GLM-5.3 processor stack is incomplete; run prepare_transformers.sh first" >&2
   exit 1
 fi
 
 docker run --rm --name glm53-flash-mxfp4 \
   --device /dev/kfd --device /dev/dri \
   --security-opt label=disable --ipc host --shm-size 32g \
+  --cpuset-cpus "${CPUSET_CPUS}" --cpuset-mems "${CPUSET_MEMS}" \
   -p "0.0.0.0:${PORT}:30000" \
   -v "${MODEL_DIR}:/model:ro" \
   -v "${OVERLAY_DIR}:/sgl-workspace/sglang/python/sglang:ro" \
   -v "${AITER_JIT_DIR}:/sgl-workspace/aiter/aiter/jit" \
+  -v "${TRANSFORMERS_DIR}:/transformers:ro" \
+  -v "${TRANSFORMERS_RUNTIME_DIR}:/transformers-runtime:ro" \
   -e ROCR_VISIBLE_DEVICES="${GPUS}" \
+  -e PYTHONPATH=/transformers-runtime:/transformers/src:/sgl-workspace/sglang/python \
+  -e SGLANG_SET_CPU_AFFINITY=0 \
   -e SGLANG_USE_AITER=1 \
   -e SGLANG_OPT_USE_TOPK_V2=false \
   -e SGLANG_OPT_DEEPGEMM_HC_PRENORM=0 \
@@ -54,12 +71,14 @@ docker run --rm --name glm53-flash-mxfp4 \
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 6 \
   --speculative-attention-mode prefill \
   --speculative-accept-threshold-single 1.0 --speculative-accept-threshold-acc 1.0 \
-  --speculative-draft-model-quantization unquant \
+  --speculative-draft-model-quantization quark \
   --enable-hierarchical-cache --hicache-ratio 0.50 \
   --hicache-write-policy write_through --hicache-io-backend direct \
   --hicache-mem-layout page_first_direct \
   --reasoning-parser glm45 --tool-call-parser glm47 \
+  --enable-strict-thinking \
   --mm-feature-transport cpu \
+  --chat-template /transformers-runtime/glm53_flash_chat_template.jinja \
   --log-requests --log-requests-level 3 \
   --watchdog-timeout 1800 --dist-timeout 600 \
   --enable-metrics --enable-cache-report --enable-request-time-stats-logging \

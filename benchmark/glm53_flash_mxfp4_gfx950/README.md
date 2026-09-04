@@ -7,10 +7,10 @@ on four AMD Instinct MI355X.
 
 ## The overlay is required
 
-`glm5_next` is **not** in upstream SGLang and not in any published
-`lmsysorg/sglang-rocm` image — both `v0.5.18-rocm724-mi35x-20260822` and
-`-20260902` contain zero references to `Glm5Next`/`glm5_next`, and upstream
-`main` has no such model file. The candidate-v30 overlay mounted over
+`glm5_next` is **not** in upstream SGLang. The
+`v0.5.18-rocm724-mi35x-20260822` and `-20260902` images contain zero references
+to `Glm5Next`/`glm5_next`, while the `-20260903` image still lacks
+`Glm5NextProcessor` and `Glm5NextImageProcessor`. The candidate-v30 overlay mounted over
 `python/sglang` *is* the implementation (25 files reference the architecture),
 not a tuning patch on top of a working model.
 
@@ -20,6 +20,12 @@ Consequences:
 - A newer image cannot substitute for the overlay, and because the overlay
   replaces `python/sglang` wholesale, a newer image's SGLang code never
   executes. The image supplies AITER/Triton/ROCm only.
+- Multimodal input additionally requires the pinned Hugging Face Transformers
+  processor checkout and the pinned official GLM-5.3-Flash chat template.
+  Without the processor, image requests return HTTP 200 but the image pixels
+  never enter the prompt. The OneNexus model revision carries the immediately
+  previous Z.ai template, so the preparation step verifies and installs the
+  current template explicitly.
 - Rebasing the overlay onto a newer image is a port, not a cherry-pick:
   upstream restructured this area (`dsa_indexer_kpool.py` is gone, replaced by
   `kpool_fp8_index.py` / `kpool_plan.py` / `paged_mqa_logits_backend.py`), so of
@@ -51,6 +57,16 @@ confirmed reachable cache-integrity defect. The freed-overlap-row guard is
 defensive hardening; instrumentation has not established that path as the
 specific Meridian trigger.
 
+Prepare the processor stack separately. The Transformers commit, Tokenizers
+version, official template revision, and template digest are pinned, and the
+script refuses to overwrite either destination:
+
+```bash
+TRANSFORMERS_DIR=/data/runtime/transformers-e4052f55 \
+TRANSFORMERS_RUNTIME_DIR=/data/runtime/transformers-deps-e4052f55 \
+./prepare_transformers.sh
+```
+
 ## Launch
 
 ```bash
@@ -61,8 +77,17 @@ hf download OneNexus/GLM-5.3-Flash-MXFP4 \
 MODEL_DIR=/data/models/GLM-5.3-Flash-MXFP4 \
 OVERLAY_DIR=/path/to/candidate-v30-mamba-fixed/python/sglang \
 AITER_JIT_DIR=/path/to/aiter-jit-cache \
+TRANSFORMERS_DIR=/data/runtime/transformers-e4052f55 \
+TRANSFORMERS_RUNTIME_DIR=/data/runtime/transformers-deps-e4052f55 \
 SGLANG_API_KEY=... ./serve.sh
 ```
+
+The defaults keep the production performance recipe intact: EAGLE 5/1/6,
+TP4/EP4, TileLang DSA, AITER MoE, FP8 KV, radix cache, and HiCache
+write-through/direct all remain enabled. GPUs 4-7 default to NUMA node 1 with
+CPUs 96-191; override `GPUS`, `CPUSET_CPUS`, and `CPUSET_MEMS` together on a
+different topology. CPU multimodal feature transport is explicit because the
+GPU-resident transports are CUDA-only; it does not disable the vision encoder.
 
 ## Verify
 
@@ -136,6 +161,7 @@ of 79K-120K exceed the first of those.
 | File | Purpose |
 | --- | --- |
 | `prepare_overlay.sh` | copies and patches candidate-v30 without changing the source tree |
+| `prepare_transformers.sh` | prepares the pinned GLM-5.3 multimodal processor stack |
 | `serve.sh` | the baseline launch (requires the patched overlay) |
 | `probe.py` | correctness + decode + long-prefill smoke |
 | `run_agentx.sh` | AgentX replay, canonical flags |
