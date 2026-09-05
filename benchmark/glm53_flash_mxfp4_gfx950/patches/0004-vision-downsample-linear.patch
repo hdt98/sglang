@@ -1,0 +1,24 @@
+diff --git a/srt/models/glm5_next.py b/srt/models/glm5_next.py
+--- a/srt/models/glm5_next.py
++++ b/srt/models/glm5_next.py
+@@ -47,6 +47,7 @@
+ from sglang.srt.layers.communicator_mhc_hybrid_cp import (
+     MHCHybridDSACPLayerCommunicator,
+ )
++from sglang.srt.layers.conv import Conv2dLayer
+ from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
+ from sglang.srt.layers.layernorm import RMSNorm
+ from sglang.srt.layers.linear import (
+@@ -317,8 +318,11 @@
+-        self.downsample = nn.Conv2d(
++        # Non-overlapping patches are equivalent to unfold + linear. Avoid
++        # MIOpen's expensive per-image-shape convolution search on ROCm.
++        self.downsample = Conv2dLayer(
+             in_channels=vision_config.hidden_size,
+             out_channels=vision_config.out_hidden_size,
+             kernel_size=vision_config.spatial_merge_size,
+             stride=vision_config.spatial_merge_size,
++            disable_linear=False,
+         )
+         self.post_layernorm = GlmOcrRMSNorm(
+             vision_config.hidden_size, eps=vision_config.rms_norm_eps

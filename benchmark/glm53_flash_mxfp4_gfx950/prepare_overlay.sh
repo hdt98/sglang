@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Copy the candidate-v30 GLM-5.3 overlay and apply this branch's cache-integrity
-# fixes without modifying the source overlay in place.
+# and vision fixes without modifying the source overlay in place.
 set -euo pipefail
 
 BASE_OVERLAY_DIR="${BASE_OVERLAY_DIR:?set BASE_OVERLAY_DIR to the unmodified candidate-v30 python/sglang tree}"
@@ -9,6 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PATCH_FILES=(
   "${SCRIPT_DIR}/patches/0002-mamba-radix-finished-state-integrity.patch"
   "${SCRIPT_DIR}/patches/0003-hicache-forward-stream-load-fence.patch"
+  "${SCRIPT_DIR}/patches/0004-vision-downsample-linear.patch"
 )
 
 if [[ ! -f "${BASE_OVERLAY_DIR}/srt/managers/schedule_batch.py" ]]; then
@@ -38,4 +39,6 @@ grep -Fq 'def _select_finished_checkpoint(' \
   "${OUTPUT_DIR}/srt/mem_cache/unified_cache/components/mamba_component.py"
 grep -Fq 'cache_controller.load_fence_stream' \
   "${OUTPUT_DIR}/srt/managers/scheduler.py"
+grep -Fq 'self.downsample = Conv2dLayer(' \
+  "${OUTPUT_DIR}/srt/models/glm5_next.py"
 echo "Prepared patched overlay: ${OUTPUT_DIR}"

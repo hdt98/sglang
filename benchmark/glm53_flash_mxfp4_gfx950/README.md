@@ -23,9 +23,10 @@ Consequences:
 - Multimodal input additionally requires the pinned Hugging Face Transformers
   processor checkout and the pinned official GLM-5.3-Flash chat template.
   Without the processor, image requests return HTTP 200 but the image pixels
-  never enter the prompt. The OneNexus model revision carries the immediately
-  previous Z.ai template, so the preparation step verifies and installs the
-  current template explicitly.
+  never enter the prompt. Model revision `854c8481` synchronizes the official
+  template and removes the obsolete embedded copy from `tokenizer_config.json`;
+  all 120 weight shards are unchanged from `21e1124f`. The preparation step
+  independently pins and verifies the same template for reproducible serving.
 - Rebasing the overlay onto a newer image is a port, not a cherry-pick:
   upstream restructured this area (`dsa_indexer_kpool.py` is gone, replaced by
   `kpool_fp8_index.py` / `kpool_plan.py` / `paged_mqa_logits_backend.py`), so of
@@ -51,11 +52,53 @@ OUTPUT_DIR=/path/to/candidate-v30-mamba-fixed/python/sglang \
 ```
 
 The script rejects an incompatible patch or an existing output path, applies
-the patch, compiles the resulting Python tree, and verifies both integrity
+the patches, compiles the resulting Python tree, and verifies the required
 guards are present. The speculative-overshoot/checkpoint fix addresses a
 confirmed reachable cache-integrity defect. The freed-overlap-row guard is
 defensive hardening; instrumentation has not established that path as the
 specific Meridian trigger.
+
+The preparation also applies `0004-vision-downsample-linear.patch`. It replaces
+only the GLM-5.3-Flash vision downsampler with SGLang's existing
+`Conv2dLayer(disable_linear=False)`. Since kernel and stride are equal and
+padding is zero, unfold plus linear computes the same non-overlapping patch
+projection. Parameter names, shapes, and bias are unchanged; no weight update
+or serving-optimization removal is required.
+
+This targets a profiled cold-image stall on MI355X: the BF16 convolution with
+input `[3696, 1024, 2, 2]` and weight `[4096, 1024, 2, 2]` spent 65.714 seconds
+in MIOpen search, including 63.636 seconds executing eight naïve candidate
+kernels. This is separate from multimodal feature transport. Warm image
+requests can reuse vision features, so they are not a sufficient latency gate.
+
+Run the focused CPU regression against the prepared overlay inside the pinned
+runtime (the baseline source tree itself does not contain `glm5_next`):
+
+```bash
+ROCR_VISIBLE_DEVICES= HIP_VISIBLE_DEVICES= \
+PYTHONPATH=/path/to/prepared/python \
+python3 test_vision_downsample.py -v
+```
+
+The test exercises the model's downsampler constructor without initializing
+the full distributed model. It checks unchanged checkpoint loading, patch
+order, non-contiguous inputs, numerical agreement with `nn.Conv2d`, and the
+absence of convolution dispatch. Promotion still requires ROCm BF16 and
+cold-image end-to-end validation on an authorized candidate, followed by the
+long-context correctness gate. The CPU test alone is not promotion evidence.
+
+On 2026-09-05 the patched candidate passed the ROCm BF16 check against the
+actual checkpoint weights (relative L2 <= 0.001666, cosine >= 0.9999986).
+For the same chart and prompt, first streaming output fell from 66.382 s to
+2.279 s in the bounded cold-image profile. The trace confirms execution of the
+linear downsampler, with no MIOpen convolution; this is not a warm-feature-cache
+measurement. Three other first-use images reached first output in
+0.290-0.436 s and produced image-grounded answers. A 33,034-token arithmetic
+startup probe passed, as did 16 concurrent original Meridian replays alongside
+2,000 short churn requests: all long responses ended in tool calls, with no
+runaway repetition or request failures. EAGLE, HiCache, and the remaining
+serving flags were unchanged. These checks do not establish recovery from
+unchanged poisoned tool histories in Nexus Composer.
 
 Prepare the processor stack separately. The Transformers commit, Tokenizers
 version, official template revision, and template digest are pinned, and the
@@ -71,7 +114,7 @@ TRANSFORMERS_RUNTIME_DIR=/data/runtime/transformers-deps-e4052f55 \
 
 ```bash
 hf download OneNexus/GLM-5.3-Flash-MXFP4 \
-    --revision 21e1124f735fd7b7836189d6c13d5eedfef3fb88 \
+    --revision 854c8481e0c1f4cf95d16b9cd57c59c9e9ac01e1 \
     --local-dir /data/models/GLM-5.3-Flash-MXFP4
 
 MODEL_DIR=/data/models/GLM-5.3-Flash-MXFP4 \
@@ -167,3 +210,5 @@ of 79K-120K exceed the first of those.
 | `run_agentx.sh` | AgentX replay, canonical flags |
 | `patches/0001-bound-kpool-cp-mqa-logits.patch` | bounds the kpool CP MQA-logits path (#37478) |
 | `patches/0002-mamba-radix-finished-state-integrity.patch` | ports the finished-request Mamba/radix integrity fixes to candidate-v30 |
+| `patches/0004-vision-downsample-linear.patch` | avoids cold MIOpen convolution search in the vision downsampler |
+| `test_vision_downsample.py` | CPU downsampler numerical/layout and dispatch regression gate |

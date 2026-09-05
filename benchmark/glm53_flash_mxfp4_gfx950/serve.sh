@@ -7,7 +7,7 @@
 # patch. Build the runtime tree with prepare_overlay.sh; see README.md.
 #
 # Weights: hf download OneNexus/GLM-5.3-Flash-MXFP4 \
-#            --revision 21e1124f735fd7b7836189d6c13d5eedfef3fb88
+#            --revision 854c8481e0c1f4cf95d16b9cd57c59c9e9ac01e1
 set -euo pipefail
 
 MODEL_DIR="${MODEL_DIR:?set MODEL_DIR to the GLM-5.3-Flash-MXFP4 checkout}"
@@ -27,7 +27,9 @@ if ! grep -Fq 'batch.mamba_track_indices[freed_rows] = -1' \
   ! grep -Fq 'def _select_finished_checkpoint(' \
   "${OVERLAY_DIR}/srt/mem_cache/unified_cache/components/mamba_component.py" || \
   ! grep -Fq 'cache_controller.load_fence_stream' \
-  "${OVERLAY_DIR}/srt/managers/scheduler.py"; then
+  "${OVERLAY_DIR}/srt/managers/scheduler.py" || \
+  ! grep -Fq 'self.downsample = Conv2dLayer(' \
+  "${OVERLAY_DIR}/srt/models/glm5_next.py"; then
   echo "OVERLAY_DIR is unpatched; run prepare_overlay.sh first: ${OVERLAY_DIR}" >&2
   exit 1
 fi
