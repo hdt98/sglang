@@ -1555,7 +1555,9 @@ class Scheduler(
             # Requests with a sent chunk that are not yet on the inflight queue.
             self.disagg_prefill_pending_chunk_rids: Set[str] = set()
 
-            self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+            # Keep scheduler-side staging behavior aligned with the selected
+            # transfer backend. Mori uses its own staging environment flag.
+            self.enable_staging = self.disagg_prefill_bootstrap_queue.enable_staging
 
         if (
             self.enable_unified_memory

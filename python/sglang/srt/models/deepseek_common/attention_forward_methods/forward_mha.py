@@ -500,9 +500,9 @@ class DeepseekMHAForwardMixin:
 
         Returns: (kv_a, k_pe) both in BF16
         """
-        backend = get_attn_backend()
-        if isinstance(backend, TboAttnBackend):  # if enable tbo, get primary backend
-            backend = backend.primary
+        backend = resolve_attn_backend(forward_batch)
+        # Hybrid models keep the DSA page table on the full-attention child.
+        backend = getattr(backend, "full_attn_backend", backend)
         kv_indices = backend.forward_metadata.page_table_1_flattened
         assert kv_indices is not None, (
             "page_table_1_flattened should have been generated for FP8 MHA path"
@@ -517,10 +517,10 @@ class DeepseekMHAForwardMixin:
             # Without this, a chunked-prefill split (extend_prefix_lens != 0) that
             # reads cached prefix KV crashes with "576 != 656".
             kv_indices = filter_dcp_local_kv_indices(kv_indices=kv_indices)
-            # Read door: the pool never translates, so the production site does.
-            kv_indices = get_attn_backend().kv_index_translator.translate_dcp_read_ids(
-                kv_indices
-            )
+            # DSA's page table contains physical slots, not unified virtual IDs.
+            # Only collapse widened DCP slots after selecting the local rank.
+            if get_parallel().dcp_enabled:
+                kv_indices = kv_indices // get_parallel().dcp_size
             kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
                 self.attn_mha, kv_indices, torch.bfloat16
             )

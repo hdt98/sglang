@@ -124,6 +124,55 @@ def test_mhc_fused_post_pre_matches_unfused(
     torch.testing.assert_close(layer_out, layer_ref, atol=layer_atol, rtol=layer_rtol)
 
 
+@pytest.mark.parametrize("num_tokens", [1, 96, 108, 8192])
+def test_mhc_pre_norm_matches_torch_reference(monkeypatch, num_tokens):
+    if not torch.cuda.is_available():
+        pytest.skip("A GPU is required for TileLang mHC kernels")
+
+    monkeypatch.setattr(mhc, "use_symmetric_memory", lambda *a, **kw: nullcontext())
+    monkeypatch.setattr(mhc, "is_allocation_symmetric", lambda: False)
+    monkeypatch.setattr(mhc, "get_tp_group", lambda: None)
+    torch.manual_seed(250)
+    hidden_size = 4096
+    fn = torch.randn(24, 4 * hidden_size, device="cuda") / 128
+    scale = torch.tensor([0.3, 0.7, 0.5], device="cuda")
+    base = torch.randn(24, device="cuda") * 0.1
+    weight = (torch.randn(hidden_size, device="cuda") * 0.1 + 1).bfloat16()
+    residual = torch.randn(
+        num_tokens, 4, hidden_size, device="cuda", dtype=torch.bfloat16
+    )
+    kwargs = dict(
+        residual=residual,
+        fn=fn,
+        hc_scale=scale,
+        hc_base=base,
+        rms_eps=1e-5,
+        hc_pre_eps=1e-6,
+        hc_sinkhorn_eps=1e-6,
+        hc_post_mult_value=2.0,
+        sinkhorn_repeat=20,
+    )
+    post_ref, comb_ref, layer_ref = mhc._mhc_pre_torch(**kwargs)
+    layer_float = layer_ref.float()
+    layer_ref = (
+        layer_float
+        * torch.rsqrt(layer_float.square().mean(-1, keepdim=True) + 1e-5)
+        * weight.float()
+    ).bfloat16()
+    post, comb, layer = mhc_pre(**kwargs, norm_weight=weight, norm_eps=1e-5)
+    torch.testing.assert_close(post, post_ref, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(comb, comb_ref, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(layer, layer_ref, atol=0.008, rtol=0.008)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output = mhc_pre(**kwargs, norm_weight=weight, norm_eps=1e-5)
+    graph.replay()
+    torch.cuda.synchronize()
+    for actual, expected in zip(graph_output, (post_ref, comb_ref, layer_ref)):
+        torch.testing.assert_close(actual, expected, atol=0.008, rtol=0.008)
+
+
 if __name__ == "__main__":
     import sys
 

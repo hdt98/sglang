@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -3999,6 +4000,16 @@ class DeepseekSparseAttnBackend(
         sm_scale: float,
     ) -> torch.Tensor:
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
+
+        if os.environ.get("SGLANG_PD_STATE_DIAG"):
+            logger.info(
+                "DSA_TILELANG_DIAG q=%s kv=%s indices=%s d_v=%s dtype=%s",
+                tuple(q_all.shape),
+                tuple(kv_cache.shape),
+                tuple(page_table_1.shape),
+                v_head_dim,
+                kv_cache.dtype,
+            )
 
         # KPool appends up to index_kpool - 1 live tail tokens to the fixed
         # index_topk columns. TileLang processes indices in 64-column blocks,

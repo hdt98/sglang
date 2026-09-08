@@ -3,7 +3,7 @@ import importlib
 import logging
 import math
 import threading
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -11,6 +11,7 @@ import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    is_symmetric_memory_enabled,
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import get_tp_group
@@ -857,6 +858,9 @@ def mhc_pre_big_fuse_with_norm_tilelang(
     norm_weight: T.Tensor[[hidden_size], T.bfloat16]
 
     ENABLE_PDL = is_arch_support_pdl()
+    # HIP AllReduce does not handle a nonzero thread_offset. Put the 64
+    # activation-reduction threads in the first full wave on ROCm instead.
+    mix_thread_start = 64 if torch.version.hip is not None else 0
     with T.Kernel(num_tokens, threads=96) as i:
         rms = T.alloc_fragment(1, T.float32)
         mixes = T.alloc_fragment(hc_mult3, T.float32)
@@ -877,7 +881,10 @@ def mhc_pre_big_fuse_with_norm_tilelang(
         mixes_shared = T.alloc_shared(hc_mult3, T.float32)
         T.copy(mixes, mixes_shared)
 
-        if T.get_thread_binding() < 32:
+        if (
+            T.get_thread_binding() >= mix_thread_start
+            and T.get_thread_binding() < mix_thread_start + 32
+        ):
             cm = T.alloc_fragment((hc_mult, hc_mult), T.float32)
             for j in T.Parallel(hc_mult):
                 post_mix[i, j] = (
@@ -1820,6 +1827,81 @@ def _mhc_post_torch(
     return out.type_as(x)
 
 
+def _try_aiter_mhc_pre(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float | None,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]]:
+    if is_symmetric_memory_enabled():
+        return None
+    from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
+
+    if not (
+        is_hip()
+        and get_bool_env_var("SGLANG_USE_AITER")
+        and is_gfx95_supported()
+    ):
+        return None
+    try:
+        from aiter.ops.mhc import mhc_pre
+    except Exception:
+        return None
+
+    norm_kwargs = {}
+    if norm_weight is not None:
+        norm_kwargs["norm_weight"] = norm_weight
+        norm_kwargs["norm_eps"] = (
+            norm_eps if norm_eps is not None else rms_eps
+        )
+    post_mix, comb_mix, layer_input = mhc_pre(
+        residual=residual,
+        fn=fn,
+        hc_scale=hc_scale,
+        hc_base=hc_base,
+        rms_eps=rms_eps,
+        hc_pre_eps=hc_pre_eps,
+        hc_sinkhorn_eps=hc_sinkhorn_eps,
+        hc_post_mult_value=hc_post_mult_value,
+        sinkhorn_repeat=sinkhorn_repeat,
+        **norm_kwargs,
+    )
+    return post_mix, comb_mix, layer_input, norm_weight is not None
+
+
+def _try_aiter_mhc_post(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    if is_symmetric_memory_enabled():
+        return None
+    from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
+
+    if not (
+        is_hip()
+        and get_bool_env_var("SGLANG_USE_AITER")
+        and is_gfx95_supported()
+    ):
+        return None
+    try:
+        from aiter.ops.mhc import mhc_post
+    except Exception:
+        return None
+
+    result = torch.empty_like(residual)
+    mhc_post(result, x, residual, post_layer_mix, comb_res_mix)
+    return result
+
+
 @torch._dynamo.disable
 def _mhc_pre_dispatch(
     residual: torch.Tensor,
@@ -1836,6 +1918,21 @@ def _mhc_pre_dispatch(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
     assert residual.dim() == 3, f"residual must be (s, n, h); got {residual.shape}"
     if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+        aiter_result = _try_aiter_mhc_pre(
+            residual=residual,
+            fn=fn,
+            hc_scale=hc_scale,
+            hc_base=hc_base,
+            rms_eps=rms_eps,
+            hc_pre_eps=hc_pre_eps,
+            hc_sinkhorn_eps=hc_sinkhorn_eps,
+            hc_post_mult_value=hc_post_mult_value,
+            sinkhorn_repeat=sinkhorn_repeat,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+        )
+        if aiter_result is not None:
+            return aiter_result
         post_mix, comb_mix, layer_input = _mhc_pre_torch(
             residual=residual,
             fn=fn,
@@ -1875,6 +1972,14 @@ def _mhc_post_dispatch(
     assert x.dim() == 2 and residual.dim() == 3
     assert post_layer_mix.dim() == 3 and comb_res_mix.dim() == 3
     if not envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
+        aiter_result = _try_aiter_mhc_post(
+            x,
+            residual,
+            post_layer_mix,
+            comb_res_mix,
+        )
+        if aiter_result is not None:
+            return aiter_result
         return _mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
     return mhc_post(x, residual, post_layer_mix, comb_res_mix)
 

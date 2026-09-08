@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 import struct
 import threading
 import time
@@ -125,7 +126,16 @@ class DecodeStagingHandler:
         prefill_info = receiver.prefill_info
         prefill_tp = prefill_info.attn_tp_size
         if prefill_tp > self.decode_tp:
-            tp_writers = prefill_tp // max(1, self.decode_tp)
+            # MLA and hybrid-MLA latent KV is replicated across attention TP
+            # ranks. Decode pulls the full latent KV from one real prefill rank;
+            # the other ranks in the TP mapping are dummy participants.
+            if (
+                getattr(self.kv_manager, "is_mla_backend", False)
+                or getattr(self.kv_manager, "is_hybrid_mla_backend", False)
+            ):
+                tp_writers = 1
+            else:
+                tp_writers = prefill_tp // max(1, self.decode_tp)
         else:
             tp_writers = 1
         pp_writers = prefill_info.pp_size // self.kv_manager.pp_size
@@ -492,6 +502,13 @@ def handle_watermark_msg(staging_ctx, msg_parts) -> None:
     wm_round = int(msg_parts[1].decode("ascii"))
     wm_tail = int(msg_parts[2].decode("ascii"))
     wm_session = msg_parts[3].decode("ascii") if len(msg_parts) > 3 else ""
+    if os.environ.get("SGLANG_PD_STATE_DIAG"):
+        logger.info(
+            "STAGING_DIAG recv WATERMARK session=%s round=%s tail=%s",
+            wm_session,
+            wm_round,
+            wm_tail,
+        )
     with staging_ctx.watermark_cv:
         prev = staging_ctx.remote_watermarks.get(wm_session, (0, 0))
         if (wm_round, wm_tail) > prev:
@@ -512,6 +529,18 @@ def handle_staging_rsp(msg_parts, transfer_infos: dict) -> None:
     stg_session = msg_parts[6].decode("ascii")
     room_infos = transfer_infos.get(stg_room, {})
     tinfo = room_infos.get(stg_session)
+    if os.environ.get("SGLANG_PD_STATE_DIAG"):
+        logger.info(
+            "STAGING_DIAG recv STAGING_RSP room=%s chunk=%s session=%s "
+            "offset=%s round=%s end=%s tinfo_present=%s",
+            stg_room,
+            stg_chunk_idx,
+            stg_session,
+            stg_offset,
+            stg_round,
+            stg_end,
+            tinfo is not None,
+        )
     if tinfo is not None:
         if tinfo.staging is None:
             tinfo.staging = StagingTransferInfo()
@@ -936,11 +965,18 @@ def prefetch_staging_reqs(
     staging_requested: set,
     prefetch_sockets: dict,
     requester_pp_rank: Optional[int] = None,
-) -> None:
-    """Send STAGING_REQ for all chunks before the prefill forward starts.
+    max_new_chunks_per_session: Optional[int] = None,
+    socket_getter=None,
+) -> int:
+    """Send STAGING_REQ messages before the prefill forward starts.
 
     Called from the scheduler right after batch formation, so that decode
-    allocates staging during the GPU forward pass.
+    allocates staging during the GPU forward pass. By default every chunk is
+    requested for compatibility with existing backends. A positive
+    ``max_new_chunks_per_session`` bounds each call for transports that advance
+    a sliding allocation window as chunks complete.
+
+    Returns the number of new requests sent.
     """
     import zmq
 
@@ -949,6 +985,13 @@ def prefetch_staging_reqs(
 
     page_size = kv_buffer_tensors["page_size"]
     full_chunk_pages = staging_grid_tokens(chunked_prefill_size, page_size) // page_size
+    if (
+        max_new_chunks_per_session is not None
+        and max_new_chunks_per_session <= 0
+    ):
+        raise ValueError("max_new_chunks_per_session must be positive")
+
+    num_requested = 0
 
     for session_id, tinfo in transfer_infos[room].items():
         # mooncake exposes is_dummy as a dataclass bool field, NIXL exposes it
@@ -963,6 +1006,7 @@ def prefetch_staging_reqs(
         if total_pages == 0:
             continue
         num_chunks = (total_pages + full_chunk_pages - 1) // full_chunk_pages
+        session_requested = 0
 
         for chunk_idx in range(num_chunks):
             stg_key = (room, chunk_idx, session_id)
@@ -975,12 +1019,16 @@ def prefetch_staging_reqs(
             try:
                 na = NetworkAddress(tinfo.endpoint, tinfo.dst_port)
                 ep = na.to_tcp()
-                if ep not in prefetch_sockets:
-                    sock = zmq.Context().socket(zmq.PUSH)
-                    if na.is_ipv6:
-                        sock.setsockopt(zmq.IPV6, 1)
-                    sock.connect(ep)
-                    prefetch_sockets[ep] = sock
+                if socket_getter is not None:
+                    sock = socket_getter(ep, is_ipv6=na.is_ipv6)
+                else:
+                    if ep not in prefetch_sockets:
+                        sock = zmq.Context().socket(zmq.PUSH)
+                        if na.is_ipv6:
+                            sock.setsockopt(zmq.IPV6, 1)
+                        sock.connect(ep)
+                        prefetch_sockets[ep] = sock
+                    sock = prefetch_sockets[ep]
                 request = [
                     b"STAGING_REQ",
                     str(room).encode("ascii"),
@@ -990,6 +1038,32 @@ def prefetch_staging_reqs(
                 ]
                 if requester_pp_rank is not None:
                     request.append(str(requester_pp_rank).encode("ascii"))
-                prefetch_sockets[ep].send_multipart(request)
+                sock.send_multipart(request)
+                num_requested += 1
+                session_requested += 1
+                if os.environ.get("SGLANG_PD_STATE_DIAG"):
+                    logger.info(
+                        "STAGING_DIAG send STAGING_REQ room=%s chunk=%s "
+                        "pages=%s session=%s endpoint=%s requester_pp_rank=%s",
+                        room,
+                        chunk_idx,
+                        chunk_pages,
+                        session_id,
+                        ep,
+                    requester_pp_rank,
+                )
+                if (
+                    max_new_chunks_per_session is not None
+                    and session_requested >= max_new_chunks_per_session
+                ):
+                    break
             except Exception:
                 staging_requested.discard(stg_key)
+                logger.exception(
+                    "Failed to send STAGING_REQ room=%s chunk=%s session=%s",
+                    room,
+                    chunk_idx,
+                    session_id,
+                )
+
+    return num_requested

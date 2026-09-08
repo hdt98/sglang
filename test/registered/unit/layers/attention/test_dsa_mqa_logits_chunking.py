@@ -14,7 +14,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from sglang.srt.layers.attention.dsa import dsa_indexer  # noqa: E402
+from sglang.srt.layers.attention.dsa import dsa_indexer, dsa_indexer_kpool  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -53,6 +53,18 @@ def test_a_smaller_memory_budget_still_wins():
 def test_off_rocm_the_budget_is_untouched():
     # Elsewhere the logits go to DeepGEMM, which has no such limit.
     assert _decide(16_384, 32_768, is_hip=False) == (False, HUGE_MEM_BUDGET)
+
+
+def test_kpool_rows_stay_strictly_below_the_aiter_ceiling():
+    rows_per_chunk = dsa_indexer_kpool.IndexerKPool._mqa_logits_rows_per_chunk
+    assert rows_per_chunk(16_384, 32_768) == 16_383
+    assert rows_per_chunk(16_384, 32_767) == 16_384
+
+
+def test_kpool_empty_logits_need_no_chunking():
+    rows_per_chunk = dsa_indexer_kpool.IndexerKPool._mqa_logits_rows_per_chunk
+    assert rows_per_chunk(0, 32_768) == 0
+    assert rows_per_chunk(16_384, 0) == 16_384
 
 
 if __name__ == "__main__":

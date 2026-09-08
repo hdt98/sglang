@@ -61,6 +61,7 @@ from sglang.srt.disaggregation.common.staging_handler import (
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     build_dsa_tail_transfer_blocks,
+    compute_mamba_state_slice_byte_blocks,
     pair_mamba_state_indices,
     slice_dsa_tail_dst_ptrs_for_pp,
 )
@@ -250,12 +251,13 @@ class TransferInfo:
         else:
             decode_prefix_len = None
 
-        # A transfer is "dummy" only when the receiver does not need any
-        # kv/aux/state delivered. When decode_prefix_len > 0 and the delta is
-        # exactly zero (full prefix hit), dst_kv_indices is empty but aux is
-        # still needed -> not dummy.
+        # A transfer is "dummy" for KV/aux when the receiver does not need
+        # either delivered. Hybrid-MLA TP-mismatch dummy ranks can still carry
+        # Mamba state, so state does not flip the KV role.
         is_dummy = (
-            dst_kv_indices.size == 0 and dst_aux_index < 0 and not decode_prefix_len
+            dst_kv_indices.size == 0
+            and dst_aux_index < 0
+            and not decode_prefix_len
         )
         return cls(
             room=room,
@@ -596,6 +598,16 @@ class MoriKVManager(CommonKVManager):
             self.kv_args.gpu_id,
             MemoryLocationType.GPU,
         )
+        if os.environ.get("SGLANG_PD_STATE_DIAG"):
+            logger.info(
+                "Mori diagnostic staging registration: rank=%s ptr=%#x "
+                "length=%s desc=(%s) %s",
+                self.attn_tp_rank,
+                allocator.get_base_ptr(),
+                allocator.get_total_size(),
+                self._memory_desc_fields(self.staging_mem_desc),
+                self._memory_desc_ipc_fields(self.staging_mem_desc),
+            )
         self._staging_ctx.allocator = allocator
 
     def register_staging_room_bootstrap(self, room, bootstrap_infos, receiver) -> None:
@@ -727,6 +739,14 @@ class MoriKVManager(CommonKVManager):
             )
         )
 
+    @staticmethod
+    def _memory_desc_ipc_fields(desc: MemoryDesc) -> str:
+        """Return serialized IPC details unavailable through Mori's pybind API."""
+        fields = msgspec.msgpack.decode(bytes(desc.pack()))
+        if not isinstance(fields, list) or len(fields) < 10:
+            return "ipc_offset=unavailable, ipc_handle=unavailable"
+        return f"ipc_offset={fields[9]}, ipc_handle={bytes(fields[7]).hex()}"
+
     def _log_registered_ranges(self) -> None:
         for index, (ptr, length, desc) in enumerate(
             zip(
@@ -811,6 +831,22 @@ class MoriKVManager(CommonKVManager):
         self, kv_chunk: TransferKVChunk, queue: Optional[FastQueue] = None
     ) -> None:
         room = kv_chunk.room
+        if os.environ.get("SGLANG_PD_STATE_DIAG") and not getattr(
+            kv_chunk, "_diag_started", False
+        ):
+            kv_chunk._diag_started = True
+            logger.info(
+                "MORI_PD_DIAG worker start rank=%s room=%s slice=%s:%s "
+                "last=%s status=%s infos=%s staging=%s",
+                self.attn_tp_rank,
+                room,
+                kv_chunk.index_slice.start,
+                kv_chunk.index_slice.stop,
+                kv_chunk.is_last_chunk,
+                self.request_status.get(room),
+                list(self.transfer_infos.get(room, {}).keys()),
+                self.enable_staging,
+            )
         if self._should_skip_transfer(room):
             return
 
@@ -820,9 +856,27 @@ class MoriKVManager(CommonKVManager):
         if self._should_skip_transfer(room):
             return
 
-        if self.enable_staging and not self._staging_room_ready(
-            room, kv_chunk.index_slice
-        ):
+        # A full decode-prefix hit still transfers state/aux, but allocates no KV staging.
+        has_kv_pages = len(kv_chunk.prefill_kv_indices) > 0
+        staging_ready = (
+            not self.enable_staging
+            or not has_kv_pages
+            or self._staging_room_ready(room, kv_chunk.index_slice)
+        )
+        if self.enable_staging and not staging_ready:
+            if os.environ.get("SGLANG_PD_STATE_DIAG") and not getattr(
+                kv_chunk, "_diag_wait_logged", False
+            ):
+                kv_chunk._diag_wait_logged = True
+                logger.info(
+                    "MORI_PD_DIAG worker wait-staging rank=%s room=%s "
+                    "slice=%s:%s infos=%s",
+                    self.attn_tp_rank,
+                    room,
+                    kv_chunk.index_slice.start,
+                    kv_chunk.index_slice.stop,
+                    list(self.transfer_infos.get(room, {}).keys()),
+                )
             with self._staging_ctx.watermark_cv:
                 self._staging_ctx.watermark_cv.wait(
                     STAGING_WATERMARK_WAIT_S
@@ -857,13 +911,15 @@ class MoriKVManager(CommonKVManager):
             self._conclude_room_failure(room, failure_reason)
             return
 
-        if self.enable_staging and target_infos:
+        if self.enable_staging and has_kv_pages and target_infos:
             self._send_chunk_ready(
                 [info for info in target_infos if not info.is_dummy],
                 room,
                 kv_chunk.index_slice,
                 len(kv_chunk.prefill_kv_indices),
             )
+            if not kv_chunk.is_last_chunk:
+                self._request_next_staging_chunks(room)
 
         if kv_chunk.is_last_chunk:
             self._notify_decode_for_room(
@@ -960,7 +1016,18 @@ class MoriKVManager(CommonKVManager):
     def _prefetch_staging_reqs(self, room: int) -> None:
         if not self.enable_staging:
             return
-        prefetch_staging_reqs(
+        if room in self._staging_ctx.prefetched_rooms:
+            return
+
+        requested = self._request_next_staging_chunks(room)
+        if requested > 0:
+            self._staging_ctx.prefetched_rooms.add(room)
+
+    def _request_next_staging_chunks(self, room: int) -> int:
+        """Advance Mori's per-session staging allocation window by one chunk."""
+        if room not in self.transfer_infos:
+            return 0
+        return prefetch_staging_reqs(
             room,
             self.transfer_infos,
             {"page_size": self.kv_args.page_size},
@@ -968,6 +1035,8 @@ class MoriKVManager(CommonKVManager):
             self._staging_ctx.prefetch_requested,
             self._staging_ctx.prefetch_sockets,
             requester_pp_rank=self.pp_rank,
+            max_new_chunks_per_session=1,
+            socket_getter=self._connect_threadsafe,
         )
 
     def _release_completed_chunk_mappings(self) -> None:
@@ -1072,6 +1141,19 @@ class MoriKVManager(CommonKVManager):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
 
+        if os.environ.get("SGLANG_PD_STATE_DIAG"):
+            logger.info(
+                "MORI_PD_DIAG enqueue rank=%s room=%s slice=%s:%s last=%s "
+                "status=%s infos=%s",
+                self.attn_tp_rank,
+                bootstrap_room,
+                index_slice.start,
+                index_slice.stop,
+                is_last_chunk,
+                self.request_status.get(bootstrap_room),
+                list(self.transfer_infos.get(bootstrap_room, {}).keys()),
+            )
+
         if (
             bootstrap_room not in self.request_status
             or self.check_status(bootstrap_room) == KVPoll.Failed
@@ -1082,6 +1164,12 @@ class MoriKVManager(CommonKVManager):
             return
 
         if bootstrap_room not in self.transfer_infos:
+            if os.environ.get("SGLANG_PD_STATE_DIAG"):
+                logger.warning(
+                    "MORI_PD_DIAG drop-no-transfer-info rank=%s room=%s",
+                    self.attn_tp_rank,
+                    bootstrap_room,
+                )
             return
 
         shard_idx = bootstrap_room % self._num_shards
@@ -1312,6 +1400,17 @@ class MoriKVManager(CommonKVManager):
                             if len(msg) > 6
                             else "unknown"
                         )
+                        if os.environ.get("SGLANG_PD_STATE_DIAG"):
+                            logger.info(
+                                "STAGING_DIAG recv CHUNK_READY rank=%s room=%s "
+                                "chunk=%s page_start=%s pages=%s writer=%s",
+                                self.attn_tp_rank,
+                                room,
+                                chunk_idx,
+                                page_start,
+                                num_pages,
+                                writer_id,
+                            )
                         self._staging_handler.handle_chunk_arrived(
                             room,
                             chunk_idx,
@@ -1353,6 +1452,16 @@ class MoriKVManager(CommonKVManager):
                         )
                         if len(tracker) >= expected:
                             self.prefill_response_tracker.pop(bootstrap_room, None)
+                            if (
+                                self.enable_staging
+                                and self._staging_handler is not None
+                                and self._staging_handler.is_staging_room(
+                                    bootstrap_room
+                                )
+                            ):
+                                self._staging_handler.submit_last_scatter_async(
+                                    bootstrap_room
+                                )
                             self.update_status(bootstrap_room, KVPoll.Success)
                             self._cleanup_room_tracking(bootstrap_room)
                     elif status_code == KVPoll.Failed:
@@ -1610,11 +1719,19 @@ class MoriKVManager(CommonKVManager):
         # Reuse grouped indices across all layers/tensors that share the same item length.
         return grouped_plan.materialize(item_len)
 
-    def _build_tp_slice_config(self, peer_info: KVArgsRegisterInfo) -> TPSliceConfig:
+    def _build_tp_slice_config(
+        self,
+        peer_info: KVArgsRegisterInfo,
+        src_item_len: Optional[int] = None,
+        dst_item_len: Optional[int] = None,
+    ) -> TPSliceConfig:
         page_size = self.kv_args.page_size
-
-        src_item_len = self.kv_args.kv_item_lens[0]
-        dst_item_len = peer_info.dst_kv_item_len
+        src_item_len = (
+            self.kv_args.kv_item_lens[0] if src_item_len is None else src_item_len
+        )
+        dst_item_len = (
+            peer_info.dst_kv_item_len if dst_item_len is None else dst_item_len
+        )
 
         bytes_per_token_src = src_item_len // page_size
         bytes_per_token_dst = dst_item_len // page_size
@@ -1715,6 +1832,43 @@ class MoriKVManager(CommonKVManager):
 
         if not local_offsets:
             return BatchTransferPlan([], [], [])
+
+        return BatchTransferPlan(
+            local_offsets=local_offsets,
+            remote_offsets=remote_offsets,
+            sizes=sizes,
+        )
+
+    def _build_staged_tp_slice_transfer_plan(
+        self,
+        grouped_plan: GroupedIndexPlan,
+        tp_cfg: TPSliceConfig,
+        staging_offset: int,
+        layer_offset: int,
+    ) -> BatchTransferPlan:
+        local_offsets: List[int] = []
+        remote_offsets: List[int] = []
+        sizes: List[int] = []
+
+        for src_start, dst_start, count in zip(
+            grouped_plan.src_starts,
+            grouped_plan.dst_starts,
+            grouped_plan.counts,
+        ):
+            for page_idx in range(count):
+                local_offsets.append(
+                    (src_start + page_idx) * tp_cfg.src_item_len
+                    + tp_cfg.src_head_slice_offset
+                )
+                remote_offsets.append(
+                    staging_offset
+                    + layer_offset
+                    + (dst_start + page_idx) * tp_cfg.dst_item_len
+                    + tp_cfg.dst_head_slice_offset
+                )
+                sizes.append(
+                    tp_cfg.page_size * tp_cfg.heads_bytes_per_token_to_send
+                )
 
         return BatchTransferPlan(
             local_offsets=local_offsets,
@@ -1867,13 +2021,6 @@ class MoriKVManager(CommonKVManager):
                 f"prefill={num_target}, decode="
                 f"{peer_info.dst_num_target_kv_entries}"
             )
-        if list(self.kv_args.kv_item_lens[:num_target]) != list(
-            peer_info.dst_kv_item_lens[:num_target]
-        ):
-            raise ValueError(
-                "Mori staged transfer target item lengths do not match "
-                "between prefill and decode"
-            )
         if len(self.kv_mem_descs) < num_target:
             raise ValueError(
                 "Mori staged transfer source descriptor count is too small: "
@@ -1881,6 +2028,55 @@ class MoriKVManager(CommonKVManager):
             )
         if peer_info.staging_mem_desc is None:
             raise RuntimeError("Mori staging descriptor is missing")
+
+        num_local = len(self.kv_mem_descs)
+        if len(peer_info.dst_kv_mem_descs) != num_local:
+            raise ValueError(
+                "Mori staged transfer descriptor count mismatch: "
+                f"prefill={num_local}, decode={len(peer_info.dst_kv_mem_descs)}"
+            )
+
+        tp_mismatch = peer_info.decode_tp_size != self.attn_tp_size and not (
+            getattr(self, "is_mla_backend", False)
+            or getattr(self, "is_hybrid_mla_backend", False)
+        )
+        if tp_mismatch:
+            for layer_id, (src_item_len, dst_item_len) in enumerate(
+                zip(self.kv_args.kv_item_lens, peer_info.dst_kv_item_lens)
+            ):
+                if (
+                    src_item_len * self.attn_tp_size
+                    != dst_item_len * peer_info.decode_tp_size
+                ):
+                    raise ValueError(
+                        "Mori staged transfer TP item-length ratio mismatch at "
+                        f"descriptor {layer_id}: src={src_item_len}, "
+                        f"dst={dst_item_len}, prefill_tp="
+                        f"{self.attn_tp_size}, decode_tp="
+                        f"{peer_info.decode_tp_size}"
+                    )
+        elif list(self.kv_args.kv_item_lens) != list(peer_info.dst_kv_item_lens):
+            raise ValueError(
+                "Mori staged transfer item lengths do not match "
+                "between prefill and decode"
+            )
+
+        if os.environ.get("SGLANG_PD_STATE_DIAG"):
+            # hipIpcOpenMemHandle can be the first synchronizing HIP call after
+            # prefill.  Synchronize explicitly so an earlier asynchronous model
+            # fault is reported at its true boundary instead of being mistaken
+            # for a transport/import failure.
+            import torch
+
+            torch.cuda.synchronize(self.kv_args.gpu_id)
+            logger.info(
+                "Mori diagnostic pre-transfer synchronize succeeded: rank=%s "
+                "device=%s staging_desc=(%s) %s",
+                self.attn_tp_rank,
+                self.kv_args.gpu_id,
+                self._memory_desc_fields(peer_info.staging_mem_desc),
+                self._memory_desc_ipc_fields(peer_info.staging_mem_desc),
+            )
 
         dst_indices = np.arange(len(prefill_kv_indices), dtype=np.int32)
         grouped_plan = GroupedIndexPlan.from_groups(
@@ -1892,17 +2088,31 @@ class MoriKVManager(CommonKVManager):
 
         statuses: List[TransferStatus] = []
         layer_offset = 0
-        for layer_id in range(num_target):
-            item_len = self.kv_args.kv_item_lens[layer_id]
-            layer_plan = grouped_plan.materialize(item_len)
-            layer_plan = BatchTransferPlan(
-                local_offsets=layer_plan.local_offsets,
-                remote_offsets=[
-                    offset + staging_offset + layer_offset
-                    for offset in layer_plan.remote_offsets
-                ],
-                sizes=layer_plan.sizes,
-            )
+        for layer_id in range(num_local):
+            src_item_len = self.kv_args.kv_item_lens[layer_id]
+            dst_item_len = peer_info.dst_kv_item_lens[layer_id]
+            if tp_mismatch:
+                tp_cfg = self._build_tp_slice_config(
+                    peer_info,
+                    src_item_len=src_item_len,
+                    dst_item_len=dst_item_len,
+                )
+                layer_plan = self._build_staged_tp_slice_transfer_plan(
+                    grouped_plan,
+                    tp_cfg,
+                    staging_offset,
+                    layer_offset,
+                )
+            else:
+                layer_plan = grouped_plan.materialize(src_item_len)
+                layer_plan = BatchTransferPlan(
+                    local_offsets=layer_plan.local_offsets,
+                    remote_offsets=[
+                        offset + staging_offset + layer_offset
+                        for offset in layer_plan.remote_offsets
+                    ],
+                    sizes=layer_plan.sizes,
+                )
             statuses.extend(
                 self._submit_batch_transfer_plan(
                     self.kv_mem_descs[layer_id],
@@ -1911,7 +2121,8 @@ class MoriKVManager(CommonKVManager):
                     context=f"Mori staged KV descriptor {layer_id}",
                 )
             )
-            layer_offset += item_len
+            # Each descriptor occupies all pages of this chunk in staging.
+            layer_offset += len(prefill_kv_indices) * dst_item_len
         return statuses
 
     def copy_staged_kv_to_pool(
@@ -1922,7 +2133,7 @@ class MoriKVManager(CommonKVManager):
         if self.staging_mem_desc is None:
             raise RuntimeError("Mori local staging descriptor is missing")
 
-        num_target = self._num_target_kv_entries()
+        num_local = len(self.kv_mem_descs)
         src_indices = np.arange(len(dst_kv_indices), dtype=np.int32)
         grouped_plan = GroupedIndexPlan.from_groups(
             *group_concurrent_contiguous(
@@ -1933,7 +2144,7 @@ class MoriKVManager(CommonKVManager):
 
         statuses: List[TransferStatus] = []
         layer_offset = 0
-        for layer_id in range(num_target):
+        for layer_id in range(num_local):
             item_len = self.kv_args.kv_item_lens[layer_id]
             layer_plan = grouped_plan.materialize(item_len)
             layer_plan = BatchTransferPlan(
@@ -1952,7 +2163,7 @@ class MoriKVManager(CommonKVManager):
                     context=f"Mori staging-to-KV descriptor {layer_id}",
                 )
             )
-            layer_offset += item_len
+            layer_offset += len(dst_kv_indices) * item_len
 
         failure_reason = self._wait_transfer_completion(statuses)
         if failure_reason is not None:
@@ -2260,10 +2471,18 @@ class MoriKVManager(CommonKVManager):
         )
 
         tp_mismatch = peer_info.decode_tp_size != self.attn_tp_size
+        src_conv_shard_groups = getattr(
+            self.kv_args, "state_conv_shard_groups", []
+        )
+        src_slice_outer_counts = getattr(
+            self.kv_args, "state_slice_outer_counts", []
+        )
 
-        # If dim info missing, silently degrade to whole-item copy (Mooncake compat)
+        # If dim info is missing, degrade to the legacy whole-item copy.
         if tp_mismatch and (
-            not src_state_dim_per_tensor or not dst_state_dim_per_tensor
+            not src_state_dim_per_tensor
+            or not dst_state_dim_per_tensor
+            or not src_slice_outer_counts
         ):
             tp_mismatch = False
 
@@ -2287,6 +2506,26 @@ class MoriKVManager(CommonKVManager):
             dst_item_len = dst_state_item_lens[i]
             src_slot_stride = src_state_slot_strides[i]
             dst_slot_stride = dst_state_slot_strides[i]
+            src_dim = (
+                src_state_dim_per_tensor[i]
+                if i < len(src_state_dim_per_tensor)
+                else 0
+            )
+            dst_dim = (
+                dst_state_dim_per_tensor[i]
+                if i < len(dst_state_dim_per_tensor)
+                else 0
+            )
+            conv_shard_groups = (
+                src_conv_shard_groups[i]
+                if i < len(src_conv_shard_groups)
+                else None
+            )
+            slice_outer_count = (
+                src_slice_outer_counts[i]
+                if i < len(src_slice_outer_counts)
+                else 1
+            )
 
             local_offsets: List[int] = []
             remote_offsets: List[int] = []
@@ -2298,41 +2537,40 @@ class MoriKVManager(CommonKVManager):
                     dst_offset = dst_desc_offset + dst_idx * dst_slot_stride
                     size = src_item_len
                 else:
-                    # TP mismatch slice copy
-                    src_dim = src_state_dim_per_tensor[i]
-                    dst_dim = dst_state_dim_per_tensor[i]
-
-                    src_bytes_per_dim = src_item_len // src_dim
-
-                    if self.attn_tp_size > peer_info.decode_tp_size:
-                        src_dim_start = 0
-                        num_dims_to_send = src_dim
-                        writers_per_decode = (
-                            self.attn_tp_size // peer_info.decode_tp_size
+                    # Kimi/GDN conv state is [outer rows, TP-sharded channels],
+                    # with q/k/v sub-blocks sharded independently. A flat slice
+                    # would send writer 1 into the next Mamba slot.
+                    for (
+                        src_slice_offset,
+                        dst_slice_offset,
+                        bytes_to_send,
+                    ) in compute_mamba_state_slice_byte_blocks(
+                        src_item_len=src_item_len,
+                        dst_item_len=dst_item_len,
+                        src_dim=src_dim,
+                        dst_dim=dst_dim,
+                        outer_count=slice_outer_count,
+                        src_attn_tp_size=self.attn_tp_size,
+                        dst_attn_tp_size=peer_info.decode_tp_size,
+                        dst_tp_rank_in_group=dst_tp_rank,
+                        local_tp_rank_in_group=local_tp_rank,
+                        conv_shard_groups=conv_shard_groups,
+                    ):
+                        src_offset = (
+                            src_desc_offset
+                            + src_idx * src_slot_stride
+                            + src_slice_offset
                         )
-                        local_writer_idx = local_tp_rank % writers_per_decode
-                        dst_dim_start = local_writer_idx * src_dim
-                    else:
-                        src_dim_start = (dst_tp_rank * dst_dim) % src_dim
-                        num_dims_to_send = dst_dim
-                        dst_dim_start = 0
+                        dst_offset = (
+                            dst_desc_offset
+                            + dst_idx * dst_slot_stride
+                            + dst_slice_offset
+                        )
+                        local_offsets.append(src_offset)
+                        remote_offsets.append(dst_offset)
+                        sizes.append(bytes_to_send)
+                    continue
 
-                    dst_bytes_per_dim = dst_item_len // dst_dim
-                    src_dim_offset = src_dim_start * src_bytes_per_dim
-                    dst_dim_offset = dst_dim_start * dst_bytes_per_dim
-                    bytes_to_send = num_dims_to_send * src_bytes_per_dim
-
-                    src_offset = (
-                        src_desc_offset + src_idx * src_slot_stride + src_dim_offset
-                    )
-                    dst_offset = (
-                        dst_desc_offset + dst_idx * dst_slot_stride + dst_dim_offset
-                    )
-                    size = bytes_to_send
-
-                local_offsets.append(src_offset)
-                remote_offsets.append(dst_offset)
-                sizes.append(size)
 
             statuses.extend(
                 self._submit_batch_transfer_plan(
@@ -2453,6 +2691,12 @@ class MoriKVManager(CommonKVManager):
             )
             return
 
+        # A receiver lookup followed by assign/publication must not race room
+        # teardown, or the allocation can outlive its only owner and pin the ring.
+        with self.transfer_lock:
+            self._allocate_staging_req(msg)
+
+    def _allocate_staging_req(self, msg: List[bytes]) -> None:
         room = int(msg[1].decode("ascii"))
         chunk_idx = int(msg[2].decode("ascii"))
         chunk_num_pages = int(msg[3].decode("ascii"))
@@ -2462,6 +2706,18 @@ class MoriKVManager(CommonKVManager):
         )
 
         receiver = self._staging_ctx.room_receivers.get(room)
+        if os.environ.get("SGLANG_PD_STATE_DIAG"):
+            logger.info(
+                "STAGING_DIAG recv STAGING_REQ rank=%s room=%s chunk=%s "
+                "pages=%s session=%s receiver_present=%s requester_pp_rank=%s",
+                self.attn_tp_rank,
+                room,
+                chunk_idx,
+                chunk_num_pages,
+                session_id,
+                receiver is not None,
+                requester_pp_rank,
+            )
         if receiver is None:
             logger.warning(
                 "Mori STAGING_REQ has no registered receiver: room=%s chunk=%s",
@@ -2485,10 +2741,7 @@ class MoriKVManager(CommonKVManager):
             alloc_round = 0
             alloc_end = -1
         else:
-            num_target = self._num_target_kv_entries()
-            required = chunk_num_pages * sum(
-                self.kv_args.kv_item_lens[:num_target]
-            )
+            required = chunk_num_pages * sum(self.kv_args.kv_item_lens)
             result = self._staging_ctx.allocator.assign(required)
             if result is None:
                 logger.error(
@@ -2541,6 +2794,19 @@ class MoriKVManager(CommonKVManager):
         requester_pp_rank: Optional[int],
     ) -> None:
         bootstrap_infos = self._staging_ctx.room_bootstrap.get(room, [])
+        if os.environ.get("SGLANG_PD_STATE_DIAG"):
+            logger.info(
+                "STAGING_DIAG send STAGING_RSP rank=%s room=%s chunk=%s "
+                "offset=%s round=%s end=%s session=%s bootstrap_peers=%s",
+                self.attn_tp_rank,
+                room,
+                chunk_idx,
+                offset,
+                alloc_round,
+                alloc_end,
+                session_id,
+                len(bootstrap_infos),
+            )
         for bootstrap_info in bootstrap_infos:
             if (
                 requester_pp_rank is not None
@@ -2614,7 +2880,7 @@ class MoriKVManager(CommonKVManager):
                 info = target.info
                 peer_info = target.peer_info
 
-                if not info.is_dummy:
+                if not info.is_dummy and len(kv_indices) > 0:
                     dst_indices_chunk = info.dst_kv_indices[index_slice]
                     staging_offset = None
                     if self.enable_staging:
@@ -2633,7 +2899,7 @@ class MoriKVManager(CommonKVManager):
                 if (
                     is_last_chunk
                     and state_indices is not None
-                    and not info.is_dummy
+                    and info.dst_state_indices
                     and self.state_mem_descs
                 ):
                     result_statuses.extend(
@@ -2664,7 +2930,11 @@ class MoriKVManager(CommonKVManager):
 
 
 class MoriDecodeStagingHandler(DecodeStagingHandler):
-    """Mori-specific staging handler for contiguous target-KV descriptors."""
+    """Mori-specific staging handler for contiguous target and draft KV."""
+
+    def unregister_decode_req(self, room: int) -> None:
+        with self.kv_manager.transfer_lock:
+            super().unregister_decode_req(room)
 
     @classmethod
     def create(cls, kv_manager, scheduler, tp_rank: int):
@@ -2837,6 +3107,13 @@ class MoriKVSender(CommonKVSender):
         super().clear()
         with self.kv_mgr._room_notify_lock:
             self.kv_mgr._room_status_notified.pop(self.bootstrap_room, None)
+        if self.kv_mgr.enable_staging and self.kv_mgr._staging_ctx is not None:
+            self.kv_mgr._staging_ctx.prefetched_rooms.discard(self.bootstrap_room)
+            self.kv_mgr._staging_ctx.prefetch_requested = {
+                key
+                for key in self.kv_mgr._staging_ctx.prefetch_requested
+                if key[0] != self.bootstrap_room
+            }
 
     def failure_exception(self):
         if self.conclude_state is None:
@@ -2875,13 +3152,6 @@ class MoriKVReceiver(CommonKVReceiver):
             return
         if self.kv_mgr.enable_staging:
             self.require_staging = True
-            if self.prefill_info.attn_tp_size != self.kv_mgr.attn_tp_size:
-                raise RuntimeError(
-                    "Mori staging intake currently requires matching prefill and "
-                    f"decode attention TP sizes (prefill="
-                    f"{self.prefill_info.attn_tp_size}, decode="
-                        f"{self.kv_mgr.attn_tp_size})"
-                )
             if self.prefill_info.pp_size != self.kv_mgr.pp_size:
                 raise RuntimeError(
                     "Mori staging intake currently requires matching prefill and "
@@ -2992,9 +3262,19 @@ class MoriKVReceiver(CommonKVReceiver):
                 self,
             )
 
+        # Hybrid-MLA latent KV is replicated across prefill TP ranks, so only
+        # one rank is the real KV writer. Mamba state is still TP-sharded and
+        # must be delivered by every contributing prefill TP rank.
+        send_state_to_dummy_tp_rank = (
+            self.kv_mgr.is_hybrid_mla_backend
+            and self.prefill_info is not None
+            and self.prefill_info.attn_tp_size != self.kv_mgr.attn_tp_size
+        )
         for bootstrap_info in self.bootstrap_infos:
             is_dummy = bootstrap_info.get("is_dummy", False)
-            if not is_dummy and normalized_state is not None:
+            if (
+                not is_dummy or send_state_to_dummy_tp_rank
+            ) and normalized_state is not None:
                 state_bytes = _pack_state_indices(normalized_state)
             else:
                 state_bytes = b""

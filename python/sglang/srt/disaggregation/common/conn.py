@@ -714,8 +714,18 @@ class CommonKVManager(BaseKVManager):
             # or the KVPoll will never be set correctly
             target_tp_rank = target_tp_ranks[0]
             required_dst_info_num = 1
-            if self.is_mla_backend:
-                required_prefill_response_num = 1
+            if self.is_mla_backend or self.is_hybrid_mla_backend:
+                # Hybrid-MLA latent KV needs only one real TP writer, but its
+                # Mamba state is TP-sharded. Wait for every contributing TP rank
+                # when state transfer is present.
+                if self.is_hybrid_mla_backend and getattr(
+                    self, "state_mem_descs", None
+                ):
+                    required_prefill_response_num = (
+                        info.attn_tp_size // self.attn_tp_size
+                    )
+                else:
+                    required_prefill_response_num = 1
             else:
                 required_prefill_response_num = info.attn_tp_size // self.attn_tp_size
 
@@ -1193,6 +1203,7 @@ class CommonKVSender(BaseKVSender):
         self._transfer_metric = KVTransferMetric()
         self._transfer_num_kv_indices = 0
         self._transfer_num_state_indices = 0
+        self._transfer_state_bytes = 0
         # inner state
         self.curr_idx = 0
         self.init_time: Optional[float] = None
@@ -1254,9 +1265,9 @@ class CommonKVSender(BaseKVSender):
         return num_pages > 0 or last_chunk
 
     def get_transfer_metric(self) -> KVTransferMetric:
-        total_bytes = self._transfer_num_kv_indices * self.kv_mgr.kv_item_lens_sum
-        total_bytes += (
-            self._transfer_num_state_indices * self.kv_mgr.state_item_lens_sum
+        total_bytes = (
+            self._transfer_num_kv_indices * self.kv_mgr.kv_item_lens_sum
+            + self._transfer_state_bytes
         )
         # Pinned to 1 for MHA (disjoint slices); only MLA replication makes it > 1.
         total_bytes *= self.kv_mgr.get_kv_replica_factor()
@@ -1270,9 +1281,18 @@ class CommonKVSender(BaseKVSender):
     ):
         self._transfer_num_kv_indices += len(kv_indices)
         if state_indices:
-            for component_indices in state_indices:
+            state_item_lens = self.kv_mgr.kv_args.state_item_lens
+            for component_id, component_indices in enumerate(state_indices):
                 if component_indices is not None:
                     self._transfer_num_state_indices += len(component_indices)
+                    component_item_lens = (
+                        state_item_lens[component_id]
+                        if component_id < len(state_item_lens)
+                        else []
+                    )
+                    self._transfer_state_bytes += len(component_indices) * sum(
+                        component_item_lens
+                    )
 
     def _prepare_send_indices(
         self,
@@ -1437,7 +1457,10 @@ class CommonKVReceiver(BaseKVReceiver):
                             target_pp_rank,
                         )
                         if bootstrap_info is not None:
-                            if self.kv_mgr.is_mla_backend:
+                            if (
+                                self.kv_mgr.is_mla_backend
+                                or self.kv_mgr.is_hybrid_mla_backend
+                            ):
                                 # For MLA: target_tp_rank is the selected real rank, others are dummy ranks
                                 bootstrap_info["is_dummy"] = not bool(
                                     target_tp_rank == self.target_tp_rank

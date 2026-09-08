@@ -1027,8 +1027,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Fancy indexing returns a fresh tensor (detached from the buffer).
             dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
 
-        # Reorganize the spec info for the next batch
-        if not can_run_decode_cuda_graph:
+        # Reorganize the spec info for the next batch. ROCm deliberately keeps
+        # selected-row gathering outside the graph because hipGraph does not
+        # reliably replay the dynamic gather indices.
+        graph_selected_rows = (
+            can_run_decode_cuda_graph
+            and self.cuda_graph_runner_for_draft_extend.select_rows_in_graph
+        )
+        if not graph_selected_rows:
             draft_logits_output.next_token_logits = (
                 draft_logits_output.next_token_logits[select_index]
             )
@@ -1333,7 +1339,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         positions = batch.seq_lens.to(torch.int64)
 
         return EagleVerifyInput(
-            draft_token=draft_input.bonus_tokens,
+            # The zero-step path bypasses the regular tree builder, which
+            # normally normalizes candidate IDs to the verifier's int64 ABI.
+            draft_token=draft_input.bonus_tokens.to(dtype=torch.long),
             custom_mask=custom_mask,
             positions=positions,
             retrieve_index=retrieve_index,

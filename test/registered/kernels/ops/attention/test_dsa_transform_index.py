@@ -5,6 +5,7 @@ import torch
 
 import sglang.kernels.ops.attention.dsa.transform_index as transform_index_module
 from sglang.kernels.ops.attention.dsa.transform_index import (
+    transform_index_page_table_decode_ref,
     transform_index_page_table_decode_fast,
     transform_index_page_table_prefill_fast,
 )
@@ -227,6 +228,36 @@ class TestDSATransformIndex(CustomTestCase):
                     page_table_is_expanded=page_table_is_expanded,
                 )
 
+    def test_prefill_page_table_row_stride_is_not_specialized(self):
+        kernel = transform_index_module.transform_index_page_table_prefill_kernel
+        stride_param = next(
+            param for param in kernel.params if param.name == "page_table_stride_0"
+        )
+
+        self.assertFalse(stride_param.is_constexpr)
+        self.assertTrue(stride_param.do_not_specialize)
+
+    def test_prefill_dynamic_page_table_row_strides(self):
+        context_lengths = (4096, 4160, 4224)
+        kernel = transform_index_module.transform_index_page_table_prefill_kernel
+
+        self._check_case(
+            [2, 1],
+            context_lengths[0],
+            page_table_is_expanded=True,
+        )
+        kernel_cache = kernel.device_caches[torch.cuda.current_device()][0]
+        specialization_count = len(kernel_cache)
+
+        for context_length in context_lengths[1:]:
+            with self.subTest(context_length=context_length):
+                self._check_case(
+                    [2, 1],
+                    context_length,
+                    page_table_is_expanded=True,
+                )
+                self.assertEqual(len(kernel_cache), specialization_count)
+
     def test_decode_fast_correctness_and_strides(self):
         self._check_decode_case(17, 8192, provide_result=True)
         self._check_decode_case(17, 8192, zero_row_stride=True)
@@ -234,6 +265,27 @@ class TestDSATransformIndex(CustomTestCase):
     def test_decode_fast_extreme_shapes(self):
         self._check_decode_case(8192, 4096)
         self._check_decode_case(2, 1_000_000)
+
+    def test_decode_fast_nonstandard_topk_width(self):
+        rows = 3
+        context_length = 5000
+        topk = 2111
+        page_table = self._make_page_table(rows, context_length)
+        wide_topk = torch.full(
+            (rows, 4096), -1, dtype=torch.int32, device=self.device
+        )
+        topk_indices = wide_topk[:, :topk]
+        topk_indices[:, :1000] = torch.arange(1000, device=self.device).unsqueeze(0)
+        topk_indices[:, 1000:2000] = torch.arange(
+            1000, 2000, device=self.device
+        ).unsqueeze(0)
+        expected = transform_index_page_table_decode_ref(page_table, topk_indices)
+        actual = transform_index_page_table_decode_fast(
+            page_table=page_table,
+            topk_indices=topk_indices,
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

@@ -8,8 +8,8 @@ import unittest
 from types import SimpleNamespace
 
 import torch
-
 from sglang.srt.disaggregation.decode import DecodeRequest, DecodeTransferQueue
+from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -96,6 +96,7 @@ def _make_req(terminate_after: int) -> Req:
         origin_input_ids=[1, 2, 3],
         sampling_params=sp,
     )
+    req.vocab_size = 32_000
     req.grammar = _FakeGrammar(terminate_after=terminate_after)
     req.kv.kv_committed_len = 0
     return req
@@ -115,6 +116,8 @@ def _commit_disagg_handoff(
     token_id: int,
     *,
     replayed_boundary: bool = False,
+    fake_transfer: bool = False,
+    mamba_checkpoint_seqlen: int = 0,
 ) -> None:
     queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
     queue.scheduler = SimpleNamespace(batch_result_processor=processor)
@@ -122,7 +125,10 @@ def _commit_disagg_handoff(
     queue.metadata_buffers = SimpleNamespace(
         get_buf=lambda _: (
             torch.tensor([token_id], dtype=torch.long),
-            torch.zeros(7, dtype=torch.long),
+            torch.tensor(
+                [0, 0, 0, 0, 0, 0, 0, mamba_checkpoint_seqlen],
+                dtype=torch.long,
+            ),
             torch.zeros(1),
             torch.zeros(1, dtype=torch.long),
             torch.zeros(1),
@@ -137,7 +143,7 @@ def _commit_disagg_handoff(
             torch.tensor([1], dtype=torch.long),
         )
     )
-    req.bootstrap_host = "127.0.0.1"
+    req.bootstrap_host = FAKE_BOOTSTRAP_HOST if fake_transfer else "127.0.0.1"
     req.bootstrap_room = 1
     if replayed_boundary:
         req.pd_rebootstrap_forced_output_id = token_id
@@ -176,6 +182,21 @@ class TestSpecV2GrammarTruncation(CustomTestCase):
 
 
 class TestReasoningTokenAccounting(CustomTestCase):
+    def test_fake_handoff_ignores_stale_mamba_checkpoint_metadata(self):
+        req = _make_req(terminate_after=99)
+        processor = _make_processor()
+
+        _commit_disagg_handoff(
+            req,
+            processor,
+            token_id=17,
+            fake_transfer=True,
+            mamba_checkpoint_seqlen=36_288,
+        )
+
+        self.assertEqual(len(req.output_ids), 1)
+        self.assertIsNone(req.kv.pd_prompt_checkpoint_seqlen)
+
     def test_multi_token_end_can_span_decode_steps(self):
         req = _make_req(terminate_after=99)
         req.require_reasoning = True

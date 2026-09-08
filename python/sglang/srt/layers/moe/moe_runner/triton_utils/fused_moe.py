@@ -694,9 +694,9 @@ def _fused_moe_kernel_sequence(
             )
         elif swiglu_limit is not None:
             # DeepSeek V4: swiglu clamp before silu_and_mul.
-            # Two paths gated by SGLANG_OPT_SWIGLU_CLAMP_FUSION:
-            #   fusion=True: clamp fused into act_and_mul_triton or silu_and_mul_clamp
-            #   fusion=False: explicit clamp_ on intermediate_cache1 (path checker)
+            # CUDA/XPU can fuse the clamp into silu_and_mul_clamp. HIP does not
+            # provide that kernel, so retain the equivalent explicit clamp that
+            # existed before SGLANG_OPT_SWIGLU_CLAMP_FUSION was retired.
             assert swiglu_limit == 10
             assert intermediate_cache1.shape == (total_tokens, N)
             assert _is_cuda or _is_hip or _is_xpu, (
@@ -708,6 +708,12 @@ def _fused_moe_kernel_sequence(
 
             if filter_expert:
                 swiglu_limit_for_triton = swiglu_limit
+            elif _is_hip:
+                half = N // 2
+                intermediate_cache1[:, :half].clamp_(max=swiglu_limit)
+                intermediate_cache1[:, half:].clamp_(
+                    min=-swiglu_limit, max=swiglu_limit
+                )
             else:
                 assert _is_cuda or _is_xpu, (
                     "fused silu_and_mul_clamp kernel is CUDA/XPU only; HIP must disable SWIGLU_CLAMP_FUSION"

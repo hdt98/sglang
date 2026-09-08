@@ -910,7 +910,10 @@ class UnifiedRadixCache(BasePrefixCache):
             # Free unaligned tail (+ deferred truncation tail)
             ranges = [(page_aligned_len, len(kv_indices))]
             if tail_free_start is not None:
-                ranges.append((tail_free_start, len(kv_indices_full)))
+                if tail_free_start == ranges[-1][1]:
+                    ranges[-1] = (ranges[-1][0], len(kv_indices_full))
+                elif tail_free_start > page_aligned_len:
+                    ranges.append((tail_free_start, len(kv_indices_full)))
             self.free_kv_row(req.kv, ranges)
         else:
             self.free_kv_row(req.kv, [(req.kv.cache_protected_len, kv_len_to_handle)])

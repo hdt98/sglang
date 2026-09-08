@@ -861,6 +861,13 @@ class Envs:
     SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
+    # Fall back to torch's GEMM for unquantized linear layers while keeping
+    # AITER enabled for quantized kernels such as MXFP4 MoE.
+    SGLANG_ROCM_DISABLE_AITER_UNQUANTIZED_GEMM = EnvBool(False)
+    # Keep quantized AITER MoE enabled while routing unquantized expert layers
+    # through the deterministic Triton fallback. This also prevents the AITER
+    # weight shuffle, because Triton consumes the checkpoint layout directly.
+    SGLANG_ROCM_DISABLE_AITER_UNQUANTIZED_MOE = EnvBool(False)
     USE_ROCM_AITER_ROPE_BACKEND = EnvStr("0")
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.

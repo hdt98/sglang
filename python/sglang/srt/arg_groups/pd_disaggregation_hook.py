@@ -87,10 +87,16 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "with --disaggregation-transfer-backend fake"
                 )
             if cfg.speculative_algorithm is not None:
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache is incompatible "
-                    "with speculative decoding "
-                    f"(--speculative-algorithm {cfg.speculative_algorithm})"
+                speculative_algorithm = cfg.speculative_algorithm.upper()
+                if speculative_algorithm not in ("EAGLE", "NEXTN"):
+                    raise ValueError(
+                        "--disaggregation-decode-enable-radix-cache only supports "
+                        "EAGLE/NEXTN speculative decoding; got "
+                        f"--speculative-algorithm {cfg.speculative_algorithm}"
+                    )
+                logger.warning(
+                    "EXPERIMENTAL: PD decode radix cache with EAGLE/NEXTN. "
+                    "Prefill and decode must use matched EAGLE settings."
                 )
 
             if resolved_view(server_args).enable_dp_attention:

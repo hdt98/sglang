@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import logging
+import os
 import random
 from collections import deque
 from contextlib import nullcontext
@@ -48,6 +51,50 @@ if is_npu():
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 _IS_HIP = is_hip()
+logger = logging.getLogger(__name__)
+MAMBA_CHECKPOINT_SEQLEN_METADATA_SLOT = 7
+
+
+def log_pd_spec_metadata(
+    side: str,
+    *,
+    rid: str,
+    metadata_index: int,
+    bootstrap_room: int,
+    output_id: int,
+    topk_p: torch.Tensor,
+    topk_index: torch.Tensor,
+    hidden_states: torch.Tensor,
+) -> None:
+    """Fingerprint the exact EAGLE handoff payload when PD diagnostics are on."""
+    if not (
+        os.environ.get("SGLANG_PD_STATE_DIAG")
+        or os.environ.get("SGLANG_DIAG_BYPASS_HEALTH_GENERATE")
+    ):
+        return
+
+    digest = hashlib.sha256()
+    for tensor in (topk_p, topk_index, hidden_states):
+        raw = tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
+        digest.update(raw)
+    hidden_fp32 = hidden_states.detach().to(dtype=torch.float32, device="cpu")
+    logger.info(
+        "PD_SPEC_META side=%s rid=%s index=%s room=%s output_id=%s "
+        "topk_p=%s topk_index=%s hidden_shape=%s hidden_sum=%.9g "
+        "hidden_norm=%.9g hidden_head=%s digest=%s",
+        side,
+        rid,
+        metadata_index,
+        bootstrap_room,
+        output_id,
+        topk_p.detach().to(device="cpu").tolist(),
+        topk_index.detach().to(device="cpu").tolist(),
+        tuple(hidden_states.shape),
+        hidden_fp32.sum().item(),
+        hidden_fp32.norm().item(),
+        hidden_fp32[:8].tolist(),
+        digest.hexdigest()[:20],
+    )
 
 
 def pair_mamba_state_indices(src_indices, dst_indices) -> List[Tuple[int, int]]:
@@ -70,7 +117,7 @@ def pair_mamba_state_indices(src_indices, dst_indices) -> List[Tuple[int, int]]:
 
 
 def get_dsa_tail_state_indices(pool, req_pool_idx: int, seq_len: int) -> List[int]:
-    if getattr(pool, "use_dsa", False):
+    if getattr(pool, "use_dsa", False) and hasattr(pool, "full_kv_pool"):
         pool = pool.full_kv_pool
     if not pool.kpool_use_compress:
         return []
@@ -332,7 +379,7 @@ def get_mamba_state_transfer_indices(
 ) -> np.ndarray:
     """Return active and optional checkpoint Mamba rows in wire order."""
     active_index = torch.as_tensor(
-        req_to_token_pool.req_index_to_mamba_index_mapping[req.req_pool_idx]
+        req_to_token_pool.req_index_to_mamba_index_mapping[req.kv.req_pool_idx]
     ).reshape(-1)
     if active_index.numel() != 1:
         raise RuntimeError(
@@ -716,13 +763,15 @@ class MetadataBuffers:
             self.bootstrap_room[idx].clone(),
         )
 
-    def set_buf(self, req: Req):
+    def set_buf(self, req: Req, *, mamba_checkpoint_seqlen: int = 0):
 
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
         # counts and slots 4-6 are reused for multimodal prompt token counts
-        # (slots 7-15 remain spare). This avoids adding new RDMA buffers.
-        # Slot map: 0=cached 1=device 2=host 3=storage 4=image 5=audio 6=video.
+        # Slot 7 carries the optional PD Mamba checkpoint length; slots 8-15
+        # remain spare. This avoids adding a new RDMA buffer.
+        # Slot map: 0=cached 1=device 2=host 3=storage 4=image 5=audio 6=video
+        # 7=mamba checkpoint sequence length.
         self.cached_tokens[req.metadata_buffer_index][0] = req.cached_tokens
         self.cached_tokens[req.metadata_buffer_index][1] = req.cached_tokens_device
         self.cached_tokens[req.metadata_buffer_index][2] = req.cached_tokens_host
@@ -737,6 +786,9 @@ class MetadataBuffers:
         self.cached_tokens[req.metadata_buffer_index][4] = image_t
         self.cached_tokens[req.metadata_buffer_index][5] = audio_t
         self.cached_tokens[req.metadata_buffer_index][6] = video_t
+        self.cached_tokens[req.metadata_buffer_index][
+            MAMBA_CHECKPOINT_SEQLEN_METADATA_SLOT
+        ] = mamba_checkpoint_seqlen
         if req.return_logprob:
             if req.logprob.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (
@@ -831,6 +883,16 @@ class MetadataBuffers:
                     )
                 else:
                     self.output_dsa_topk_indices[req.metadata_buffer_index].fill_(-1)
+            log_pd_spec_metadata(
+                "sender",
+                rid=getattr(req, "rid", ""),
+                metadata_index=req.metadata_buffer_index,
+                bootstrap_room=req.bootstrap_room or 0,
+                output_id=req.output_ids[0],
+                topk_p=self.output_topk_p[req.metadata_buffer_index],
+                topk_index=self.output_topk_index[req.metadata_buffer_index],
+                hidden_states=self.output_hidden_states[req.metadata_buffer_index],
+            )
         # Store bootstrap_room for validation on decode side
         self.bootstrap_room[req.metadata_buffer_index, 0] = (
             req.bootstrap_room if req.bootstrap_room is not None else 0
@@ -1395,7 +1457,7 @@ def append_state_component(
 
 
 def get_dsa_tail_state_indices(pool, req_pool_idx: int, seq_len: int) -> List[int]:
-    if getattr(pool, "use_dsa", False):
+    if getattr(pool, "use_dsa", False) and hasattr(pool, "full_kv_pool"):
         pool = pool.full_kv_pool
     if not pool.kpool_use_compress:
         return []
@@ -1751,6 +1813,22 @@ def setup_state_kv_args(
                     dsa_item_lens,
                 )
                 append_dsa_tail(dsa_pool)
+
+                draft_dsa_pool = draft_token_to_kv_pool
+                if isinstance(draft_dsa_pool, HybridLinearKVPool):
+                    draft_dsa_pool = draft_dsa_pool.full_kv_pool
+                if isinstance(draft_dsa_pool, DSATokenToKVPool):
+                    draft_ptrs, draft_lens, draft_item_lens = (
+                        draft_dsa_pool.get_state_buf_infos()
+                    )
+                    append_state_component(
+                        kv_args,
+                        StateType.DSA,
+                        draft_ptrs,
+                        draft_lens,
+                        draft_item_lens,
+                    )
+                    append_dsa_tail(draft_dsa_pool)
         elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
             tail_ptrs, tail_lens, tail_item_lens = [], [], []
             if isinstance(token_to_kv_pool, DSATokenToKVPool):

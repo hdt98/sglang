@@ -41,6 +41,7 @@ def _make_kv_mgr(is_mla_backend):
     mgr.is_mla_backend = is_mla_backend
     mgr.kv_item_lens_sum = KV_ITEM_LENS_SUM
     mgr.state_item_lens_sum = STATE_ITEM_LENS_SUM
+    mgr.kv_args = SimpleNamespace(state_item_lens=[[STATE_ITEM_LENS_SUM]])
     mgr._kv_replica_factor = None if is_mla_backend else 1
     return mgr
 
@@ -65,6 +66,7 @@ def _make_sender(kv_mgr):
     sender._transfer_metric = KVTransferMetric()
     sender._transfer_num_kv_indices = 0
     sender._transfer_num_state_indices = 0
+    sender._transfer_state_bytes = 0
     sender.kv_mgr = kv_mgr
     return sender
 
@@ -96,6 +98,24 @@ class TestKVTransferReplicaMetric(CustomTestCase):
         self.assertEqual(
             sender.get_transfer_metric().transfer_total_bytes, 6 * KV_ITEM_LENS_SUM
         )
+
+    def test_state_bytes_are_counted_per_component(self):
+        # State components have different index counts and item sizes. The
+        # metric must sum count * component_item_bytes, not multiply the total
+        # index count by the sum of every component's item bytes.
+        mgr = _make_kv_mgr(is_mla_backend=False)
+        mgr.kv_args.state_item_lens = [[10, 20], [7]]
+        sender = _make_sender(mgr)
+
+        sender._record_transfer_indices(
+            np.arange(4, dtype=np.int32),
+            [
+                np.arange(2, dtype=np.int32),
+                np.arange(3, dtype=np.int32),
+            ],
+        )
+
+        self.assertEqual(sender.get_transfer_metric().transfer_total_bytes, 4 * 100 + 81)
 
     def test_unresolved_factor_does_not_crash_metric(self):
         # An empty room or a missing required_dst_info_num leaves the factor

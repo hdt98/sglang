@@ -33,6 +33,8 @@ from sglang.srt.disaggregation.mooncake.conn import (
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     get_dsv4_c128_state_indices,
+    get_dsa_tail_state_indices,
+    get_mamba_state_transfer_indices,
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
@@ -40,7 +42,15 @@ from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MambaPool
+from sglang.srt.mem_cache.kv_cache_configurator import (
+    KVCacheConfigurator,
+    mori_staging_reservation_gb,
+)
+from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
+    HybridLinearKVPool,
+    MambaPool,
+)
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.eagle_disaggregation import (
     build_eagle_disagg_draft_input,
@@ -51,6 +61,84 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestDisaggregationWire(unittest.TestCase):
+    def test_mori_decode_staging_is_reserved_from_the_kv_budget(self):
+        disagg = SimpleNamespace(
+            disaggregation_mode="decode",
+            disaggregation_transfer_backend="mori",
+        )
+        with (
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.get_disagg",
+                return_value=disagg,
+            ),
+            patch.object(
+                envs.SGLANG_MORI_STAGING_BUFFER, "get", return_value=True
+            ),
+            patch.object(
+                envs.SGLANG_MORI_STAGING_POOL_SIZE_MB, "get", return_value=4096
+            ),
+        ):
+            self.assertEqual(mori_staging_reservation_gb(), 4.0)
+
+        disagg.disaggregation_mode = "prefill"
+        with (
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.get_disagg",
+                return_value=disagg,
+            ),
+            patch.object(
+                envs.SGLANG_MORI_STAGING_BUFFER, "get", return_value=True
+            ),
+        ):
+            self.assertEqual(mori_staging_reservation_gb(), 0.0)
+
+    def test_plain_dsa_pool_covers_pd_decode_request_slots(self):
+        pool = SimpleNamespace(req_to_token=torch.empty((97, 1)))
+        sizes = SimpleNamespace(max_total_num_tokens=1024, max_running_requests=32)
+        expected = object()
+        configurator = SimpleNamespace(
+            use_mla_backend=True,
+            is_hybrid_swa=False,
+            mambaish_config=None,
+            is_draft_worker=True,
+            model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+            _validate_prefill_only_disable_kv_cache_pool_family=Mock(),
+            _build_dsa_kv_pool=Mock(return_value=expected),
+        )
+
+        with (
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.current_platform"
+            ) as platform,
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.get_exec",
+                return_value=SimpleNamespace(
+                    kernel=SimpleNamespace(attention_backend="dsa")
+                ),
+            ),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.get_memory",
+                return_value=SimpleNamespace(
+                    enable_page_major_kv_layout=False,
+                    enable_unified_memory=False,
+                ),
+            ),
+        ):
+            platform.is_out_of_tree.return_value = False
+            result = KVCacheConfigurator._build_token_to_kv_pool(
+                configurator,
+                sizes=sizes,
+                is_dsa_model=True,
+                is_dsv4_model=False,
+                req_to_token_pool=pool,
+            )
+
+        self.assertIs(result, expected)
+        configurator._build_dsa_kv_pool.assert_called_once_with(
+            max_total_num_tokens=1024,
+            max_running_requests=97,
+        )
+
     def test_mooncake_registration_staging_fields(self):
         msg = [
             b"room",
@@ -628,6 +716,73 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
                 self.assertEqual(kv_args.state_item_lens[-1], expected_infos[2])
 
 
+def _make_dsa_pool(*, state_ptr, tail_ptr):
+    pool = object.__new__(DSATokenToKVPool)
+    pool.use_dsa = True
+    pool.kpool_use_compress = True
+    pool.index_kpool = 256
+    pool.tail_extra_slots = 8
+    pool.get_state_buf_infos = lambda: _buf_infos(state_ptr)
+    pool.get_compress_tail_buf_infos = lambda: _buf_infos(tail_ptr)
+    return pool
+
+
+def _make_hybrid_dsa_pool(*, mamba_ptr, dsa_pool):
+    pool = object.__new__(HybridLinearKVPool)
+    pool.use_dsa = True
+    pool.full_kv_pool = dsa_pool
+    pool.get_state_buf_infos = lambda: _buf_infos(mamba_ptr)
+    pool.get_state_dim_per_tensor = lambda: []
+    pool.get_state_conv_shard_groups = lambda: []
+    pool.get_state_slice_outer_counts = lambda: []
+    pool.get_state_layer_ids = lambda: []
+    pool.get_state_registration_buf_infos = lambda: _buf_infos(mamba_ptr)[:2]
+    pool.get_state_slot_strides = lambda: []
+    return pool
+
+
+class TestHybridDSADraftStateRegistration(unittest.TestCase):
+    def test_bare_dsa_tail_indices_do_not_require_a_hybrid_wrapper(self):
+        pool = _make_dsa_pool(state_ptr=21, tail_ptr=31)
+
+        self.assertEqual(
+            get_dsa_tail_state_indices(pool, req_pool_idx=3, seq_len=65),
+            [3, 0, 65, 0, 0, 264],
+        )
+
+    def test_draft_dsa_state_is_registered_after_hybrid_target_state(self):
+        target_dsa = _make_dsa_pool(state_ptr=21, tail_ptr=31)
+        draft_dsa = _make_dsa_pool(state_ptr=41, tail_ptr=51)
+        target = _make_hybrid_dsa_pool(mamba_ptr=11, dsa_pool=target_dsa)
+
+        for name, draft in (
+            ("bare", draft_dsa),
+            (
+                "hybrid_wrapper",
+                _make_hybrid_dsa_pool(mamba_ptr=61, dsa_pool=draft_dsa),
+            ),
+        ):
+            with self.subTest(name=name):
+                kv_args = KVArgs()
+
+                setup_state_kv_args(kv_args, target, draft)
+
+                self.assertEqual(
+                    kv_args.state_types,
+                    [
+                        StateType.MAMBA,
+                        StateType.DSA,
+                        StateType.DSA_TAIL,
+                        StateType.DSA,
+                        StateType.DSA_TAIL,
+                    ],
+                )
+                self.assertEqual(
+                    kv_args.state_data_ptrs,
+                    [[11], [21], [31], [41], [51]],
+                )
+
+
 class TestHybridStateRegistration(unittest.TestCase):
     def test_registration_infos_match_transferable_mamba_views(self):
         pool = HybridLinearKVPool.__new__(HybridLinearKVPool)
@@ -665,6 +820,23 @@ class TestMambaStateSlotStrides(unittest.TestCase):
         # Each slot starts 10 float32 elements (40 bytes) apart, while one
         # state item is only 16 bytes.
         self.assertEqual(pool.get_state_slot_strides(), [40, 40])
+
+
+class TestMambaStateTransferIndices(unittest.TestCase):
+    def test_active_and_checkpoint_rows_use_request_kv_slot(self):
+        pool = SimpleNamespace(
+            req_index_to_mamba_index_mapping=torch.tensor([3, 5, 7]),
+            translate_mamba_indices=lambda indices: indices + 100,
+        )
+        req = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=1))
+
+        indices = get_mamba_state_transfer_indices(
+            pool,
+            req,
+            checkpoint_index=torch.tensor(9),
+        )
+
+        np.testing.assert_array_equal(indices, np.array([105, 109], dtype=np.int32))
 
 
 if __name__ == "__main__":

@@ -126,6 +126,10 @@ class TensorDumper:
 
     def _dump_hook(self, tensor_name, do_dump):
         def inner_dump_hook(module, input, output):
+            if os.getenv("SGLANG_DEBUG_TENSOR_DUMP_INPUTS", "0") == "1":
+                for index, item in enumerate(input):
+                    if isinstance(item, torch.Tensor):
+                        self.add_tensor(f"{tensor_name}.input{index}", item)
             if do_dump:
                 # This is the top-level model, so we will record the input for it.
                 for item in input:

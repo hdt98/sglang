@@ -49,6 +49,7 @@ from sglang.srt.utils import (
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils.common import is_hip
 from sglang.srt.utils.device_timer import device_timer_ctx
 
 if TYPE_CHECKING:
@@ -127,6 +128,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             if speculative_num_steps is None
             else speculative_num_steps
         )
+        # hipGraph currently mis-replays the dynamic selected-row gather used by
+        # draft extend. Keep the gather outside the graph on ROCm so the next
+        # draft step receives the accepted token's actual hidden state.
+        self.select_rows_in_graph = not is_hip()
         self.draft_extend_attn_backend = (
             draft_extend_attn_backend or eagle_worker.draft_extend_attn_backend
         )
@@ -245,7 +250,12 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
             next_token_logits_buffer = (
                 self.model_runner.graph_shared_output.get_logits_buffer(
-                    vocab_size, rows=self.max_bs
+                    vocab_size,
+                    rows=(
+                        self.max_bs
+                        if self.select_rows_in_graph
+                        else self.max_bs * self.captured_req_width
+                    ),
                 )
             )
 
@@ -367,19 +377,23 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         num_correct_drafts = buffers.num_correct_drafts[:bs]
         num_accept_tokens = buffers.num_accept_tokens[:bs]
         select_index = buffers.select_index[:bs]
-        next_token_logits_buffer = buffers.next_token_logits_buffer[:bs]
 
-        # The worker samples only the last accepted row from each request.
-        # Keep the full tree width for the draft forward, but run the lm_head
-        # and logits path on those selected rows only.
-        num_tokens_for_logprob = bs
+        # The worker samples only the last accepted row from each request. CUDA
+        # selects those rows before lm_head; ROCm keeps the gather outside the
+        # graph because hipGraph does not reliably replay its dynamic indices.
+        num_tokens_for_logprob = bs if self.select_rows_in_graph else num_tokens
+        next_token_logits_buffer = buffers.next_token_logits_buffer[
+            :num_tokens_for_logprob
+        ]
 
         if self.require_mlp_tp_gather:
             global_num_tokens_cpu = [num_tokens] * self.attn_dp_size
-            global_num_tokens_for_logprob_cpu = [bs] * self.attn_dp_size
+            global_num_tokens_for_logprob_cpu = [num_tokens_for_logprob] * (
+                self.attn_dp_size
+            )
         elif self.require_attn_tp_gather:
             global_num_tokens_cpu = [num_tokens]
-            global_num_tokens_for_logprob_cpu = [bs]
+            global_num_tokens_for_logprob_cpu = [num_tokens_for_logprob]
         else:
             global_num_tokens_cpu = None
             global_num_tokens_for_logprob_cpu = None
@@ -409,8 +423,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             num_accept_tokens=num_accept_tokens,
             # Padded tree width per req; drives the constant qo layout.
             num_tokens_per_req=self.captured_req_width,
-            num_tokens_for_logprob_per_req=1,
-            select_index=select_index,
+            num_tokens_for_logprob_per_req=(
+                1 if self.select_rows_in_graph else self.captured_req_width
+            ),
+            select_index=select_index if self.select_rows_in_graph else None,
         )
 
         forward_batch = ForwardBatch(
@@ -577,7 +593,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:
             buffers.global_num_tokens_gpu.fill_(bs * self.captured_req_width)
-            buffers.global_num_tokens_for_logprob_gpu.fill_(bs)
+            buffers.global_num_tokens_for_logprob_gpu.fill_(
+                bs if self.select_rows_in_graph else bs * self.captured_req_width
+            )
 
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
@@ -638,10 +656,16 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         with device_timer_ctx(self.model_runner.device_timer, "eagle_draft_extend"):
             out = self._replay_graph(shape_key, forward_batch)
 
-        out = LogitsProcessorOutput(
-            next_token_logits=out.next_token_logits[:raw_bs],
-            # CUDA graph replay reuses its captured output storage. These states
-            # survive into the next draft step, so detach them from that buffer.
-            hidden_states=out.hidden_states[:raw_bs].clone(),
-        )
+        if self.select_rows_in_graph:
+            out = LogitsProcessorOutput(
+                next_token_logits=out.next_token_logits[:raw_bs],
+                # CUDA graph replay reuses its captured output storage. These
+                # states survive into the next draft step, so detach them.
+                hidden_states=out.hidden_states[:raw_bs].clone(),
+            )
+        else:
+            out = LogitsProcessorOutput(
+                next_token_logits=out.next_token_logits[:num_tokens],
+                hidden_states=out.hidden_states[:num_tokens],
+            )
         return out

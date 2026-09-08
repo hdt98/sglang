@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import gc
 import logging
 import os
@@ -47,6 +48,30 @@ elif _is_mps:
     apply_metal_profiler_patches()
 
 logger = logging.getLogger(__name__)
+
+_roctx_profiler_lib = None
+
+
+def _set_rocprofv3_selected_region(enabled: bool) -> None:
+    """Toggle rocprofv3 selected-region collection when explicitly requested."""
+    if torch.version.hip is None or os.getenv(
+        "SGLANG_ROCPROFV3_SELECTED_REGIONS", "0"
+    ) not in ("1", "true", "True"):
+        return
+
+    global _roctx_profiler_lib
+    try:
+        if _roctx_profiler_lib is None:
+            _roctx_profiler_lib = ctypes.CDLL("librocprofiler-sdk-roctx.so")
+        function_name = "roctxProfilerResume" if enabled else "roctxProfilerPause"
+        function = getattr(_roctx_profiler_lib, function_name)
+        function.argtypes = [ctypes.c_uint64]
+        function.restype = ctypes.c_int
+        status = function(0)
+        if status != 0:
+            logger.warning("%s returned status %s", function_name, status)
+    except (AttributeError, OSError) as error:
+        logger.warning("Unable to toggle rocprofv3 selected region: %s", error)
 
 
 @dataclass(kw_only=True)
@@ -272,6 +297,7 @@ class SchedulerProfilerManager:
 
         if "CUDA_PROFILER" in activities:
             if self.ps.gpu_id == get_device().base_gpu_id:
+                _set_rocprofv3_selected_region(True)
                 torch.cuda.cudart().cudaProfilerStart()
             self.profile_in_progress = True
 
@@ -386,6 +412,7 @@ class SchedulerProfilerManager:
         if "CUDA_PROFILER" in self.profiler_activities:
             if self.ps.gpu_id == get_device().base_gpu_id:
                 torch.cuda.cudart().cudaProfilerStop()
+                _set_rocprofv3_selected_region(False)
 
         merge_message = self._merge_profile_traces()
 

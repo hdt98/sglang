@@ -896,6 +896,10 @@ class ReqKvInfo:
     # Seq len of the other ping-pong slot's state. None means what is in that
     # slot cannot be named (never written, donated, freed), not that it is empty.
     mamba_prev_track_seqlen: Optional[int] = None
+    # Decode-side PD may receive a prompt checkpoint alongside the active state.
+    # Keep it stable so recorded AgentX continuations can reuse the prompt even
+    # when their recorded assistant turn differs from our generated output.
+    pd_prompt_checkpoint_seqlen: Optional[int] = None
     # Deferred COW: source mamba pool index from radix cache node (copy on forward stream)
     mamba_cow_src_index: Optional[torch.Tensor] = None
     # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
@@ -1848,6 +1852,7 @@ class Req(ReqDllmMixin):
         self.kv.mamba_last_track_idx = None
         self.kv.mamba_last_track_seqlen = None
         self.kv.mamba_prev_track_seqlen = None
+        self.kv.pd_prompt_checkpoint_seqlen = None
         self.mamba_branching_seqlen = None
         self.kv.mamba_cow_src_index = None
         self.kv.mamba_needs_clear = False
@@ -2853,7 +2858,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # to force the math calculation to retrieve the correct mamba state from h.
             return i + 1
 
-        mask = req.extend_range.length >= checkpoint_grid
+        mask = (
+            req.kv.pd_prompt_checkpoint_seqlen is None
+            and req.extend_range.length >= checkpoint_grid
+        )
         track_index = req.kv.mamba_ping_pong_track_buffer[
             req.kv.mamba_next_track_idx
         ].item()

@@ -67,6 +67,12 @@ _is_hip = is_hip()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter_unquantized_gemm = (
+    _use_aiter and not envs.SGLANG_ROCM_DISABLE_AITER_UNQUANTIZED_GEMM.get()
+)
+_use_aiter_unquantized_moe = (
+    _use_aiter and not envs.SGLANG_ROCM_DISABLE_AITER_UNQUANTIZED_MOE.get()
+)
 
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
@@ -380,7 +386,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 output = output.view(x_shapes[0], x_shapes[1], -1)
             return output
 
-        elif _use_aiter and type(layer.weight.data) is torch.Tensor:
+        elif _use_aiter_unquantized_gemm and type(layer.weight.data) is torch.Tensor:
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
         elif (
@@ -588,7 +594,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         _should_use_aiter_moe = (
-            _use_aiter
+            _use_aiter_unquantized_moe
             and (
                 get_moe_runner_backend().is_auto()
                 or get_moe_runner_backend().is_aiter()
@@ -839,7 +845,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         # aiter CK fused-MoE only supports 128-aligned shapes; otherwise use triton.
         self._aiter_runner: Optional[MoeRunner] = None
         if (
-            _use_aiter
+            _use_aiter_unquantized_moe
             and (
                 get_moe_runner_backend().is_auto()
                 or get_moe_runner_backend().is_aiter()

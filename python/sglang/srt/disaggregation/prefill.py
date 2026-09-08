@@ -48,6 +48,7 @@ from sglang.srt.disaggregation.utils import (
     get_dsa_tail_state_indices,
     get_dsv4_c128_state_indices,
     get_kv_class,
+    get_mamba_state_transfer_indices,
     is_aborted,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
@@ -72,6 +73,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -622,7 +624,46 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
+        import os
+        _diag_enabled = bool(os.environ.get("SGLANG_PD_STATE_DIAG"))
+        _diag_rank = self.ps.tp_rank
+        _diag_last_key = None
         while True:
+            if _diag_enabled:
+                _diag_reqs = (
+                    self.disagg_prefill_bootstrap_queue.queue
+                    + self.waiting_queue
+                    + self.disagg_prefill_inflight_queue
+                )
+                _diag_key = tuple(
+                    (
+                        req.rid,
+                        req.pending_bootstrap,
+                        req.prefill_attempt_count,
+                        getattr(req, "start_send_idx", None),
+                        getattr(req, "inflight_middle_chunks", None),
+                    )
+                    for req in _diag_reqs
+                )
+                if _diag_key != _diag_last_key:
+                    _diag_last_key = _diag_key
+                    logger.info(
+                        "PD_STATE_DIAG rank=%s bootstrap=%s waiting=%s inflight=%s state=%s",
+                        _diag_rank,
+                        [
+                            (req.rid, req.pending_bootstrap, req.prefill_attempt_count)
+                            for req in self.disagg_prefill_bootstrap_queue.queue
+                        ],
+                        [
+                            (req.rid, req.pending_bootstrap, req.prefill_attempt_count)
+                            for req in self.waiting_queue
+                        ],
+                        [
+                            (req.rid, req.pending_bootstrap, req.prefill_attempt_count)
+                            for req in self.disagg_prefill_inflight_queue
+                        ],
+                        _diag_key,
+                    )
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -1231,8 +1272,6 @@ class SchedulerDisaggregationPrefillMixin:
 
         state_indices: Optional[List] = None
         if last_chunk:
-            self.disagg_metadata_buffers.set_buf(req)
-
             # Most state payloads read token-pool rows and should match the KV
             # range actually materialized on prefill. C128 state is request
             # scoped, so its transfer index must use the logical input length
@@ -1240,16 +1279,47 @@ class SchedulerDisaggregationPrefillMixin:
             seq_len = min(req.extend_range.end, transfer_input_len)
             c128_seq_len = transfer_input_len
 
-            def _mamba_payload():
-                return [
-                    self.req_to_token_pool.translate_mamba_indices(
-                        self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                            req.kv.req_pool_idx
-                        ]
+            mamba_checkpoint_index = None
+            mamba_checkpoint_seqlen = req.kv.mamba_last_track_seqlen or 0
+            if (
+                mamba_checkpoint_seqlen > 0
+                and mamba_checkpoint_seqlen <= transfer_input_len
+                and req.kv.mamba_ping_pong_track_buffer is not None
+            ):
+                keep_idx = req.kv.mamba_last_track_idx
+                if keep_idx is not None:
+                    mamba_checkpoint_index = req.kv.mamba_ping_pong_track_buffer[
+                        keep_idx
+                    ]
+            # Chunked prefill donates aligned checkpoints to the radix tree and
+            # clears mamba_last_track_seqlen before the final (usually short)
+            # chunk. In that common case, transfer the tree-owned checkpoint
+            # that remains locked by this request.
+            if (
+                mamba_checkpoint_index is None
+                and self.tree_cache.supports_mamba()
+                and req.last_node is not None
+            ):
+                mamba_checkpoint_index = (
+                    self.tree_cache.tree_core.get_component_device_value(
+                        req.last_node, ComponentType.MAMBA
                     )
-                    .cpu()
-                    .numpy()
-                ]
+                )
+                if mamba_checkpoint_index is not None:
+                    mamba_checkpoint_seqlen = req.kv.cache_protected_len
+            if mamba_checkpoint_index is None:
+                mamba_checkpoint_seqlen = 0
+
+            self.disagg_metadata_buffers.set_buf(
+                req, mamba_checkpoint_seqlen=mamba_checkpoint_seqlen
+            )
+
+            def _mamba_payload():
+                return get_mamba_state_transfer_indices(
+                    self.req_to_token_pool,
+                    req,
+                    checkpoint_index=mamba_checkpoint_index,
+                )
 
             def _swa_payload():
                 window_size = self.sliding_window_size
@@ -1266,14 +1336,15 @@ class SchedulerDisaggregationPrefillMixin:
                 return kv_to_page_indices(window_kv_indices_swa, page_size)
 
             def _full_kv_pages_payload():
+                # Decode radix already owns the matched prefix's DSA rows.
                 kv_indices_full = self.req_to_token_pool.req_to_token[
-                    req.kv.req_pool_idx, :seq_len
+                    req.kv.req_pool_idx, req.disagg_decode_prefix_len : seq_len
                 ]
                 return kv_to_page_indices(kv_indices_full, page_size)
 
-            def _dsa_tail_payload():
+            def _dsa_tail_payload(pool):
                 return get_dsa_tail_state_indices(
-                    self.token_to_kv_pool_allocator.get_kvcache(),
+                    pool,
                     req.kv.req_pool_idx,
                     seq_len,
                 )
@@ -1314,7 +1385,6 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.MAMBA: _mamba_payload,
                 StateType.SWA: _swa_payload,
                 StateType.DSA: _full_kv_pages_payload,
-                StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.C128_STATE: _c128_state_payload,
@@ -1338,9 +1408,27 @@ class SchedulerDisaggregationPrefillMixin:
                         prefix_len=req.disagg_decode_prefix_len,
                     )
                 )
-            state_indices = [
-                payloads[st]() if st in payloads else None for st in state_types
-            ]
+            # Hybrid GLM target and EAGLE draft pools can have different DSA
+            # tail geometries. Their wire components share the DSA_TAIL type,
+            # so select the matching pool in registration order.
+            dsa_tail_pools = [self.token_to_kv_pool_allocator.get_kvcache()]
+            draft_token_to_kv_pool = (
+                self.disagg_prefill_bootstrap_queue.draft_token_to_kv_pool
+            )
+            if draft_token_to_kv_pool is not None:
+                dsa_tail_pools.append(draft_token_to_kv_pool)
+            dsa_tail_idx = 0
+            state_indices = []
+            for state_type in state_types:
+                if state_type == StateType.DSA_TAIL:
+                    state_indices.append(
+                        _dsa_tail_payload(dsa_tail_pools[dsa_tail_idx])
+                    )
+                    dsa_tail_idx += 1
+                else:
+                    state_indices.append(
+                        payloads[state_type]() if state_type in payloads else None
+                    )
 
         if self.enable_staging:
             # One sender.send per grid slot; the sender's cumulative page

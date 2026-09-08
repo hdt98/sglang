@@ -779,6 +779,40 @@ class TestLoadBalanceMethod(unittest.TestCase):
             str(context.exception),
         )
 
+    def test_pd_decode_radix_cache_accepts_eagle_and_nextn(self):
+        for algorithm in ("EAGLE", "NEXTN"):
+            with self.subTest(algorithm=algorithm):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    disaggregation_mode="decode",
+                    disaggregation_decode_enable_radix_cache=True,
+                    disaggregation_transfer_backend="nixl",
+                    speculative_algorithm=algorithm,
+                )
+                with self.assertLogs(
+                    pd_disaggregation_hook.logger, level="WARNING"
+                ) as logs:
+                    handle_pd_disaggregation(server_args)
+
+                self.assertFalse(resolution_result(server_args, "disable_radix_cache"))
+                self.assertIn(
+                    "Prefill and decode must use matched EAGLE settings",
+                    "\n".join(logs.output),
+                )
+
+    def test_pd_decode_radix_cache_rejects_other_speculative_algorithms(self):
+        for algorithm in ("EAGLE3", "DFLASH", "FROZEN_KV_MTP", "NGRAM"):
+            with self.subTest(algorithm=algorithm):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    disaggregation_mode="decode",
+                    disaggregation_decode_enable_radix_cache=True,
+                    disaggregation_transfer_backend="nixl",
+                    speculative_algorithm=algorithm,
+                )
+                with self.assertRaisesRegex(ValueError, "only supports EAGLE/NEXTN"):
+                    handle_pd_disaggregation(server_args)
+
     def test_pd_decode_radix_cache_allows_mooncake_tcp(self):
         server_args = self._load_balance_args(
             disaggregation_mode="decode",

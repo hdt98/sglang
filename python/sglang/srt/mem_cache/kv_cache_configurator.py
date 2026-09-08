@@ -158,6 +158,24 @@ def mm_runtime_reservation_gb(
     return reserved_mb / 1024
 
 
+def mori_staging_reservation_gb() -> float:
+    """GPU memory allocated by Mori after the KV pools are sized on decode."""
+    disagg = get_disagg()
+    if (
+        disagg.disaggregation_mode != "decode"
+        or disagg.disaggregation_transfer_backend != "mori"
+        or not envs.SGLANG_MORI_STAGING_BUFFER.get()
+    ):
+        return 0.0
+
+    reserved_gb = envs.SGLANG_MORI_STAGING_POOL_SIZE_MB.get() / 1024
+    logger.info(
+        "Reserving %.2f GB of the KV budget for the post-sizing Mori staging pool.",
+        reserved_gb,
+    )
+    return reserved_gb
+
+
 # base ratio of mamba pool size to max_running_requests. Under
 # SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK the decode-time skip frees one resident slot
 # per running request, so the base drops by 1 (overlap 5->4, lazy 4->3). no_buffer
@@ -1233,7 +1251,11 @@ class KVCacheConfigurator:
         elif self.use_mla_backend and is_dsa_model and not self.mambaish_config:
             token_to_kv_pool = self._build_dsa_kv_pool(
                 max_total_num_tokens=sizes.max_total_num_tokens,
-                max_running_requests=sizes.max_running_requests,
+                # DSA compression tails are indexed by req_pool_idx. PD decode
+                # extends that index space with preallocated transfer slots, so
+                # size from the actual shared request table rather than only the
+                # concurrently-running request limit.
+                max_running_requests=req_to_token_pool.req_to_token.shape[0],
             )
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_dsa_model
@@ -2095,7 +2117,13 @@ class KVCacheConfigurator:
             is_multimodal=self.model_config.is_multimodal,
             mm_feature_transport=get_mm().mm_feature_transport,
         )
-        rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
+        staging_reservation_gb = mori_staging_reservation_gb()
+        rest_memory = (
+            available_gpu_memory
+            - slack_gb
+            - mm_reservation_gb
+            - staging_reservation_gb
+        )
         if self.mambaish_config is not None:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
 

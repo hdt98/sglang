@@ -538,8 +538,8 @@ class MambaComponent(TreeComponent):
         keep_idx = pool.get_mamba_ping_pong_keep_idx(req)
         cache_len = req.kv.mamba_last_track_seqlen or 0
 
-        if req.kv_key_capped_at_prompt:
-            return cache_len, keep_idx
+        if req.kv.pd_prompt_checkpoint_seqlen is not None:
+            return req.kv.pd_prompt_checkpoint_seqlen, keep_idx
         if cache_len <= token_ids_len:
             return cache_len, keep_idx
 
@@ -608,7 +608,10 @@ class MambaComponent(TreeComponent):
                 insert_params.mamba_value = active_value
             return cache_len
         else:
-            if cache_len is None:
+            # PD prefill may recompute an older checkpoint than decode's locked
+            # prefix. Keep that prefix and the request-owned checkpoint intact;
+            # an unfinished insert must not move cache ownership backwards.
+            if cache_len is None or cache_len < insert_params.prev_prefix_len:
                 return 0
             # Donate the mamba index to the radix cache instead of copying.
             if self.int8_ckpt_pool is not None:

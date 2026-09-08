@@ -708,8 +708,8 @@ impl PDRouter {
         tokio::pin!(prefill_fut);
         tokio::pin!(decode_fut);
 
-        // Poll both until prefill resolves; decode normally resolves later, but
-        // may resolve first if it rejects the request outright.
+        // Poll both until prefill resolves or decode fails. An early decode
+        // failure leaves prefill waiting for bootstrap indices that cannot arrive.
         let prefill_result;
         let mut decode_early: Option<Result<reqwest::Response, reqwest::Error>> = None;
         loop {
@@ -720,7 +720,32 @@ impl PDRouter {
                     break;
                 }
                 dr = &mut decode_fut, if decode_early.is_none() => {
-                    decode_early = Some(dr);
+                    let mut response = match dr {
+                        Ok(res) if !res.status().is_success() => {
+                            // The streaming error wrapper records decode on drop.
+                            // Prefill is cancelled, so do not record an outcome for it.
+                            if !context.is_stream {
+                                decode.record_outcome(res.status().is_client_error());
+                            }
+                            self.handle_decode_error_response(res, &context, prefill, decode)
+                                .await
+                        }
+                        Err(e) => {
+                            error!(decode_url = %decode.url(), error = ?e,
+                                "Decode request failed before prefill completed");
+                            decode.record_outcome(false);
+                            error::bad_gateway(
+                                "decode_server_error",
+                                format!("Decode server error: {}", e),
+                            )
+                        }
+                        success => {
+                            decode_early = Some(success);
+                            continue;
+                        }
+                    };
+                    response.extensions_mut().insert(BreakerOutcomesRecorded);
+                    return response;
                 }
             }
         }
@@ -1739,6 +1764,113 @@ mod tests {
             .build();
         worker.set_healthy(healthy);
         Box::new(worker)
+    }
+
+    #[tokio::test]
+    async fn test_early_decode_failure_cancels_prefill_without_penalising_it() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+            sync::Notify,
+            time::{timeout, Duration},
+        };
+
+        for status in [
+            None,
+            Some(StatusCode::SERVICE_UNAVAILABLE),
+            Some(StatusCode::BAD_REQUEST),
+        ] {
+            for is_stream in [false, true] {
+                let router = create_test_pd_router();
+                let p_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let d_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let prefill: Arc<dyn Worker> = Arc::from(create_test_worker(
+                    format!("http://{}", p_listener.local_addr().unwrap()),
+                    WorkerType::Prefill {
+                        bootstrap_port: None,
+                    },
+                    true,
+                ));
+                let decode: Arc<dyn Worker> = Arc::from(create_test_worker(
+                    format!("http://{}", d_listener.local_addr().unwrap()),
+                    WorkerType::Decode,
+                    true,
+                ));
+                let received = Arc::new(Notify::new());
+                let p_received = received.clone();
+                let mut p_task = tokio::spawn(async move {
+                    let (mut socket, _) = p_listener.accept().await.unwrap();
+                    let mut buf = [0; 4096];
+                    assert!(socket.read(&mut buf).await.unwrap() > 0);
+                    p_received.notify_one();
+                    // No response: PD prefill would be waiting for decode's
+                    // bootstrap indices. Only peer cancellation can finish it.
+                    while socket.read(&mut buf).await.unwrap() != 0 {}
+                });
+                let d_task = tokio::spawn(async move {
+                    let (mut socket, _) = d_listener.accept().await.unwrap();
+                    let mut buf = [0; 4096];
+                    assert!(socket.read(&mut buf).await.unwrap() > 0);
+                    received.notified().await;
+                    if let Some(status) = status {
+                        socket
+                            .write_all(
+                                format!(
+                            "HTTP/1.1 {} {}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}",
+                            status.as_u16(), status.canonical_reason().unwrap()
+                        )
+                                .as_bytes(),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    // None closes the connection without response headers.
+                });
+                let context = PDRequestContext {
+                    route: "/generate",
+                    batch_size: None,
+                    is_stream,
+                    return_logprob: false,
+                    request_text: None,
+                    model_id: None,
+                    headers: None,
+                };
+                let result = timeout(
+                    Duration::from_secs(1),
+                    router.execute_dual_dispatch_internal(
+                        None,
+                        json!({"text": "test", "stream": is_stream}),
+                        context,
+                        prefill.clone(),
+                        decode.clone(),
+                        Instant::now(),
+                    ),
+                )
+                .await;
+                d_task.await.unwrap();
+                let cancelled = timeout(Duration::from_secs(1), &mut p_task).await;
+                p_task.abort();
+                let response = result.expect("early decode failure must not wait for prefill");
+                assert_eq!(response.status(), status.unwrap_or(StatusCode::BAD_GATEWAY));
+                assert!(response
+                    .extensions()
+                    .get::<BreakerOutcomesRecorded>()
+                    .is_some());
+                axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                assert!(cancelled.is_ok(), "paired prefill connection must close");
+                let p_stats = prefill.circuit_breaker().stats();
+                let d_stats = decode.circuit_breaker().stats();
+                assert_eq!((p_stats.total_successes, p_stats.total_failures), (0, 0));
+                let client_fault = status.is_some_and(|s| s.is_client_error());
+                assert_eq!(
+                    (d_stats.total_successes, d_stats.total_failures),
+                    (u64::from(client_fault), u64::from(!client_fault))
+                );
+                assert_eq!((prefill.load(), decode.load()), (0, 0));
+            }
+        }
     }
 
     #[test]

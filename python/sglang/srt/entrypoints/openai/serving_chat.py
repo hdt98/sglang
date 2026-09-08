@@ -1085,6 +1085,25 @@ class OpenAIServingChat(OpenAIServingBase):
             prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
         elif is_multimodal and self.chat_encoding_spec == "kimi_k3":
             prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
+        elif (
+            is_multimodal
+            and self.chat_encoding_spec is None
+            and self.template_manager.chat_template_name is None
+            and getattr(
+                self.tokenizer_manager.model_config.hf_config, "model_type", None
+            )
+            == "glm5_next"
+            and not self._tokenizer_auto_adds_specials
+            and isinstance(processed_messages.prompt_ids, list)
+            and processed_messages.prompt_ids
+            and not processed_messages.image_data
+            and not processed_messages.video_data
+            and not processed_messages.audio_data
+            and not processed_messages.modalities
+        ):
+            # Reuse already encoded GLM text prompts. Actual media and custom
+            # encoders/templates retain their existing multimodal text path.
+            prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
         elif is_multimodal:
             # Standard VLMs render a text prompt (with placeholder strings) for the MM
             # processor to tokenize. Inkling's custom encoder instead produces pre-rendered

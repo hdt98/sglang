@@ -48,6 +48,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
+    MAMBA_CHECKPOINT_SEQLEN_METADATA_SLOT,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
@@ -57,8 +58,10 @@ from sglang.srt.disaggregation.utils import (
     get_dsa_tail_state_indices,
     get_dsv4_c128_state_indices,
     get_kv_class,
+    get_mamba_state_transfer_indices,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
+    log_pd_spec_metadata,
     poll_and_all_reduce,
     poll_and_all_reduce_pp,
     poll_and_all_reduce_with_staging,
@@ -73,6 +76,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.allocation import alloc_req_slots
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -1419,15 +1423,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             seq_len = origin_input_len
 
             def _mamba_payload():
-                return [
-                    self.req_to_token_pool.translate_mamba_indices(
-                        self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                            decode_req.req.kv.req_pool_idx
-                        ]
-                    )
-                    .cpu()
-                    .numpy()
-                ]
+                checkpoint_index = None
+                track_buffer = decode_req.req.kv.mamba_ping_pong_track_buffer
+                track_idx = decode_req.req.kv.mamba_last_track_idx
+                if track_buffer is not None and track_idx is not None:
+                    checkpoint_index = track_buffer[track_idx]
+                return get_mamba_state_transfer_indices(
+                    self.req_to_token_pool,
+                    decode_req.req,
+                    checkpoint_index=checkpoint_index,
+                )
 
             def _swa_payload():
                 window_size = self.scheduler.sliding_window_size
@@ -1444,16 +1449,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 return kv_to_page_indices(window_kv_indices_swa, page_size)
 
             def _full_kv_pages_payload():
+                # The matched decode prefix already owns its DSA rows. Register
+                # destinations only for the suffix that prefill will send.
                 kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.kv.req_pool_idx, :seq_len
+                    decode_req.req.kv.req_pool_idx, total_prefix_len:seq_len
                 ]
                 # Indexer lives on device pool; always use device page_size
                 device_page_size = self.token_to_kv_pool.page_size
                 return kv_to_page_indices(kv_indices_full, device_page_size)
 
-            def _dsa_tail_payload():
+            def _dsa_tail_payload(pool):
                 return get_dsa_tail_state_indices(
-                    self.token_to_kv_pool,
+                    pool,
                     decode_req.req.kv.req_pool_idx,
                     seq_len,
                 )
@@ -1490,7 +1497,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 StateType.MAMBA: _mamba_payload,
                 StateType.SWA: _swa_payload,
                 StateType.DSA: _full_kv_pages_payload,
-                StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.C128_STATE: _c128_state_payload,
@@ -1511,9 +1517,24 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         prefix_len=total_prefix_len,
                     )
                 )
-            state_indices: Optional[List] = [
-                payloads[st]() if st in payloads else None for st in state_types
-            ]
+            # Hybrid GLM target and EAGLE draft pools can have different DSA
+            # tail geometries. Their wire components share the DSA_TAIL type,
+            # so select the matching pool in registration order.
+            dsa_tail_pools = [self.token_to_kv_pool]
+            if self.draft_token_to_kv_pool is not None:
+                dsa_tail_pools.append(self.draft_token_to_kv_pool)
+            dsa_tail_idx = 0
+            state_indices: Optional[List] = []
+            for state_type in state_types:
+                if state_type == StateType.DSA_TAIL:
+                    state_indices.append(
+                        _dsa_tail_payload(dsa_tail_pools[dsa_tail_idx])
+                    )
+                    dsa_tail_idx += 1
+                else:
+                    state_indices.append(
+                        payloads[state_type]() if state_type in payloads else None
+                    )
 
             decode_req.metadata_buffer_index = (
                 self.req_to_metadata_buffer_idx_allocator.alloc()
@@ -1816,11 +1837,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if total_prefix_len is None:
             total_prefix_len = prefix_len
 
-        req_pool_indices = self.req_to_token_pool.alloc([req])
-
-        assert req_pool_indices is not None, (
-            "req_pool_indices is full! There is a bug in memory estimation."
-        )
+        # Reclaim cached recurrent states before allocating the main/track slots,
+        # just as the regular extend path does under Mamba pool pressure.
+        alloc_req_slots(self.req_to_token_pool, [req], self.tree_cache)
 
         fill_len = self._pre_alloc_fill_len(req)
         req.kv.kv_committed_len = fill_len
@@ -2238,7 +2257,44 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.req.mm_image_tokens = cached_tokens[4].item()
         decode_req.req.mm_audio_tokens = cached_tokens[5].item()
         decode_req.req.mm_video_tokens = cached_tokens[6].item()
+        # Fake transfers (including the router health check) do not populate
+        # the metadata buffer. Ignore its retained contents from an earlier
+        # real request instead of treating stale checkpoint state as current.
+        mamba_checkpoint_seqlen = (
+            0
+            if _is_fake_transfer(decode_req.req)
+            else int(cached_tokens[MAMBA_CHECKPOINT_SEQLEN_METADATA_SLOT].item())
+        )
+        if mamba_checkpoint_seqlen:
+            if not (
+                0 < mamba_checkpoint_seqlen <= len(decode_req.req.origin_input_ids)
+            ):
+                raise RuntimeError(
+                    "Invalid PD Mamba checkpoint length: "
+                    f"checkpoint={mamba_checkpoint_seqlen}, "
+                    f"input_len={len(decode_req.req.origin_input_ids)}"
+                )
+            if decode_req.req.kv.mamba_ping_pong_track_buffer is None:
+                raise RuntimeError(
+                    "Prefill sent a PD Mamba checkpoint but decode has no "
+                    "checkpoint destination buffer"
+                )
+            decode_req.req.kv.mamba_last_track_seqlen = mamba_checkpoint_seqlen
+            decode_req.req.kv.mamba_prev_track_seqlen = None
+            decode_req.req.kv.pd_prompt_checkpoint_seqlen = (
+                mamba_checkpoint_seqlen
+            )
         if not self.spec_algorithm.is_none():
+            log_pd_spec_metadata(
+                "receiver",
+                rid=decode_req.req.rid,
+                metadata_index=idx,
+                bootstrap_room=actual_room,
+                output_id=committed_output_id,
+                topk_p=output_topk_p,
+                topk_index=output_topk_index,
+                hidden_states=output_hidden_states,
+            )
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index
             decode_req.req.hidden_states_tensor = output_hidden_states
