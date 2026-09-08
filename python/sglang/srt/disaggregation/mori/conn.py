@@ -253,11 +253,12 @@ class TransferInfo:
 
         # A transfer is "dummy" for KV/aux when the receiver does not need
         # either delivered. Hybrid-MLA TP-mismatch dummy ranks can still carry
-        # Mamba state, so state does not flip the KV role.
+        # Mamba state, so state and decode-prefix metadata do not flip the KV
+        # role. A partial prefix is informational for incremental KV transfer;
+        # it must not turn a state-only peer into a KV writer.
         is_dummy = (
             dst_kv_indices.size == 0
             and dst_aux_index < 0
-            and not decode_prefix_len
         )
         return cls(
             room=room,
@@ -2348,6 +2349,16 @@ class MoriKVManager(CommonKVManager):
                 if i < len(peer_info.dst_state_dim_per_tensor)
                 else []
             )
+            src_conv_groups = (
+                self.kv_args.state_conv_shard_groups[i]
+                if i < len(self.kv_args.state_conv_shard_groups)
+                else []
+            )
+            src_outer_counts = (
+                self.kv_args.state_slice_outer_counts[i]
+                if i < len(self.kv_args.state_slice_outer_counts)
+                else []
+            )
 
             if st == "mamba":
                 statuses.extend(
@@ -2365,6 +2376,8 @@ class MoriKVManager(CommonKVManager):
                         dst_strides,
                         src_dims,
                         dst_dims,
+                        src_conv_groups,
+                        src_outer_counts,
                     )
                 )
             elif st in ("swa", "dsa", "swa_ring", "c128_state", "minimax_index_k"):
@@ -2465,24 +2478,19 @@ class MoriKVManager(CommonKVManager):
         dst_state_slot_strides: List[int],
         src_state_dim_per_tensor: List[int],
         dst_state_dim_per_tensor: List[int],
+        src_state_conv_shard_groups: List[Optional[List[int]]],
+        src_state_slice_outer_counts: List[int],
     ) -> List[TransferStatus]:
         state_pairs = pair_mamba_state_indices(
             src_state_indices, dst_state_indices
         )
 
         tp_mismatch = peer_info.decode_tp_size != self.attn_tp_size
-        src_conv_shard_groups = getattr(
-            self.kv_args, "state_conv_shard_groups", []
-        )
-        src_slice_outer_counts = getattr(
-            self.kv_args, "state_slice_outer_counts", []
-        )
-
         # If dim info is missing, degrade to the legacy whole-item copy.
         if tp_mismatch and (
             not src_state_dim_per_tensor
             or not dst_state_dim_per_tensor
-            or not src_slice_outer_counts
+            or not src_state_slice_outer_counts
         ):
             tp_mismatch = False
 
@@ -2517,13 +2525,13 @@ class MoriKVManager(CommonKVManager):
                 else 0
             )
             conv_shard_groups = (
-                src_conv_shard_groups[i]
-                if i < len(src_conv_shard_groups)
+                src_state_conv_shard_groups[i]
+                if i < len(src_state_conv_shard_groups)
                 else None
             )
             slice_outer_count = (
-                src_slice_outer_counts[i]
-                if i < len(src_slice_outer_counts)
+                src_state_slice_outer_counts[i]
+                if i < len(src_state_slice_outer_counts)
                 else 1
             )
 
