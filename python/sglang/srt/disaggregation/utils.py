@@ -522,17 +522,28 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
 
     Mutates `polls` in-place. Called before all-reduce so that MIN across TP
     ranks naturally prevents any rank from committing before all ranks are ready.
+
+    The bootstrap-room check reads device state, so it is batched into one D2H
+    copy for the whole poll: an `.item()` per queued request makes each poll
+    cost N device syncs, and this gate runs on every scheduler poll — the C8
+    decode profile showed ~270 device syncs per decode step, leaving the GPU
+    idle for roughly 40% of decode wall time. All rooms are read as of one
+    instant (same stream ordering as the per-request reads); a request whose
+    metadata lands mid-poll is simply downgraded here and promoted by the next
+    poll, the same self-correcting behavior the per-request loop had.
     """
-    for i, poll_val in enumerate(polls):
-        if poll_val == int(KVPoll.Success):
-            decode_req = decode_reqs[i]
-            if _is_fake_transfer(decode_req.req):
-                continue
-            actual_room = metadata_buffers.bootstrap_room[
-                decode_req.metadata_buffer_index, 0
-            ].item()
-            if actual_room == 0:
-                polls[i] = int(KVPoll.Transferring)
+    success_idx = [
+        i
+        for i, poll_val in enumerate(polls)
+        if poll_val == int(KVPoll.Success)
+        and not _is_fake_transfer(decode_reqs[i].req)
+    ]
+    if not success_idx:
+        return
+    rooms_cpu = metadata_buffers.bootstrap_room[success_idx, 0].cpu()
+    for i, actual_room in zip(success_idx, rooms_cpu.tolist()):
+        if actual_room == 0:
+            polls[i] = int(KVPoll.Transferring)
 
 
 def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:
