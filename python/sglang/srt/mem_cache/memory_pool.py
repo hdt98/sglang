@@ -46,6 +46,7 @@ from sglang.kernels.ops.kvcache.cache_move import (
     copy_all_layer_kv_cache_func,
     set_kv_buffer_prefix_valid_tiled,
 )
+from sglang.kernels.ops.kvcache.copy_pages import copy_pages
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
@@ -4931,9 +4932,44 @@ class DSATokenToKVPool(MLATokenToKVPool):
             del self._compress_tail_score
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
-        """Move latent KV and the DSA indexer cache (key + scale) in lockstep."""
-        super().move_kv_cache(tgt_loc, src_loc)
-        self.index_key_cache.move(tgt_loc, src_loc)
+        """Move latent KV and the DSA indexer cache by whole page envelopes.
+
+        The token-granular advanced-index gather faults on gfx950 for long PD
+        moves. Both the MLA latent rows and the DSA index rows are physically
+        page-contiguous, so copy each page envelope directly instead.
+        """
+        if tgt_loc.numel() == 0:
+            return
+
+        size_limit = self.size + self.page_size
+        maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
+        maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
+
+        ps = self.page_size
+        tgt_pages = tgt_loc[::ps] // ps
+        src_pages = src_loc[::ps] // ps
+
+        for kv_cache in self.kv_buffer:
+            raw = kv_cache.view(torch.uint8).view(-1)
+            copy_pages(
+                raw,
+                tgt_pages,
+                src_pages,
+                kv_cache.shape[0] // ps,
+                kv_cache[0].nbytes * ps,
+            )
+
+        for index_k in self.index_key_cache.buffer:
+            if index_k.shape[0] == 0:
+                continue
+            raw = index_k.view(-1)
+            copy_pages(
+                raw,
+                tgt_pages,
+                src_pages,
+                index_k.shape[0],
+                index_k.stride(0),
+            )
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         return self.index_key_cache.get_local_buffer(layer_id)

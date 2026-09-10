@@ -4,6 +4,7 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     alloc_with_pin_memory,
@@ -23,6 +24,90 @@ class TestDSAOffloadSignatures(unittest.TestCase):
             with self.subTest(method_name=method_name):
                 signature = inspect.signature(getattr(DSATokenToKVPool, method_name))
                 self.assertIn("mamba_indices", signature.parameters)
+
+
+class TestDSAMoveKVCache(unittest.TestCase):
+    def setUp(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for DSA move tests.")
+        if is_npu() or is_xpu():
+            self.skipTest("DSA move tests only support CUDA/ROCm.")
+        if is_hip() and not aiter_can_use_preshuffle_paged_mqa():
+            self.skipTest("ROCm DSA move tests require preshuffle paged MQA.")
+
+    def test_move_copies_latent_and_index_pages(self):
+        page_size = 64
+        layer_num = 2
+        size = page_size * 4
+
+        pool = DSATokenToKVPool(
+            size=size,
+            page_size=page_size,
+            kv_lora_rank=128,
+            dtype=torch.bfloat16,
+            qk_rope_head_dim=32,
+            layer_num=layer_num,
+            device="cuda",
+            enable_memory_saver=False,
+            kv_cache_dim=576,
+            index_head_dim=128,
+        )
+
+        for layer_id in range(layer_num):
+            kv_buf = pool.kv_buffer[layer_id]
+            kv_data = torch.arange(
+                kv_buf.numel(), device=kv_buf.device, dtype=kv_buf.dtype
+            ).view_as(kv_buf)
+            kv_buf.copy_(kv_data + layer_id)
+
+            index_buf = pool.index_k_with_scale_buffer[layer_id]
+            index_data = torch.arange(
+                index_buf.numel(), device=index_buf.device, dtype=torch.uint8
+            ).view_as(index_buf)
+            index_buf.copy_((index_data + layer_id) % 256)
+
+        src_pages = torch.tensor([1, 2], device="cuda", dtype=torch.int64)
+        tgt_pages = torch.tensor([3, 4], device="cuda", dtype=torch.int64)
+        src_loc = torch.cat(
+            [
+                torch.arange(
+                    int(page) * page_size,
+                    (int(page) + 1) * page_size,
+                    device="cuda",
+                    dtype=torch.int64,
+                )
+                for page in src_pages.tolist()
+            ]
+        )
+        tgt_loc = torch.cat(
+            [
+                torch.arange(
+                    int(page) * page_size,
+                    (int(page) + 1) * page_size,
+                    device="cuda",
+                    dtype=torch.int64,
+                )
+                for page in tgt_pages.tolist()
+            ]
+        )
+
+        pool.move_kv_cache(tgt_loc, src_loc)
+        torch.cuda.synchronize()
+
+        for layer_id in range(layer_num):
+            kv_buf = pool.kv_buffer[layer_id]
+            for src_page, tgt_page in zip(src_pages.tolist(), tgt_pages.tolist()):
+                src_start = src_page * page_size
+                tgt_start = tgt_page * page_size
+                got = kv_buf[tgt_start : tgt_start + page_size]
+                expected = kv_buf[src_start : src_start + page_size]
+                self.assertTrue(torch.equal(got, expected))
+
+            index_buf = pool.index_k_with_scale_buffer[layer_id]
+            for src_page, tgt_page in zip(src_pages.tolist(), tgt_pages.tolist()):
+                got = index_buf[tgt_page]
+                expected = index_buf[src_page]
+                self.assertTrue(torch.equal(got, expected))
 
 
 class TestDSAHiCacheTransfer(unittest.TestCase):

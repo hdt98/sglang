@@ -1164,6 +1164,12 @@ class MoriKVManager(CommonKVManager):
             )
             return
 
+        if self.disaggregation_mode == DisaggregationMode.HYBRID:
+            with self.transfer_lock:
+                transfer_info_ready = bootstrap_room in self.transfer_infos
+            if not transfer_info_ready:
+                return
+
         if bootstrap_room not in self.transfer_infos:
             if os.environ.get("SGLANG_PD_STATE_DIAG"):
                 logger.warning(
@@ -1219,6 +1225,14 @@ class MoriKVManager(CommonKVManager):
     def _handle_register_message(self, payload: List[bytes]) -> None:
         try:
             register_info = KVArgsRegisterInfo.from_zmq(payload)
+            if os.environ.get("SGLANG_HYBRID_PD_DEBUG") == "1":
+                logger.info(
+                    "HYBRID_PD_DEBUG register rank=%s engine=%s endpoint=%s port=%s",
+                    self.attn_tp_rank,
+                    register_info.engine_key,
+                    register_info.endpoint,
+                    register_info.dst_port,
+                )
             self._add_remote_peer(register_info)
         except Exception:
             logger.exception("Failed to register remote peer")
@@ -1226,6 +1240,20 @@ class MoriKVManager(CommonKVManager):
     def _handle_transfer_message(self, payload: List[bytes]) -> None:
         try:
             transfer_info = TransferInfo.from_zmq(payload)
+            if os.environ.get("SGLANG_HYBRID_PD_DEBUG") == "1":
+                logger.info(
+                    "HYBRID_PD_DEBUG transfer rank=%s room=%s engine=%s "
+                    "required=%s current=%s kv=%s aux=%s state=%s prefix=%s",
+                    self.attn_tp_rank,
+                    transfer_info.room,
+                    transfer_info.engine_key,
+                    transfer_info.required_dst_info_num,
+                    self.request_status.get(transfer_info.room),
+                    len(transfer_info.dst_kv_indices),
+                    transfer_info.dst_aux_index,
+                    len(transfer_info.dst_state_indices),
+                    transfer_info.decode_prefix_len,
+                )
             with self.transfer_lock:
                 # Accept metadata when room is not yet created (None) or
                 # in Bootstrapping. Reject for active/terminal states where
@@ -1451,6 +1479,17 @@ class MoriKVManager(CommonKVManager):
                         expected = self.required_prefill_response_num_table.get(
                             bootstrap_room, 1
                         )
+                        if os.environ.get("SGLANG_HYBRID_PD_DEBUG") == "1":
+                            logger.info(
+                                "HYBRID_PD_DEBUG status rank=%s room=%s code=%s "
+                                "writer=%s acks=%s expected=%s",
+                                self.attn_tp_rank,
+                                bootstrap_room,
+                                status_code,
+                                prefill_rank,
+                                sorted(tracker),
+                                expected,
+                            )
                         if len(tracker) >= expected:
                             self.prefill_response_tracker.pop(bootstrap_room, None)
                             if (
@@ -1466,6 +1505,16 @@ class MoriKVManager(CommonKVManager):
                             self.update_status(bootstrap_room, KVPoll.Success)
                             self._cleanup_room_tracking(bootstrap_room)
                     elif status_code == KVPoll.Failed:
+                        if os.environ.get("SGLANG_HYBRID_PD_DEBUG") == "1":
+                            logger.info(
+                                "HYBRID_PD_DEBUG status rank=%s room=%s code=%s "
+                                "writer=%s reason=%s",
+                                self.attn_tp_rank,
+                                bootstrap_room,
+                                status_code,
+                                prefill_rank,
+                                failure_reason,
+                            )
                         if failure_reason:
                             self.record_failure(bootstrap_room, failure_reason)
                         self.prefill_response_tracker.pop(bootstrap_room, None)

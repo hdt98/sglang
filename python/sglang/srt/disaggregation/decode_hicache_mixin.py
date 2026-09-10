@@ -185,6 +185,11 @@ class DecodeHiCacheTransferMixin:
             self.tree_cache.release_aborted_request(decode_req.req.rid)
         if decode_req.hicache_restored_node is not None:
             self.tree_cache.dec_lock_ref(decode_req.hicache_restored_node)
+            if decode_req.req.last_node is decode_req.hicache_restored_node:
+                decode_req.req.last_node = None
+                decode_req.req.swa_uuid_for_lock = None
+                decode_req.req.skip_lock_node_ids = {}
+                decode_req.req.swa_prefix_lock_released = False
             decode_req.hicache_restored_node = None
 
     def _try_hicache_queue_load_back(self, dr: DecodeRequest) -> bool:

@@ -308,6 +308,7 @@ pub enum DisaggregationMode {
     /// Unified prefill + decode.
     Null,
     Prefill,
+    Hybrid,
     Decode,
 }
 
@@ -547,7 +548,10 @@ impl ServerArgs {
     /// api port, so whichever prefill server that port names is the one that
     /// receives the registrations.
     pub fn enable_pd_bootstrap(&self) -> bool {
-        self.disaggregation_mode == DisaggregationMode::Prefill
+        matches!(
+            self.disaggregation_mode,
+            DisaggregationMode::Prefill | DisaggregationMode::Hybrid
+        )
     }
 
     /// Whether the served model is multimodal, from the scheduler's config. See

@@ -146,6 +146,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue.token_to_kv_pool_allocator.page_size = 1
         queue.token_to_kv_pool_allocator.available_size.return_value = 1000
         queue.token_to_kv_pool = MagicMock()
+        queue.draft_token_to_kv_pool = None
         queue.transfer_queue = SimpleNamespace(queue=[], enable_staging=False)
         queue.kv_manager = SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))
         queue.tree_cache = MagicMock()
@@ -256,6 +257,7 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
             cache_salt=None,
             routing_key=None,
             disagg_prefill_dp_rank=None,
+            disagg_role=None,
         )
 
     def test_build_rebootstrap_payload_converts_numpy_ids_to_json_lists(self):
@@ -425,6 +427,7 @@ class TestCommonKVManagerPrefillRecompute(unittest.TestCase):
 class TestDecodePrebuilt(unittest.TestCase):
     def _new_scheduler(self, *, enable_overlap: bool) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
         scheduler.grammar_manager = MagicMock()
         scheduler.grammar_manager.has_waiting_grammars.return_value = False
         scheduler.waiting_queue = []

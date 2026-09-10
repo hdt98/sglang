@@ -145,6 +145,32 @@ class TestDecodeQueueCleanup(CustomTestCase):
             [req], req.return_logprob
         )
 
+    def test_hicache_cleanup_clears_aliased_request_lock(self):
+        restored_node = object()
+        req = SimpleNamespace(
+            rid="hicache-alias",
+            last_node=restored_node,
+            swa_uuid_for_lock=None,
+            skip_lock_node_ids={},
+            swa_prefix_lock_released=False,
+        )
+        decode_req = SimpleNamespace(
+            req=req,
+            prefix_match=SimpleNamespace(prefetch_registered=False),
+            hicache_restored_node=restored_node,
+        )
+        queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        queue.tree_cache = MagicMock()
+
+        queue._clean_hicache_prefetch_resources(decode_req)
+
+        queue.tree_cache.dec_lock_ref.assert_called_once_with(restored_node)
+        self.assertIsNone(decode_req.hicache_restored_node)
+        self.assertIsNone(req.last_node)
+        self.assertIsNone(req.swa_uuid_for_lock)
+        self.assertEqual(req.skip_lock_node_ids, {})
+        self.assertFalse(req.swa_prefix_lock_released)
+
     def test_prealloc_abort_also_drops_from_pending_reqs(self):
         # Same DecodeRequest lives in both queue and pending_reqs (add() slow
         # path). Aborting must drop it from both, and compare by identity since

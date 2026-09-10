@@ -3195,8 +3195,8 @@ class ServerArgs:
     # PD disaggregation
     # -------------------------------------------------------------------------
     disaggregation_mode: A[
-        Literal["null", "prefill", "decode"],
-        'Only used for PD disaggregation. "prefill" for prefill-only server, and "decode" for decode-only server. If not specified, it is not PD disaggregated',
+        Literal["null", "prefill", "hybrid", "decode"],
+        'Only used for PD disaggregation. "prefill" for prefill-only server, "decode" for decode-only server, and "hybrid" for an experimental worker that hosts both roles. If not specified, it is not PD disaggregated',
         NS("disagg"),
     ] = "null"
     disaggregation_transfer_backend: A[

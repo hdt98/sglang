@@ -118,6 +118,22 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             )
             logger.warning("KV cache is forced as chunk cache for decode server")
 
+    elif cfg.disaggregation_mode == "hybrid":
+        # Hybrid prefill and decode share one scheduler and radix tree. Decode
+        # prebuilt admission would release prefix locks owned by prefill, so
+        # keep the tree prefill-only until role-aware lock ownership exists.
+        if cfg.disaggregation_decode_enable_radix_cache:
+            declare_resolution(
+                server_args,
+                "handle_pd_disaggregation",
+                disaggregation_decode_enable_radix_cache=False,
+            )
+            logger.warning(
+                "HYBRID PD forces decode radix cache off: prefill and decode "
+                "share one radix tree"
+            )
+
+    if cfg.disaggregation_mode in ("decode", "hybrid"):
         # Default the number of *extra* decode req_to_token slots reserved for
         # in-transfer (being-received-from-prefill) requests, on top of the
         # max_running_requests-derived pool. Large batches get none; small
@@ -134,7 +150,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 disaggregation_decode_extra_slots=extra_slots,
             )
 
-    elif cfg.disaggregation_mode == "prefill":
+    if cfg.disaggregation_mode == "prefill":
         assert cfg.disaggregation_transfer_backend != "fake", (
             "Prefill server does not support 'fake' as the transfer backend"
         )

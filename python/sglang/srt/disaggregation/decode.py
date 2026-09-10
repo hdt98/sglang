@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+from sglang.srt.utils import get_bool_env_var
 from torch.distributed import ProcessGroup
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
@@ -112,6 +113,7 @@ from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
+_HYBRID_PD_DEBUG_LOG = get_bool_env_var("SGLANG_HYBRID_PD_DEBUG")
 
 _is_npu = is_npu()
 
@@ -427,6 +429,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             req.swa_prefix_lock_released = False
         else:
             self.tree_cache.dec_lock_ref(req.last_node, params)
+        req.last_node = None
+        req.swa_uuid_for_lock = None
+        req.skip_lock_node_ids = {}
 
     def _reclaim_swa_tail_capacity(
         self, swa_tail_len: int, req_id: str
@@ -2397,6 +2402,22 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             polls = self._poll_with_staging()
         else:
             polls = self._poll_with_metadata_gate()
+        if _HYBRID_PD_DEBUG_LOG and self.queue:
+            bootstrap_rooms = self.metadata_buffers.bootstrap_room
+            actual_rooms = [
+                bootstrap_rooms[req.metadata_buffer_index]
+                if isinstance(bootstrap_rooms, list)
+                else bootstrap_rooms[req.metadata_buffer_index, 0].item()
+                for req in self.queue
+            ]
+            logger.info(
+                "HYBRID_PD_DECODE_POLL rank=%s rooms=%s actual_rooms=%s polls=%s staging=%s",
+                self.tp_rank,
+                [decode_req.req.bootstrap_room for decode_req in self.queue],
+                actual_rooms,
+                polls,
+                self.enable_staging,
+            )
 
         transferred_reqs = []
         indices_to_remove = set()
@@ -2424,6 +2445,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         error_message += f" with exception {e}"
                         is_propagated = getattr(e, "is_from_another_rank", False)
                 self._clean_hicache_prefetch_resources(decode_req)
+                if self.scheduler.disaggregation_mode == DisaggregationMode.HYBRID:
+                    self.scheduler.hybrid_release_prefill_role_for_room(
+                        decode_req.req.bootstrap_room
+                    )
                 # Mute error message for propagated exceptions to avoid duplicate logging
                 if is_propagated:
                     logger.debug(error_message)
@@ -2773,6 +2798,11 @@ class SchedulerDisaggregationDecodeMixin:
                     tree_cache = self.tree_cache if req.last_node is None else None
                 else:
                     tree_cache = self.tree_cache
+                # Hybrid shares the prefill-side radix tree. Decode prebuilt
+                # admission must not match it: match_prefix records last_node
+                # without acquiring the lock that cache_finished_req releases.
+                if self.disaggregation_mode == DisaggregationMode.HYBRID:
+                    tree_cache = None
                 req.init_next_round_input(tree_cache)
                 # Truncate fill_len to kv_committed_len so cache_unfinished_req
                 # only sees committed KV (full array includes one uncommitted

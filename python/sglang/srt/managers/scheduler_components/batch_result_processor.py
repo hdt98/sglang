@@ -110,7 +110,10 @@ class SchedulerBatchResultProcessor:
     abort_request: Callable
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
-        assert self.disaggregation_mode == DisaggregationMode.DECODE
+        assert self.disaggregation_mode in (
+            DisaggregationMode.DECODE,
+            DisaggregationMode.HYBRID,
+        )
         use_free_group = get_disagg().disaggregation_decode_enable_radix_cache
         if use_free_group:
             self.token_to_kv_pool_allocator.free_group_begin()

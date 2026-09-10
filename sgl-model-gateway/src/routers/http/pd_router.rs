@@ -234,6 +234,7 @@ impl PDRouter {
     const BOOTSTRAP_PORT_KEY: &'static str = "bootstrap_port";
     const BOOTSTRAP_ROOM_KEY: &'static str = "bootstrap_room";
     const DISAGG_PREFILL_DP_RANK_KEY: &'static str = "disagg_prefill_dp_rank";
+    const DISAGG_ROLE_KEY: &'static str = "disagg_role";
 
     fn inject_bootstrap_into_value(
         mut original: Value,
@@ -352,14 +353,25 @@ impl PDRouter {
         prefill: &dyn Worker,
         decode: &dyn Worker,
     ) -> Result<(PreparedWorkerRequest<'a>, PreparedWorkerRequest<'a>), String> {
+        let prefill_json_request = Self::inject_disagg_role(Cow::Borrowed(json_request), "prefill");
         let prefill_request =
-            Self::prepare_worker_request(route, prefill, Cow::Borrowed(json_request)).await?;
+            Self::prepare_worker_request(route, prefill, prefill_json_request).await?;
         let decode_json_request =
             Self::inject_prefill_dp_rank_for_decode(Cow::Borrowed(json_request), prefill)?;
+        let decode_json_request = Self::inject_disagg_role(decode_json_request, "decode");
         let decode_request =
             Self::prepare_worker_request(route, decode, decode_json_request).await?;
 
         Ok((prefill_request, decode_request))
+    }
+
+    fn inject_disagg_role<'a>(mut request: Cow<'a, Value>, role: &'static str) -> Cow<'a, Value> {
+        let obj = request
+            .to_mut()
+            .as_object_mut()
+            .expect("PD request body must be a JSON object");
+        obj.insert(Self::DISAGG_ROLE_KEY.to_string(), Value::from(role));
+        request
     }
 
     async fn execute_dual_dispatch<T: Serialize + Clone>(
@@ -2012,6 +2024,7 @@ mod tests {
             "http://prefill:30000/v1/completions"
         );
         assert_eq!(prefill_request.body["data_parallel_rank"], 2);
+        assert_eq!(prefill_request.body["disagg_role"], "prefill");
         assert!(prefill_request.body.get("disagg_prefill_dp_rank").is_none());
 
         assert_eq!(
@@ -2019,6 +2032,7 @@ mod tests {
             "http://decode:30001/v1/completions"
         );
         assert_eq!(decode_request.body["data_parallel_rank"], 1);
+        assert_eq!(decode_request.body["disagg_role"], "decode");
         assert_eq!(decode_request.body["disagg_prefill_dp_rank"], 2);
         assert_eq!(decode_request.body["bootstrap_room"], 1234);
         assert!(matches!(prefill_request.body, Cow::Owned(_)));
@@ -2056,9 +2070,12 @@ mod tests {
         );
         assert!(prefill_request.body.get("data_parallel_rank").is_none());
         assert!(decode_request.body.get("data_parallel_rank").is_none());
+        assert_eq!(prefill_request.body["disagg_role"], "prefill");
+        assert_eq!(decode_request.body["disagg_role"], "decode");
         assert!(decode_request.body.get("disagg_prefill_dp_rank").is_none());
-        assert!(matches!(prefill_request.body, Cow::Borrowed(_)));
-        assert!(matches!(decode_request.body, Cow::Borrowed(_)));
+        assert!(matches!(prefill_request.body, Cow::Owned(_)));
+        assert!(matches!(decode_request.body, Cow::Owned(_)));
+        assert!(request.get("disagg_role").is_none());
     }
 
     #[test]

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from array import array
 from collections import deque
 from http import HTTPStatus
@@ -49,6 +50,7 @@ from sglang.srt.disaggregation.utils import (
     get_dsv4_c128_state_indices,
     get_kv_class,
     get_mamba_state_transfer_indices,
+    pair_mamba_state_indices,
     is_aborted,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
@@ -81,6 +83,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.utils import is_npu
+from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
 if TYPE_CHECKING:
@@ -92,6 +95,69 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+_HYBRID_PD_DEBUG_LOG = get_bool_env_var("SGLANG_HYBRID_PD_DEBUG")
+_last_hybrid_pd_debug_log = 0.0
+
+
+def _log_hybrid_pd_debug_state(scheduler: Scheduler, *, force: bool = False) -> None:
+    """Log only nonempty hybrid queues, at most once per second."""
+    global _last_hybrid_pd_debug_log
+    now = time.monotonic()
+    if not force and now - _last_hybrid_pd_debug_log < 1.0:
+        return
+    _last_hybrid_pd_debug_log = now
+
+    prefill_bootstrap = getattr(
+        getattr(scheduler, "disagg_prefill_bootstrap_queue", None), "queue", []
+    )
+    decode_prealloc = getattr(
+        getattr(scheduler, "disagg_decode_prealloc_queue", None), "queue", []
+    )
+    decode_transfer = getattr(
+        getattr(scheduler, "disagg_decode_transfer_queue", None), "queue", []
+    )
+    prefill_inflight = getattr(scheduler, "disagg_prefill_inflight_queue", [])
+    prefill_waiting = getattr(scheduler, "hybrid_waiting_queue_prefill", [])
+    decode_waiting = getattr(scheduler, "hybrid_waiting_queue_decode", [])
+
+    def _rooms(reqs):
+        entries = []
+        for req in reqs:
+            inner = getattr(req, "req", None)
+            if inner is not None:
+                entries.append(
+                    (
+                        getattr(inner, "rid", None),
+                        getattr(inner, "bootstrap_room", None),
+                    )
+                )
+            else:
+                entries.append(
+                    (getattr(req, "rid", None), getattr(req, "bootstrap_room", None))
+                )
+        return entries
+
+    if any(
+        (
+            prefill_bootstrap,
+            decode_prealloc,
+            decode_transfer,
+            prefill_inflight,
+            prefill_waiting,
+            decode_waiting,
+        )
+    ):
+        logger.info(
+            "HYBRID_PD_DEBUG rank=%s bootstrap=%s prealloc=%s transfer=%s "
+            "inflight=%s prefill_wait=%s decode_wait=%s",
+            getattr(getattr(scheduler, "ps", None), "tp_rank", None),
+            _rooms(prefill_bootstrap),
+            _rooms(decode_prealloc),
+            _rooms(decode_transfer),
+            _rooms(prefill_inflight),
+            _rooms(prefill_waiting),
+            _rooms(decode_waiting),
+        )
 
 
 def should_force_retry(req: Req) -> bool:
@@ -699,6 +765,127 @@ class SchedulerDisaggregationPrefillMixin:
             self.last_batch = batch
 
     @torch.no_grad()
+    def event_loop_normal_disagg_hybrid(self: Scheduler) -> None:
+        """Sequential experimental loop for a hybrid PD worker.
+
+        Each iteration drains request intake, progresses both the prefill and
+        decode queues, then runs exactly one batch. Decode is preferred when a
+        decode batch is ready (it already has KV transfers in flight); otherwise
+        prefill runs. This intentionally does not use overlap or PP.
+
+        Prefill and decode keep separate persistent waiting lists so the two
+        planners never consume each other's requests from the shared
+        self.waiting_queue attribute (which is swapped to the active role
+        before each planner runs).
+        """
+        prefill_waiting_queue = getattr(self, "hybrid_waiting_queue_prefill", None)
+        if prefill_waiting_queue is None:
+            prefill_waiting_queue = []
+        decode_waiting_queue = getattr(self, "hybrid_waiting_queue_decode", None)
+        if decode_waiting_queue is None:
+            decode_waiting_queue = []
+        prefill_running_batch = getattr(self, "hybrid_running_batch_prefill", None)
+        if prefill_running_batch is None:
+            prefill_running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
+        decode_running_batch = getattr(self, "hybrid_running_batch_decode", None)
+        if decode_running_batch is None:
+            decode_running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
+        prefill_chunked_req = getattr(self, "hybrid_chunked_req_prefill", None)
+        decode_chunked_req = getattr(self, "hybrid_chunked_req_decode", None)
+        last_prefill_batch: Optional[ScheduleBatch] = None
+        while True:
+            if _HYBRID_PD_DEBUG_LOG:
+                _log_hybrid_pd_debug_state(self)
+            if self.gracefully_exit:
+                break
+
+            if not self._engine_paused:
+                self.disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries()
+
+            # Receive requests
+            recv_reqs = self.request_receiver.recv_requests()
+            self.process_input_requests(recv_reqs)
+            if self._engine_paused:
+                continue
+
+            # Prefill intake: only the prefill waiting list sees bootstrapped
+            # prefill requests.
+            self.waiting_queue = prefill_waiting_queue
+            self.waiting_queue.extend(
+                self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+            )
+            prefill_waiting_queue = self.waiting_queue
+            self.hybrid_waiting_queue_prefill = prefill_waiting_queue
+
+            # Decode pipeline: transferred decode requests land on the decode
+            # waiting list and are never visible to the prefill planner.
+            self.chunked_req = decode_chunked_req
+            self.waiting_queue = decode_waiting_queue
+            self.process_decode_queue()
+            self.running_batch = decode_running_batch
+            decode_plan = self.get_next_disagg_decode_batch_to_run(
+                running_batch=self.running_batch
+            )
+            decode_running_batch = decode_plan.running_batch
+            decode_waiting_queue = self.waiting_queue
+            decode_chunked_req = self.chunked_req
+            self.hybrid_running_batch_decode = decode_running_batch
+            self.hybrid_waiting_queue_decode = decode_waiting_queue
+            self.hybrid_chunked_req_decode = decode_chunked_req
+            decode_batch = decode_plan.batch_to_run
+
+            # Prefill pipeline: separate waiting list, running batch and
+            # chunked_req so a live prefill chunk cannot trip decode planning.
+            self.chunked_req = prefill_chunked_req
+            self.waiting_queue = prefill_waiting_queue
+            self.running_batch = prefill_running_batch
+            prefill_plan = self.get_next_disagg_prefill_batch_to_run(
+                running_batch=self.running_batch,
+                last_batch=last_prefill_batch,
+            )
+            prefill_batch = prefill_plan.batch_to_run
+            prefill_running_batch = prefill_plan.running_batch
+            prefill_waiting_queue = self.waiting_queue
+            prefill_chunked_req = self.chunked_req
+            self.hybrid_running_batch_prefill = prefill_running_batch
+            self.hybrid_waiting_queue_prefill = prefill_waiting_queue
+            self.hybrid_chunked_req_prefill = prefill_chunked_req
+
+            if decode_batch is not None:
+                batch = decode_batch
+                self.running_batch = decode_running_batch
+                self.chunked_req = decode_chunked_req
+            elif prefill_batch is not None:
+                batch = prefill_batch
+                self.running_batch = prefill_running_batch
+                self.chunked_req = prefill_chunked_req
+            else:
+                batch = None
+
+            self.cur_batch_for_debug = batch
+
+            # Launch the chosen batch
+            if batch is not None:
+                batch = self.ngram_embedding_manager.prepare_for_forward(
+                    batch, chunked_req=self.chunked_req
+                )
+                result = self.run_batch(batch)
+                self.process_batch_result(batch, result)
+                if batch.forward_mode.is_extend():
+                    last_prefill_batch = batch
+                    prefill_chunked_req = self.chunked_req
+                    self.hybrid_chunked_req_prefill = prefill_chunked_req
+                else:
+                    decode_chunked_req = self.chunked_req
+                    self.hybrid_chunked_req_decode = decode_chunked_req
+            else:
+                # When the server is idle, do self-check and re-init some states.
+                self._sched_idled = True
+                self.on_idle()
+
+            self.process_disagg_prefill_inflight_queue()
+
+    @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
         self.result_queue = deque()
 
@@ -961,6 +1148,16 @@ class SchedulerDisaggregationPrefillMixin:
             self.attn_tp_cpu_group,
         )
 
+        if self.disaggregation_mode == DisaggregationMode.HYBRID:
+            for req in self.disagg_prefill_inflight_queue:
+                self._hybrid_retry_last_chunk(req)
+            polls = [
+                KVPoll.Success
+                if self._hybrid_commit_local_transfer(req)
+                else KVPoll.Transferring
+                for req in self.disagg_prefill_inflight_queue
+            ]
+
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
@@ -999,7 +1196,13 @@ class SchedulerDisaggregationPrefillMixin:
             elif poll == KVPoll.Success:  # transfer done
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finished_reason = FINISH_LENGTH(length=0)
-                release_kv_cache(req, self.tree_cache)  # unlock the tree
+                # In hybrid mode the decode arm owns the shared radix tree.
+                # Avoid inserting the same prefix twice from prefill and decode.
+                release_kv_cache(
+                    req,
+                    self.tree_cache,
+                    is_insert=self.disaggregation_mode != DisaggregationMode.HYBRID,
+                )
                 # FIXME: clean up req's data in transfer engine
                 req.disagg_kv_sender.clear()
                 done_reqs.append(req)
@@ -1042,13 +1245,249 @@ class SchedulerDisaggregationPrefillMixin:
         for req in done_reqs:
             req: Req
 
-            maybe_release_metadata_buffer(
-                req, self.req_to_metadata_buffer_idx_allocator
+            prefill_metadata_allocator = getattr(
+                self, "disagg_prefill_req_to_metadata_buffer_idx_allocator", None
             )
+            if prefill_metadata_allocator is None:
+                prefill_metadata_allocator = (
+                    self.req_to_metadata_buffer_idx_allocator
+                )
+            maybe_release_metadata_buffer(req, prefill_metadata_allocator)
 
         self.disagg_prefill_inflight_queue = undone_reqs
 
         return done_reqs
+
+    def _hybrid_commit_local_transfer(self: Scheduler, req: Req) -> bool:
+        """Commit a same-worker hybrid transfer without Mori XGMI.
+
+        Decode has already preallocated its destination row and registered the
+        bootstrap room. Prefill has written the shared metadata buffer. Only the
+        token->KV mapping still differs, so copy it directly and mark the room
+        complete. This path is intentionally hybrid-only; normal PD still uses
+        Mori and its completion protocol.
+        """
+        decode_queue = self.disagg_decode_transfer_queue
+        if decode_queue is None:
+            return False
+
+        for decode_req in decode_queue.queue:
+            if decode_req.req.bootstrap_room != req.bootstrap_room:
+                continue
+            if decode_req.req.kv.req_pool_idx is None:
+                if _HYBRID_PD_DEBUG_LOG:
+                    logger.info(
+                        "HYBRID_PD_LOCAL_COMMIT rank=%s room=%s waiting_for_decode_pool",
+                        getattr(getattr(self, "ps", None), "tp_rank", None),
+                        req.bootstrap_room,
+                    )
+                continue
+
+            src = self.req_to_token_pool.req_to_token[
+                req.kv.req_pool_idx,
+                req.disagg_decode_prefix_len : req.extend_range.end,
+            ]
+            dst = self.req_to_token_pool.req_to_token[
+                decode_req.req.kv.req_pool_idx,
+                req.disagg_decode_prefix_len : req.extend_range.end,
+            ]
+            if _HYBRID_PD_DEBUG_LOG:
+                torch.cuda.synchronize()
+                logger.info(
+                    "HYBRID_PD_TRANSFER_DEBUG rank=%s room=%s prefill_row=%s "
+                    "decode_row=%s prefix_len=%s extend_end=%s src_len=%s "
+                    "dst_len=%s src_virt=[%s,%s] dst_virt=[%s,%s] "
+                    "src_phys=per-chunk dst_phys=per-chunk",
+                    getattr(getattr(self, "ps", None), "tp_rank", None),
+                    req.bootstrap_room,
+                    req.kv.req_pool_idx,
+                    decode_req.req.kv.req_pool_idx,
+                    req.disagg_decode_prefix_len,
+                    req.extend_range.end,
+                    src.numel(),
+                    dst.numel(),
+                    int(src.min().item()),
+                    int(src.max().item()),
+                    int(dst.min().item()),
+                    int(dst.max().item()),
+                )
+            # Copy the actual KV payload from prefill's physical slots into
+            # the slots decode preallocated. Do not alias decode's
+            # req_to_token to prefill's slots: prefill releases them after
+            # this handoff, and a later prefill can reuse and corrupt them.
+            page_size = self.token_to_kv_pool_allocator.page_size
+            max_pages_per_move = 64
+            tokens_per_move = max_pages_per_move * page_size
+
+            def translate_chunk(indices: torch.Tensor) -> torch.Tensor:
+                """Translate full pages with one v2p gather per page.
+
+                The token-granular translation gathers every token through v2p.
+                That large PyTorch gather faults on gfx950 during long hybrid
+                moves. Virtual token ids are page-major, so translate one page id
+                per page and reconstruct token ids arithmetically. A final partial
+                page uses the stock token translation (at most page_size tokens).
+                Static paged allocators have no virtual->physical table; their
+                stock transfer translation is identity, so use it directly.
+                """
+                if page_size == 1:
+                    return (
+                        self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                            indices
+                        )
+                    )
+                full_tokens = (indices.numel() // page_size) * page_size
+                if full_tokens == 0:
+                    return (
+                        self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                            indices
+                        )
+                    )
+
+                v2p = getattr(
+                    self.token_to_kv_pool_allocator, "full_v2p_page_table", None
+                )
+                if v2p is None:
+                    return (
+                        self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                            indices
+                        )
+                    )
+                full = indices[:full_tokens].view(-1, page_size)
+                pages = full[:, 0] // page_size
+                physical_pages = torch.clamp_min(v2p[pages], 0)
+                offsets = full % page_size
+                translated = (
+                    physical_pages[:, None] * page_size + offsets[None, :]
+                ).reshape(-1)
+                remainder = indices[full_tokens:]
+                if remainder.numel():
+                    translated = torch.cat(
+                        (
+                            translated,
+                            self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                                remainder
+                            ),
+                        )
+                    )
+                return translated
+
+            for start in range(0, src.numel(), tokens_per_move):
+                end = min(start + tokens_per_move, src.numel())
+                src_physical = translate_chunk(src[start:end].reshape(-1))
+                dst_physical = translate_chunk(dst[start:end].reshape(-1))
+                if _HYBRID_PD_DEBUG_LOG:
+                    torch.cuda.synchronize()
+                    logger.info(
+                        "HYBRID_PD_TRANSLATE_DEBUG rank=%s room=%s chunk=[%s,%s) "
+                        "src_phys=[%s,%s] dst_phys=[%s,%s]",
+                        getattr(getattr(self, "ps", None), "tp_rank", None),
+                        req.bootstrap_room,
+                        start,
+                        end,
+                        int(src_physical.min().item()),
+                        int(src_physical.max().item()),
+                        int(dst_physical.min().item()),
+                        int(dst_physical.max().item()),
+                    )
+                self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
+                    dst_physical,
+                    src_physical,
+                )
+                if _HYBRID_PD_DEBUG_LOG:
+                    torch.cuda.synchronize()
+                    logger.info(
+                        "HYBRID_PD_MOVE_DEBUG rank=%s room=%s chunk=[%s,%s) "
+                        "src_phys=[%s,%s] dst_phys=[%s,%s]",
+                        getattr(getattr(self, "ps", None), "tp_rank", None),
+                        req.bootstrap_room,
+                        start,
+                        end,
+                        int(src_physical[0].item()),
+                        int(src_physical[-1].item()),
+                        int(dst_physical[0].item()),
+                        int(dst_physical[-1].item()),
+                    )
+            prefill_idx = req.metadata_buffer_index
+            decode_idx = decode_req.metadata_buffer_index
+            src_state_indices = get_mamba_state_transfer_indices(
+                self.req_to_token_pool,
+                req,
+            )
+            dst_state_indices = get_mamba_state_transfer_indices(
+                self.req_to_token_pool,
+                decode_req.req,
+            )
+            for src_state_index, dst_state_index in pair_mamba_state_indices(
+                src_state_indices,
+                dst_state_indices,
+            ):
+                src_state_index = torch.tensor(
+                    [src_state_index],
+                    dtype=torch.int64,
+                    device=self.req_to_token_pool.device,
+                )
+                dst_state_index = torch.tensor(
+                    [dst_state_index],
+                    dtype=torch.int64,
+                    device=self.req_to_token_pool.device,
+                )
+                self.req_to_token_pool.mamba_pool.copy_from(
+                    src_state_index,
+                    dst_state_index,
+                )
+            self.disagg_prefill_metadata_buffers.copy_row(
+                prefill_idx,
+                decode_idx,
+                destination=self.disagg_decode_metadata_buffers,
+            )
+            decode_req.req.kv.kv_committed_len = req.extend_range.end
+            decode_req.req.set_extend_range(
+                req.disagg_decode_prefix_len, req.extend_range.end
+            )
+            decode_req.req.prefix_indices = dst.to(
+                dtype=torch.int64, device="cpu", non_blocking=False
+            )
+            decode_req.waiting_for_input = True
+            decode_req.kv_receiver.require_staging = False
+            decode_req.kv_receiver.conclude_state = KVPoll.Success
+            req.disagg_kv_sender.kv_mgr.update_status(
+                req.bootstrap_room, KVPoll.Success
+            )
+            if _HYBRID_PD_DEBUG_LOG:
+                logger.info(
+                    "HYBRID_PD_LOCAL_COMMIT rank=%s room=%s prefill_idx=%s "
+                    "decode_idx=%s require_staging=%s",
+                    getattr(getattr(self, "ps", None), "tp_rank", None),
+                    req.bootstrap_room,
+                    prefill_idx,
+                    decode_idx,
+                    decode_req.kv_receiver.require_staging,
+                )
+            return True
+
+        return False
+
+    def _hybrid_retry_last_chunk(self: Scheduler, req: Req) -> bool:
+        """Retry a hybrid final chunk after decode metadata registration.
+
+        In the same-process hybrid worker, decode can publish its destination
+        metadata after prefill has already tried the final send. Mori drops that
+        send when transfer_infos is still empty, so retry it here instead of
+        leaving the room parked in the inflight queue forever.
+        """
+        if req.pending_bootstrap:
+            return False
+        if getattr(req, "_hybrid_last_chunk_retried", False):
+            return False
+        sender = req.disagg_kv_sender
+        if not hasattr(sender, "bootstrap_room"):
+            return False
+        if sender.bootstrap_room not in sender.kv_mgr.transfer_infos:
+            return False
+        self.send_kv_chunk(req, last_chunk=True)
+        req._hybrid_last_chunk_retried = True
+        return True
 
     def handle_inflight_transfer_failure(
         self: Scheduler, req: Req
@@ -1088,6 +1527,52 @@ class SchedulerDisaggregationPrefillMixin:
         """
         self.disagg_prefill_pending_chunk_rids.discard(req.rid)
 
+    def hybrid_release_prefill_role_for_room(self: Scheduler, room: int) -> None:
+        """Release the prefill leg paired with a failed same-worker hybrid room.
+
+        Decode owns the transfer timeout in hybrid mode. If its peer never
+        reaches a terminal prefill poll, decode must also retire the prefill
+        request so its KV, metadata buffer, and pending-chunk gate cannot leak.
+        Match by bootstrap room, not RID: the two router legs use different IDs.
+        """
+        if self.disaggregation_mode != DisaggregationMode.HYBRID:
+            return
+
+        queues = (
+            getattr(self.disagg_prefill_bootstrap_queue, "queue", []),
+            self.disagg_prefill_inflight_queue,
+        )
+        reqs = [req for req in queues[0] + queues[1] if req.bootstrap_room == room]
+        if not reqs:
+            return
+
+        self.disagg_prefill_bootstrap_queue.queue = [
+            req for req in queues[0] if req.bootstrap_room != room
+        ]
+        self.disagg_prefill_inflight_queue = [
+            req for req in queues[1] if req.bootstrap_room != room
+        ]
+        for req in reqs:
+            self.clear_pending_chunk_send(req)
+            sender = getattr(req, "disagg_kv_sender", None)
+            if sender is not None and hasattr(sender, "abort"):
+                sender.abort()
+            if req.kv.holds_kv or req.kv.holds_mamba:
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+            prefill_metadata_allocator = getattr(
+                self, "disagg_prefill_req_to_metadata_buffer_idx_allocator", None
+            )
+            if prefill_metadata_allocator is None:
+                prefill_metadata_allocator = self.req_to_metadata_buffer_idx_allocator
+            maybe_release_metadata_buffer(req, prefill_metadata_allocator)
+            req.pending_bootstrap = False
+            prepare_abort(
+                req,
+                f"Hybrid decode transfer failed for bootstrap room {room}",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            self.output_streamer.stream_output([req], req.return_logprob)
+
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
         self.clear_pending_chunk_send(req)
         error_message = (
@@ -1108,7 +1593,14 @@ class SchedulerDisaggregationPrefillMixin:
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache)
-        maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
+        prefill_metadata_allocator = getattr(
+            self, "disagg_prefill_req_to_metadata_buffer_idx_allocator", None
+        )
+        if prefill_metadata_allocator is None:
+            prefill_metadata_allocator = (
+                self.req_to_metadata_buffer_idx_allocator
+            )
+        maybe_release_metadata_buffer(req, prefill_metadata_allocator)
         req.pending_bootstrap = False
         prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
         self.output_streamer.stream_output([req], req.return_logprob)

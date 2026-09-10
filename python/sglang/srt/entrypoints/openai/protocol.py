@@ -387,6 +387,8 @@ class CompletionRequest(BaseModel):
     routed_dp_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
+    # For hybrid PD — per-request role hint. Accepts "prefill" or "decode".
+    disagg_role: Optional[str] = None
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
 
@@ -948,6 +950,8 @@ class ChatCompletionRequest(BaseModel):
     routed_dp_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
+    # For hybrid PD — per-request role hint. Accepts "prefill" or "decode".
+    disagg_role: Optional[str] = None
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
 

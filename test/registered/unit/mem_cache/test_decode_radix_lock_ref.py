@@ -369,11 +369,13 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         req.rid = "req-1"
         req.origin_input_ids = list(range(8))
         req.output_ids = [99]
-        req.last_node = object()
+        matched_node = object()
+        req.last_node = matched_node
         req.finished_reason = None
         req.kv.cache_protected_len = 0
         req.swa_uuid_for_lock = 123
         req.swa_prefix_lock_released = False
+        req.skip_lock_node_ids = {}
         req.pd_rebootstrap_in_progress = False
         req.sampling_params.max_new_tokens = 16
 
@@ -442,12 +444,15 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         self.assertEqual(preallocated, [])
         self.assertEqual(failed, [])
         queue._pre_alloc.assert_not_called()
-        queue.tree_cache.dec_swa_lock_only.assert_called_once_with(req.last_node, 123)
+        queue.tree_cache.dec_swa_lock_only.assert_called_once_with(matched_node, 123)
         queue.tree_cache.dec_lock_ref.assert_called_once_with(
-            req.last_node,
+            matched_node,
             DecLockRefParams(swa_uuid_for_lock=123),
             skip_swa=True,
         )
+        self.assertIsNone(req.last_node)
+        self.assertIsNone(req.swa_uuid_for_lock)
+        self.assertEqual(req.skip_lock_node_ids, {})
         self.assertFalse(req.swa_prefix_lock_released)
         queue._swa_tail_len.assert_called_once_with(8)
         queue._allocatable_token_budgets.assert_called_once()

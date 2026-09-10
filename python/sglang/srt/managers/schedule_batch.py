@@ -965,6 +965,7 @@ class Req(ReqDllmMixin):
         disagg_mode: Optional[DisaggregationMode] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
+        disagg_role: Optional[str] = None,
         vocab_size: Optional[int] = None,
         priority: Optional[int] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
@@ -1282,6 +1283,9 @@ class Req(ReqDllmMixin):
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank
+        # Hybrid PD role: "prefill" or "decode". None defaults to prefill at
+        # queue-routing time so existing unified requests keep the prefill path.
+        self.disagg_role: Optional[str] = disagg_role
 
         # the start index of the sent kv cache
         # We want to send it chunk by chunk for chunked prefill.
@@ -1967,6 +1971,7 @@ class Req(ReqDllmMixin):
             "cache_salt": self.cache_salt,
             "routing_key": self.routing_key,
             "disagg_prefill_dp_rank": self.disagg_prefill_dp_rank,
+            "disagg_role": self.disagg_role,
         }
 
     def log_time_stats(self):

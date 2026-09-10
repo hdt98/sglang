@@ -33,6 +33,7 @@ from typing import ClassVar, Dict, List, NamedTuple, Optional, Tuple
 import torch
 from torch.profiler import record_function
 
+from sglang.kernels.ops.kvcache.copy_pages import copy_pages
 from sglang.kernels.ops.kvcache.zero_pages import zero_pages
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
@@ -55,6 +56,25 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 logger = logging.getLogger(__name__)
 
 GB = 1024 * 1024 * 1024
+
+
+def _copy_page_envelopes(
+    envelopes: torch.Tensor,
+    tgt_pages: torch.Tensor,
+    src_pages: torch.Tensor,
+) -> None:
+    """Copy whole page envelopes without ROCm's advanced-index gather."""
+    # The caller passes the anchored raw envelope view. Reconstruct it from the
+    # same storage so the Triton kernel can address the full physical pool.
+    raw_tensor = envelopes[:0].new_empty(0, dtype=torch.uint8)
+    raw_tensor.set_(envelopes.untyped_storage())
+    copy_pages(
+        raw_tensor,
+        tgt_pages,
+        src_pages,
+        envelopes.shape[0],
+        envelopes.stride(0),
+    )
 
 
 def _prod(iterable) -> int:
@@ -615,13 +635,15 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         # the ids stay in range so nothing downstream notices.
         assert self._unified_buffer.anchor_bytes(self._sub_pool_name) == 0
         ps = self.page_size
-        tgt_pages = tgt_loc.view(-1, ps)[:, 0] // ps
-        src_pages = src_loc.view(-1, ps)[:, 0] // ps
+        # Page-major token runs: a strided slice avoids the large advanced-index
+        # gather that faults on gfx950 for long PD moves.
+        tgt_pages = tgt_loc[::ps] // ps
+        src_pages = src_loc[::ps] // ps
         with record_function("UnifiedMHA.move_kv_cache"):
             env = self._unified_buffer._raw[: self._num_pages * self._page_bytes].view(
                 self._num_pages, self._page_bytes
             )
-            env[tgt_pages] = env[src_pages]
+            _copy_page_envelopes(env, tgt_pages, src_pages)
 
     def get_contiguous_buf_infos(self):
         raise NotImplementedError(
@@ -740,13 +762,15 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
         if tgt_loc.numel() == 0:
             return
         ps = self.page_size
-        tgt_pages = tgt_loc.view(-1, ps)[:, 0] // ps
-        src_pages = src_loc.view(-1, ps)[:, 0] // ps
+        # Page-major token runs: a strided slice avoids the large advanced-index
+        # gather that faults on gfx950 for long PD moves.
+        tgt_pages = tgt_loc[::ps] // ps
+        src_pages = src_loc[::ps] // ps
         with record_function("UnifiedMLA.move_kv_cache"):
             env = self._unified_buffer._raw[: self._num_pages * self._page_bytes].view(
                 self._num_pages, self._page_bytes
             )
-            env[tgt_pages] = env[src_pages]
+            _copy_page_envelopes(env, tgt_pages, src_pages)
 
     def zero_physical_pages(self, phys_pages: torch.Tensor) -> None:
         """Zero whole page envelopes (PHYSICAL page ids) on allocator

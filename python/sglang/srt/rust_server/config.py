@@ -41,6 +41,7 @@ def _build_server_args(scheduler: Scheduler) -> ServerArgs:
     disaggregation_mode = {
         "null": ext.DisaggregationMode.Null,
         "prefill": ext.DisaggregationMode.Prefill,
+        "hybrid": ext.DisaggregationMode.Hybrid,
         "decode": ext.DisaggregationMode.Decode,
     }[get_disagg().disaggregation_mode]
     return ext.ServerArgs(

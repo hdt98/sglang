@@ -25,10 +25,7 @@ import torch.distributed as dist
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import (
-    get_disagg,
-    get_parallel,
-)
+from sglang.srt.runtime_context import get_disagg
 from sglang.srt.utils import is_hip, is_npu
 
 if TYPE_CHECKING:
@@ -378,8 +375,21 @@ def get_mamba_state_transfer_indices(
     checkpoint_index: Optional[torch.Tensor] = None,
 ) -> np.ndarray:
     """Return active and optional checkpoint Mamba rows in wire order."""
+    req_pool_idx = req.kv.req_pool_idx
+    if not isinstance(req_pool_idx, int):
+        raise RuntimeError(
+            "PD Mamba state transfer requires an allocated request row, "
+            f"got {type(req_pool_idx).__name__} for rid={req.rid}"
+        )
+    mapping = req_to_token_pool.req_index_to_mamba_index_mapping
+    if req_pool_idx < 0 or req_pool_idx >= mapping.shape[0]:
+        raise RuntimeError(
+            "PD Mamba state transfer request row is out of bounds: "
+            f"rid={req.rid} req_pool_idx={req_pool_idx} "
+            f"mapping_shape={tuple(mapping.shape)}"
+        )
     active_index = torch.as_tensor(
-        req_to_token_pool.req_index_to_mamba_index_mapping[req.kv.req_pool_idx]
+        mapping[req_pool_idx]
     ).reshape(-1)
     if active_index.numel() != 1:
         raise RuntimeError(
@@ -408,6 +418,7 @@ def get_mamba_state_transfer_indices(
 class DisaggregationMode(Enum):
     NULL = "null"
     PREFILL = "prefill"
+    HYBRID = "hybrid"
     DECODE = "decode"
 
     @staticmethod
@@ -416,6 +427,8 @@ class DisaggregationMode(Enum):
             return "prefill"
         elif mode == DisaggregationMode.DECODE.value:
             return "decode"
+        elif mode == DisaggregationMode.HYBRID.value:
+            return "hybrid"
         return "unified"
 
 
@@ -437,7 +450,10 @@ def unified_memory_disagg_move_gate(scheduler):
       allocating for the next, whose allocation can urgently flush the peer
       sub-allocator; the batch reaches the transfer queue only after the loop.
     """
-    if scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
+    if scheduler.disaggregation_mode in (
+        DisaggregationMode.PREFILL,
+        DisaggregationMode.HYBRID,
+    ):
 
         def prefill_gate() -> bool:
             return not (
@@ -445,9 +461,13 @@ def unified_memory_disagg_move_gate(scheduler):
                 or scheduler.disagg_prefill_pending_chunk_rids
             )
 
-        return prefill_gate
+        if scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
+            return prefill_gate
 
-    if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
+    if scheduler.disaggregation_mode in (
+        DisaggregationMode.DECODE,
+        DisaggregationMode.HYBRID,
+    ):
 
         def decode_gate() -> bool:
             return not (
@@ -455,7 +475,11 @@ def unified_memory_disagg_move_gate(scheduler):
                 or scheduler.disagg_decode_prealloc_queue.has_published_destinations
             )
 
-        return decode_gate
+        if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
+            return decode_gate
+
+    if scheduler.disaggregation_mode == DisaggregationMode.HYBRID:
+        return lambda: prefill_gate() and decode_gate()
 
     raise ValueError(
         "unified_memory_disagg_move_gate: scheduler is not a PD node "
@@ -762,6 +786,45 @@ class MetadataBuffers:
             ),
             self.bootstrap_room[idx].clone(),
         )
+
+    def copy_row(
+        self,
+        src_idx: int,
+        dst_idx: int,
+        destination: Optional[MetadataBuffers] = None,
+    ):
+        """Copy one complete metadata row between same-schema buffers."""
+        destination = destination if destination is not None else self
+        row_names = [
+            "output_ids",
+            "cached_tokens",
+            "output_token_logprobs_val",
+            "output_token_logprobs_idx",
+            "output_top_logprobs_val",
+            "output_top_logprobs_idx",
+        ]
+        if self.enable_sampling_mask:
+            row_names.extend(
+                [
+                    "output_token_sampling_mask_len",
+                    "output_token_sampling_mask_idx",
+                    "output_token_sampling_logprobs",
+                ]
+            )
+        row_names.extend(
+            [
+                "output_topk_p",
+                "output_topk_index",
+                "output_hidden_states",
+            ]
+        )
+        if self.output_dsa_topk_indices is not None:
+            row_names.append("output_dsa_topk_indices")
+        row_names.append("bootstrap_room")
+        for row_name in row_names:
+            row = getattr(self, row_name)
+            destination_row = destination.__dict__[row_name]
+            destination_row[dst_idx].copy_(row[src_idx], non_blocking=False)
 
     def set_buf(self, req: Req, *, mamba_checkpoint_seqlen: int = 0):
 

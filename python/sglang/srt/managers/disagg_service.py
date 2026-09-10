@@ -20,7 +20,7 @@ def start_disagg_service():
     disagg_mode = DisaggregationMode(get_disagg().disaggregation_mode)
     transfer_backend = TransferBackend(get_disagg().disaggregation_transfer_backend)
 
-    if disagg_mode == DisaggregationMode.PREFILL:
+    if disagg_mode in (DisaggregationMode.PREFILL, DisaggregationMode.HYBRID):
         # only start bootstrap server on prefill tm
         kv_bootstrap_server_class = get_kv_class(
             transfer_backend, KVClassType.BOOTSTRAP_SERVER

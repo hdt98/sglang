@@ -195,7 +195,7 @@ def handle_media_url_security(server_args: Any):
 
 def handle_load_balance_method(server_args: Any):
     cfg = resolving_view(server_args)
-    if cfg.disaggregation_mode not in ("null", "prefill", "decode"):
+    if cfg.disaggregation_mode not in ("null", "prefill", "hybrid", "decode"):
         raise ValueError(f"Invalid disaggregation_mode={cfg.disaggregation_mode!r}")
 
     if cfg.load_balance_method == "auto":

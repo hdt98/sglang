@@ -1278,6 +1278,16 @@ class Scheduler(
             self.chunked_prefill_size = None
         self.chunked_req = None
         self._pending_chunked_abort_req = None
+        # Hybrid PD: role-local scheduler state persists across event-loop
+        # iterations so abort / pause / collect_inflight_reqs can see both
+        # roles even though the hybrid loop swaps the shared attributes while
+        # planning/running a role.
+        self.hybrid_waiting_queue_prefill: List[Req] = []
+        self.hybrid_waiting_queue_decode: List[Req] = []
+        self.hybrid_running_batch_prefill: Optional[ScheduleBatch] = None
+        self.hybrid_running_batch_decode: Optional[ScheduleBatch] = None
+        self.hybrid_chunked_req_prefill: Optional[Req] = None
+        self.hybrid_chunked_req_decode: Optional[Req] = None
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
@@ -1420,6 +1430,10 @@ class Scheduler(
         self.disagg_prefill_inflight_queue = None
         self.disagg_decode_prealloc_queue = None
         self.disagg_decode_transfer_queue = None
+        self.disagg_prefill_req_to_metadata_buffer_idx_allocator = None
+        self.disagg_decode_req_to_metadata_buffer_idx_allocator = None
+        self.disagg_prefill_metadata_buffers = None
+        self.disagg_decode_metadata_buffers = None
 
         self.disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
         self.transfer_backend = TransferBackend(
@@ -1519,6 +1533,88 @@ class Scheduler(
                 num_reserved_decode_tokens=get_disagg().num_reserved_decode_tokens,
                 transfer_backend=self.transfer_backend,
             )
+
+        elif self.disaggregation_mode == DisaggregationMode.HYBRID:
+            # Hybrid PD workers host both roles. Keep their metadata allocators
+            # separate because decode pre-allocation and prefill bootstrap use
+            # independent buffer pools and index lifetimes.
+            decode_buffer_multiplier = (
+                8 if is_minimax_sparse(self.model_config.hf_config) else 2
+            )
+            decode_buffer_size = (
+                self.req_to_token_pool.size
+            ) * decode_buffer_multiplier
+            self.disagg_decode_req_to_metadata_buffer_idx_allocator = (
+                ReqToMetadataIdxAllocator(decode_buffer_size)
+            )
+            self.disagg_decode_metadata_buffers = MetadataBuffers(
+                decode_buffer_size,
+                hidden_size=disagg_hidden_size,
+                hidden_states_dtype=disagg_hidden_states_dtype,
+                custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
+            )
+            self.req_to_metadata_buffer_idx_allocator = (
+                self.disagg_decode_req_to_metadata_buffer_idx_allocator
+            )
+            self.disagg_metadata_buffers = self.disagg_decode_metadata_buffers
+
+            self.disagg_decode_transfer_queue = DecodeTransferQueue(
+                gloo_group=self.attn_tp_cpu_group,
+                req_to_metadata_buffer_idx_allocator=self.disagg_decode_req_to_metadata_buffer_idx_allocator,
+                tp_rank=self.ps.tp_rank,
+                metadata_buffers=self.disagg_decode_metadata_buffers,
+                scheduler=self,
+                tree_cache=self.tree_cache,
+            )
+            self.disagg_decode_prealloc_queue = DecodePreallocQueue(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                draft_token_to_kv_pool=draft_token_to_kv_pool,
+                req_to_metadata_buffer_idx_allocator=self.disagg_decode_req_to_metadata_buffer_idx_allocator,
+                metadata_buffers=self.disagg_decode_metadata_buffers,
+                scheduler=self,
+                transfer_queue=self.disagg_decode_transfer_queue,
+                tree_cache=self.tree_cache,
+                gloo_group=self.attn_tp_cpu_group,
+                tp_rank=self.ps.tp_rank,
+                tp_size=self.ps.tp_size,
+                dp_size=get_parallel().dp_size,
+                gpu_id=self.ps.gpu_id,
+                bootstrap_port=get_disagg().disaggregation_bootstrap_port,
+                max_total_num_tokens=self.max_total_num_tokens,
+                pp_rank=self.ps.pp_rank,
+                num_reserved_decode_tokens=get_disagg().num_reserved_decode_tokens,
+                transfer_backend=self.transfer_backend,
+            )
+
+            prefill_buffer_size = self.max_running_requests * 2
+            self.disagg_prefill_req_to_metadata_buffer_idx_allocator = (
+                ReqToMetadataIdxAllocator(prefill_buffer_size)
+            )
+            # Hybrid prefill and decode share one metadata buffer because the
+            # same scheduler writes and consumes it locally. Keep only their
+            # allocator lifetimes separate.
+            self.disagg_prefill_metadata_buffers = self.disagg_decode_metadata_buffers
+            self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
+                token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
+                draft_token_to_kv_pool=draft_token_to_kv_pool,
+                req_to_metadata_buffer_idx_allocator=self.disagg_prefill_req_to_metadata_buffer_idx_allocator,
+                metadata_buffers=self.disagg_prefill_metadata_buffers,
+                tp_rank=self.ps.tp_rank,
+                tp_size=self.ps.tp_size,
+                gpu_id=self.ps.gpu_id,
+                bootstrap_port=get_disagg().disaggregation_bootstrap_port,
+                gloo_group=self.attn_tp_cpu_group,
+                max_total_num_tokens=self.max_total_num_tokens,
+                scheduler=self,
+                pp_rank=self.ps.pp_rank,
+                pp_size=self.ps.pp_size,
+                transfer_backend=self.transfer_backend,
+            )
+            self.disagg_prefill_inflight_queue: List[Req] = []
+            self.disagg_prefill_pending_chunk_rids: Set[str] = set()
+            self.enable_staging = self.disagg_prefill_bootstrap_queue.enable_staging
 
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
@@ -2735,6 +2831,7 @@ class Scheduler(
                 disagg_mode=self.disaggregation_mode,
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
+                disagg_role=recv_req.disagg_role,
                 vocab_size=self.model_config.vocab_size,
                 priority=recv_req.priority,
                 metrics_collector=(
@@ -3140,6 +3237,22 @@ class Scheduler(
                 req.time_stats.set_decode_prealloc_queue_entry_time()
             else:
                 req.time_stats.set_retract_time()
+        elif self.disaggregation_mode == DisaggregationMode.HYBRID:
+            # A hybrid worker owns both queues; the per-request role decides
+            # where a request enters. None defaults to prefill, so ordinary
+            # unified clients still behave like a prefill request.
+            if req.disagg_role == "decode":
+                self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
+                if not is_retracted:
+                    req.time_stats.set_decode_prealloc_queue_entry_time()
+                else:
+                    req.time_stats.set_retract_time()
+            else:
+                self._prefetch_kvcache(req)
+                self.disagg_prefill_bootstrap_queue.add(
+                    req, self.model_config.num_key_value_heads
+                )
+                req.time_stats.set_prefill_bootstrap_queue_entry_time()
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
 
@@ -3386,11 +3499,20 @@ class Scheduler(
         prepare_abort(req, "Aborted")
         req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
         req.to_finish = None
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+        if self.disaggregation_mode in (
+            DisaggregationMode.PREFILL,
+            DisaggregationMode.HYBRID,
+        ):
             self.clear_pending_chunk_send(req)
             req.disagg_kv_sender.abort()
+            if self.disaggregation_mode == DisaggregationMode.HYBRID:
+                metadata_allocator = (
+                    self.disagg_prefill_req_to_metadata_buffer_idx_allocator
+                )
+            else:
+                metadata_allocator = self.req_to_metadata_buffer_idx_allocator
             maybe_release_metadata_buffer(
-                req, self.req_to_metadata_buffer_idx_allocator
+                req, metadata_allocator
             )
             req.pending_bootstrap = False
         self._release_aborted_request(req.rid)
@@ -4513,7 +4635,10 @@ class Scheduler(
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
                 self.process_batch_result_dllm(batch, result)
-            elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            elif self.disaggregation_mode in (
+                DisaggregationMode.PREFILL,
+                DisaggregationMode.HYBRID,
+            ):
                 self.process_batch_result_disagg_prefill(batch, result)
             else:
                 self.batch_result_processor.process_batch_result_prefill(batch, result)
@@ -4651,7 +4776,8 @@ class Scheduler(
         # of the allocator by design, so the pool is transiently below `total` and
         # would trip the idle leak invariant. Resumes once the holds resolve.
         deferred_pending = (
-            self.disaggregation_mode == DisaggregationMode.DECODE
+            self.disaggregation_mode
+            in (DisaggregationMode.DECODE, DisaggregationMode.HYBRID)
             and self.disagg_decode_transfer_queue.has_pending_deferred_releases()
         )
         if not self.enable_hisparse and not deferred_pending:
@@ -4708,7 +4834,11 @@ class Scheduler(
         )
 
         # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
-        idle &= len(self.waiting_queue) == 0
+        if self.disaggregation_mode == DisaggregationMode.HYBRID:
+            idle &= len(self.hybrid_waiting_queue_prefill) == 0
+            idle &= len(self.hybrid_waiting_queue_decode) == 0
+        else:
+            idle &= len(self.waiting_queue) == 0
 
         if (
             for_health_check
@@ -4722,11 +4852,17 @@ class Scheduler(
             # Grammar queue and prefill inflight queue may not produce batch
             # results instantly, but they still indicate the server is not idle.
             idle &= len(self.grammar_manager.grammar_queue) == 0
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if self.disaggregation_mode in (
+                DisaggregationMode.PREFILL,
+                DisaggregationMode.HYBRID,
+            ):
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
 
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
+            if self.disaggregation_mode in (
+                DisaggregationMode.DECODE,
+                DisaggregationMode.HYBRID,
+            ):
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
                 idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
@@ -5079,9 +5215,18 @@ class Scheduler(
 
         live_reqs = {
             *self.collect_inflight_reqs(),
-            *self.waiting_queue,
+            *self._hybrid_waiting_reqs(),
             *([self.chunked_req] if self.chunked_req is not None else []),
         }
+        if self.disaggregation_mode == DisaggregationMode.HYBRID:
+            live_reqs.update(
+                req
+                for req in (
+                    self.hybrid_chunked_req_prefill,
+                    self.hybrid_chunked_req_decode,
+                )
+                if req is not None
+            )
         if self.hisparse_coordinator is not None:
             live_reqs.update(
                 act.req for act in self.hisparse_coordinator.ack_staging_queue
@@ -5089,6 +5234,20 @@ class Scheduler(
         num_recorded = record_weight_version_events(live_reqs, old_version=old_version)
         logger.info(
             f"Weight version changed. {old_version=} {new_version=} {num_recorded=}"
+        )
+
+    def _hybrid_waiting_reqs(self) -> Set[Req]:
+        if self.disaggregation_mode != DisaggregationMode.HYBRID:
+            return set(self.waiting_queue)
+        return set(
+            self.hybrid_waiting_queue_prefill + self.hybrid_waiting_queue_decode
+        )
+
+    def _hybrid_waiting_reqs_for_abort(self) -> List[Req]:
+        if self.disaggregation_mode != DisaggregationMode.HYBRID:
+            return self.waiting_queue
+        return list(
+            self.hybrid_waiting_queue_prefill + self.hybrid_waiting_queue_decode
         )
 
     def collect_inflight_reqs(self) -> Set[Req]:
@@ -5104,15 +5263,28 @@ class Scheduler(
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
+        if self.disaggregation_mode == DisaggregationMode.HYBRID:
+            for role_chunked_req in (
+                self.hybrid_chunked_req_prefill,
+                self.hybrid_chunked_req_decode,
+            ):
+                if role_chunked_req is not None:
+                    if (
+                        recv_req.abort_all
+                        or role_chunked_req.rid.startswith(recv_req.rid)
+                    ):
+                        self._pending_chunked_abort_req = role_chunked_req
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
         # Abort requests still waiting for encoder embeddings (EPD language-only)
         if self.mm_receiver is not None:
             self.mm_receiver.abort_waiting_requests(recv_req)
 
-        # Delete requests in the waiting queue
+        # Delete requests in the waiting queue (hybrid scans both role queues)
+        waiting_queue_to_scan = self._hybrid_waiting_reqs_for_abort()
         to_del = []
-        for i, req in enumerate(self.waiting_queue):
+        aborted_reqs = []
+        for i, req in enumerate(waiting_queue_to_scan):
             if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                 to_del.append(i)
 
@@ -5121,19 +5293,31 @@ class Scheduler(
             # Abort method 1: directly pop from the queue
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
-            req = self.waiting_queue.pop(i)
+            req = waiting_queue_to_scan.pop(i)
+            aborted_reqs.append(req)
             self._release_aborted_request(req.rid)
             self.beam_coordinator.retire_group(req)
             self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
+            is_decode_role = self.disaggregation_mode == DisaggregationMode.DECODE or (
+                self.disaggregation_mode == DisaggregationMode.HYBRID
+                and req.disagg_role == "decode"
+            )
+            if is_decode_role:
                 release_kv_cache(req, self.tree_cache)
             # For disaggregation prefill mode, free the metadata buffer index
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if self.disaggregation_mode in (
+                DisaggregationMode.PREFILL,
+                DisaggregationMode.HYBRID,
+            ) and req.disagg_role != "decode":
+                if self.disaggregation_mode == DisaggregationMode.HYBRID:
+                    metadata_allocator = (
+                        self.disagg_prefill_req_to_metadata_buffer_idx_allocator
+                    )
+                else:
+                    metadata_allocator = self.req_to_metadata_buffer_idx_allocator
                 bootstrap_pending = req.pending_bootstrap
-                maybe_release_metadata_buffer(
-                    req, self.req_to_metadata_buffer_idx_allocator
-                )
+                maybe_release_metadata_buffer(req, metadata_allocator)
                 if (
                     bootstrap_pending
                     and hasattr(req, "disagg_kv_sender")
@@ -5143,12 +5327,25 @@ class Scheduler(
                         req.disagg_kv_sender.abort()
 
             # For mamba radix cache
-            if (
-                req.kv.holds_mamba
-                and self.disaggregation_mode != DisaggregationMode.DECODE
-            ):
+            if req.kv.holds_mamba and not is_decode_role:
                 release_kv_cache(req, self.tree_cache, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")
+
+        if (
+            self.disaggregation_mode == DisaggregationMode.HYBRID
+            and aborted_reqs
+        ):
+            aborted_ids = {req.rid for req in aborted_reqs}
+            self.hybrid_waiting_queue_prefill = [
+                req
+                for req in self.hybrid_waiting_queue_prefill
+                if req.rid not in aborted_ids
+            ]
+            self.hybrid_waiting_queue_decode = [
+                req
+                for req in self.hybrid_waiting_queue_decode
+                if req.rid not in aborted_ids
+            ]
 
         if self.dllm_config is not None:
             for req in self.dllm_manager.pop_aborted_reqs(
@@ -5169,17 +5366,33 @@ class Scheduler(
         self.grammar_manager.abort_requests(recv_req)
 
         # Delete requests not in the waiting queue when PD disaggregation is enabled
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+        if self.disaggregation_mode in (
+            DisaggregationMode.PREFILL,
+            DisaggregationMode.HYBRID,
+        ):
             # Abort requests that have not yet been bootstrapped
+            remaining_bootstrap = []
             for req in self.disagg_prefill_bootstrap_queue.queue:
-                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort bootstrap queue request. {req.rid=}")
-                    self._release_aborted_request(req.rid)
-
-                    if hasattr(req.disagg_kv_sender, "abort"):
-                        req.disagg_kv_sender.abort()
-                    if self.ps.pp_size > 1:
-                        prepare_abort(req, "Aborted by AbortReq.")
+                if not (recv_req.abort_all or req.rid.startswith(recv_req.rid)):
+                    remaining_bootstrap.append(req)
+                    continue
+                logger.debug(f"Abort bootstrap queue request. {req.rid=}")
+                self._release_aborted_request(req.rid)
+                if hasattr(req, "disagg_kv_sender") and hasattr(
+                    req.disagg_kv_sender, "abort"
+                ):
+                    req.disagg_kv_sender.abort()
+                req.pending_bootstrap = False
+                if self.disaggregation_mode == DisaggregationMode.HYBRID:
+                    metadata_allocator = (
+                        self.disagg_prefill_req_to_metadata_buffer_idx_allocator
+                    )
+                else:
+                    metadata_allocator = self.req_to_metadata_buffer_idx_allocator
+                maybe_release_metadata_buffer(req, metadata_allocator)
+                if self.ps.pp_size > 1:
+                    prepare_abort(req, "Aborted by AbortReq.")
+            self.disagg_prefill_bootstrap_queue.queue = remaining_bootstrap
 
             # Abort in-flight requests
             for req in self.disagg_prefill_inflight_queue:
@@ -5188,19 +5401,22 @@ class Scheduler(
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
 
-        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+        if self.disaggregation_mode in (
+            DisaggregationMode.DECODE,
+            DisaggregationMode.HYBRID,
+        ):
             # Abort requests that have not yet finished preallocation
             for decode_req in self.disagg_decode_prealloc_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
-                    if self.ps.pp_size > 1:
-                        prepare_abort(decode_req.req, "Aborted by AbortReq.")
+                    prepare_abort(decode_req.req, "Aborted by AbortReq.")
 
             # Abort requests waiting for kvcache to release tree cache
             for decode_req in self.disagg_decode_transfer_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
+                    prepare_abort(decode_req.req, "Aborted by AbortReq.")
                     receiver = decode_req.kv_receiver
                     receiver.abort()
                     # Arm drain-ack accounting once the ABORT is sent, so acks
@@ -5267,9 +5483,20 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
-        retract_reqs = [r for r in self.running_batch.reqs if not r.finished()]
+        hybrid_mode = self.disaggregation_mode == DisaggregationMode.HYBRID
+        if hybrid_mode:
+            running_batch = getattr(self, "hybrid_running_batch_decode", None)
+            if running_batch is None:
+                running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
+            chunked_req = getattr(self, "hybrid_chunked_req_decode", None)
+        else:
+            running_batch = self.running_batch
+            chunked_req = self.chunked_req
+
+        retract_reqs = [r for r in running_batch.reqs if not r.finished()]
         if (
-            self.last_batch is not None
+            not hybrid_mode
+            and self.last_batch is not None
             and self.last_batch.forward_mode.is_extend()
             # Skip merge for disagg prefill: completed prefill requests are
             # already in disagg_prefill_inflight_queue. Merging them into
@@ -5280,14 +5507,15 @@ class Scheduler(
             retract_reqs += [r for r in self.last_batch.reqs if not r.finished()]
 
         if (
-            self.chunked_req is not None
-            and not self.chunked_req.finished()
-            and self.chunked_req not in retract_reqs
+            chunked_req is not None
+            and not chunked_req.finished()
+            and chunked_req not in retract_reqs
             and self.disaggregation_mode != DisaggregationMode.PREFILL
         ):
-            retract_reqs.append(self.chunked_req)
+            retract_reqs.append(chunked_req)
 
-        self.last_batch = None
+        if not hybrid_mode:
+            self.last_batch = None
         self.cur_batch_for_debug = None
 
         if retract_reqs:
@@ -5303,9 +5531,13 @@ class Scheduler(
                 hisparse_coordinator=self.hisparse_coordinator,
                 offload_kv=False,
             )
-        self.running_batch.reqs = []
+        running_batch.reqs = []
         for req in retract_reqs:
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
+            is_decode_role = self.disaggregation_mode == DisaggregationMode.DECODE or (
+                self.disaggregation_mode == DisaggregationMode.HYBRID
+                and req.disagg_role == "decode"
+            )
+            if is_decode_role:
                 if req.output_ids:
                     req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
                 req.pd_rebootstrap_in_progress = True
@@ -5313,14 +5545,20 @@ class Scheduler(
                 self.disagg_decode_prealloc_queue.hold_rebootstrap(req)
             else:
                 self._add_request_to_queue(req)
-        self.running_batch.batch_is_full = False
+        running_batch.batch_is_full = False
+        if hybrid_mode:
+            self.hybrid_running_batch_decode = running_batch
+            self.hybrid_chunked_req_decode = None
         # In disagg-PREFILL, keep a live mid-chunk chunked_req rather than retract it:
         # freeing its KV under a live disagg KV-sender crashes pop_bootstrapped or
         # sends freed/reused KV to decode. Kept, it resumes prefill after the pause.
         # TODO(disagg-prefill-retract): tear the sender down (abort + release metadata
         # buffer + reset pending_bootstrap) before freeing KV, then retract for real.
         # Until then a weight-update pause leaves stale-weight prefix KV (off-policy).
-        if self.disaggregation_mode != DisaggregationMode.PREFILL:
+        if self.disaggregation_mode not in (
+            DisaggregationMode.PREFILL,
+            DisaggregationMode.HYBRID,
+        ):
             self.chunked_req = None
 
         # Surface the paused state to dashboards immediately. The scheduler
@@ -5351,10 +5589,10 @@ class Scheduler(
         # queue empty during the pause window (so an intervening weight update
         # can flush the cache) and recomputes the prefix KV under the updated
         # weights.
-        if (
-            self.disaggregation_mode == DisaggregationMode.DECODE
-            and self.disagg_decode_prealloc_queue is not None
-        ):
+        if self.disaggregation_mode in (
+            DisaggregationMode.DECODE,
+            DisaggregationMode.HYBRID,
+        ) and self.disagg_decode_prealloc_queue is not None:
             self.disagg_decode_prealloc_queue.enqueue_held_rebootstrap()
         self._engine_paused = False
 
@@ -5593,6 +5831,13 @@ def dispatch_event_loop(scheduler: Scheduler):
             scheduler.event_loop_overlap_disagg_decode()
         else:
             scheduler.event_loop_normal_disagg_decode()
+    elif disaggregation_mode == DisaggregationMode.HYBRID:
+        if get_parallel().pp_size > 1:
+            raise NotImplementedError(
+                "HYBRID disaggregation does not support PP yet"
+            )
+        # Experimental sequential loop only; overlap is deliberately not used.
+        scheduler.event_loop_normal_disagg_hybrid()
 
 
 def configure_scheduler_process(

@@ -689,6 +689,12 @@ async def health_generate(request: Request) -> Response:
     ):
         return Response(status_code=200)
 
+    if (
+        request.url.path == "/health"
+        and get_disagg().disaggregation_mode == DisaggregationMode.HYBRID.value
+    ):
+        return Response(status_code=200)
+
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
     # uuid keeps rids unique across tokenizer workers (a bare time.time() can
     # collide and crash the shared DetokenizerManager decode_status).
