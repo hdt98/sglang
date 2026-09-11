@@ -938,7 +938,7 @@ def prefetch_staging_reqs(
     requester_pp_rank: Optional[int] = None,
     max_new_chunks_per_session: Optional[int] = None,
     socket_getter: Optional[Callable[..., object]] = None,
-) -> None:
+) -> int:
     """Send STAGING_REQ for all chunks before the prefill forward starts.
 
     Called from the scheduler right after batch formation, so that decode
@@ -952,6 +952,7 @@ def prefetch_staging_reqs(
     page_size = kv_buffer_tensors["page_size"]
     full_chunk_pages = staging_grid_tokens(chunked_prefill_size, page_size) // page_size
 
+    emitted = 0
     for session_id, tinfo in transfer_infos[room].items():
         emitted_for_session = 0
 
@@ -1005,5 +1006,7 @@ def prefetch_staging_reqs(
                     request.append(str(requester_pp_rank).encode("ascii"))
                 prefetch_sockets[ep].send_multipart(request)
                 emitted_for_session += 1
+                emitted += 1
             except Exception:
                 staging_requested.discard(stg_key)
+    return emitted
