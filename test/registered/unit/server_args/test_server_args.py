@@ -63,7 +63,10 @@ from sglang.srt.arg_groups.serving_hook import (
     handle_tokenizer_batching,
     ssl_verify_of,
 )
-from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+from sglang.srt.arg_groups.speculative_hook import (
+    _resolve_speculative_algorithm_alias,
+    handle_speculative_decoding,
+)
 from sglang.srt.arg_groups.validation_hook import (
     check_two_batch_overlap,
 )
@@ -840,6 +843,36 @@ class TestLoadBalanceMethod(unittest.TestCase):
             "with --disaggregation-transfer-backend fake",
             str(context.exception),
         )
+
+    def test_pd_decode_radix_cache_accepts_eagle(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="nixl",
+            speculative_algorithm="EAGLE",
+        )
+
+        handle_pd_disaggregation(server_args)
+        self.assertFalse(resolution_result(server_args, "disable_radix_cache"))
+        self.assertEqual(_resolve_speculative_algorithm_alias("EAGLE", None), "EAGLE")
+        self.assertEqual(_resolve_speculative_algorithm_alias("NEXTN", None), "EAGLE")
+        self.assertEqual(server_args.speculative_algorithm, "EAGLE")
+
+    def test_pd_decode_radix_cache_rejects_other_speculative_algorithms(self):
+        for algorithm in ("EAGLE3", "DFLASH", "NGRAM"):
+            with self.subTest(algorithm=algorithm):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    disaggregation_mode="decode",
+                    disaggregation_decode_enable_radix_cache=True,
+                    disaggregation_transfer_backend="nixl",
+                speculative_algorithm=algorithm,
+                )
+                handle_pd_disaggregation(server_args)
+                self.assertNotEqual(
+                    _resolve_speculative_algorithm_alias(algorithm, None), "EAGLE"
+                )
 
     def test_pd_decode_radix_cache_allows_mooncake_tcp(self):
         server_args = self._load_balance_args(
