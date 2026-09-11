@@ -827,27 +827,28 @@ class TestMoriRegistrationWireSchema(unittest.TestCase):
 
     def test_from_zmq_parses_shifted_staging_and_target_count(self):
         payload = [
-            b"None",                                   # [0] register sentinel
-            b"10.0.0.1",                               # [1] endpoint
-            b"5000",                                   # [2] dst_port
-            b"engine-blob",                            # [3] engine_desc
+            b"None",  # [0] register sentinel
+            b"10.0.0.1",  # [1] endpoint
+            b"5000",  # [2] dst_port
+            b"engine-blob",  # [3] engine_desc
             msgspec.msgpack.encode([b"kv0", b"kv1"]),  # [4] dst_kv_mem_descs
-            msgspec.msgpack.encode([b"aux0"]),         # [5] dst_aux_mem_descs
-            msgspec.msgpack.encode([[b"st0"]]),        # [6] dst_state_mem_descs
-            b"0",                                      # [7] gpu_id
-            b"8",                                      # [8] decode_tp_size
-            b"3",                                      # [9] decode_tp_rank
-            b"192",                                    # [10] dst_kv_item_len
-            pack_int_lists([[64]], "I"),               # [11] dst_state_item_lens
-            pack_int_lists([[8]], "I"),                # [12] dst_state_dim_per_tensor
-            struct.pack("2Q", 192, 96),                # [13] dst_kv_item_lens
-            pack_int_lists([[16], [32]], "Q"),         # [14] dst_state_slot_strides
+            msgspec.msgpack.encode([b"aux0"]),  # [5] dst_aux_mem_descs
+            msgspec.msgpack.encode([[b"st0"]]),  # [6] dst_state_mem_descs
+            b"0",  # [7] gpu_id
+            b"8",  # [8] decode_tp_size
+            b"3",  # [9] decode_tp_rank
+            b"192",  # [10] dst_kv_item_len
+            pack_int_lists([[64]], "I"),  # [11] dst_state_item_lens
+            pack_int_lists([[8]], "I"),  # [12] dst_state_dim_per_tensor
+            struct.pack("2Q", 192, 96),  # [13] dst_kv_item_lens
+            pack_int_lists([[16], [32]], "Q"),  # [14] dst_state_slot_strides
             msgspec.msgpack.encode([b"staging-blob"]),  # [15] staging_mem_descs
-            b"40",                                     # [16] dst_num_target_kv_entries
+            b"40",  # [16] dst_num_target_kv_entries
         ]
 
-        with patch.object(mori_conn, "EngineDesc", _StubEngineDesc), patch.object(
-            mori_conn, "MemoryDesc", _StubMemoryDesc
+        with (
+            patch.object(mori_conn, "EngineDesc", _StubEngineDesc),
+            patch.object(mori_conn, "MemoryDesc", _StubMemoryDesc),
         ):
             info = mori_conn.KVArgsRegisterInfo.from_zmq(payload)
 
@@ -876,8 +877,9 @@ class TestMoriRegistrationWireSchema(unittest.TestCase):
             # Frames [13]-[16] absent: sender from before the staging schema.
         ]
 
-        with patch.object(mori_conn, "EngineDesc", _StubEngineDesc), patch.object(
-            mori_conn, "MemoryDesc", _StubMemoryDesc
+        with (
+            patch.object(mori_conn, "EngineDesc", _StubEngineDesc),
+            patch.object(mori_conn, "MemoryDesc", _StubMemoryDesc),
         ):
             info = mori_conn.KVArgsRegisterInfo.from_zmq(payload)
 
