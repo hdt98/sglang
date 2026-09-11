@@ -13,7 +13,7 @@ import logging
 import struct
 import threading
 import time
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 
@@ -937,6 +937,7 @@ def prefetch_staging_reqs(
     prefetch_sockets: dict,
     requester_pp_rank: Optional[int] = None,
     max_new_chunks_per_session: Optional[int] = None,
+    socket_getter: Optional[Callable[..., object]] = None,
 ) -> None:
     """Send STAGING_REQ for all chunks before the prefill forward starts.
 
@@ -985,10 +986,13 @@ def prefetch_staging_reqs(
                 na = NetworkAddress(tinfo.endpoint, tinfo.dst_port)
                 ep = na.to_tcp()
                 if ep not in prefetch_sockets:
-                    sock = zmq.Context().socket(zmq.PUSH)
-                    if na.is_ipv6:
-                        sock.setsockopt(zmq.IPV6, 1)
-                    sock.connect(ep)
+                    if socket_getter is not None:
+                        sock = socket_getter(ep, is_ipv6=na.is_ipv6)
+                    else:
+                        sock = zmq.Context().socket(zmq.PUSH)
+                        if na.is_ipv6:
+                            sock.setsockopt(zmq.IPV6, 1)
+                        sock.connect(ep)
                     prefetch_sockets[ep] = sock
                 request = [
                     b"STAGING_REQ",
