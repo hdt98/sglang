@@ -82,6 +82,7 @@ from sglang.srt.observability.scheduler_stage_metrics import (
 )
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_parallel,
     get_schedule,
 )
 from sglang.srt.utils import is_npu

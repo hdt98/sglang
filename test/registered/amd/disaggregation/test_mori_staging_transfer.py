@@ -1,4 +1,5 @@
 import types
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -39,7 +40,9 @@ class TestMoriStagingTransfer(unittest.TestCase):
             staging_mem_desc="decode-staging",
             dst_num_target_kv_entries=2,
             dst_kv_item_lens=[100, 200, 30],
+            decode_tp_size=1,
         )
+        manager.attn_tp_size = 1
 
         manager._send_staged_kvcache(
             peer,
@@ -56,7 +59,7 @@ class TestMoriStagingTransfer(unittest.TestCase):
 
         self.assertEqual(submitted[1][0], "target-1")
         self.assertEqual(submitted[1][2].local_offsets, [2000])
-        self.assertEqual(submitted[1][2].remote_offsets, [1234 + 100])
+        self.assertEqual(submitted[1][2].remote_offsets, [1234 + 200])
         self.assertEqual(submitted[1][2].sizes, [400])
 
     def test_staged_prefill_write_rejects_target_geometry_mismatch(self):
@@ -107,7 +110,7 @@ class TestMoriStagingTransfer(unittest.TestCase):
         self.assertEqual(submitted[0][2].sizes, [200])
 
         self.assertEqual(submitted[1][1], "decode-1")
-        self.assertEqual(submitted[1][2].local_offsets, [1234 + 100])
+        self.assertEqual(submitted[1][2].local_offsets, [1234 + 200])
         self.assertEqual(submitted[1][2].remote_offsets, [10000])
         self.assertEqual(submitted[1][2].sizes, [400])
 
@@ -124,6 +127,7 @@ class TestMoriStagingTransfer(unittest.TestCase):
 
         manager = MoriKVManager.__new__(MoriKVManager)
         manager.enable_staging = True
+        manager.transfer_lock = threading.Lock()
         manager.kv_mem_descs = ["decode-0", "decode-1", "draft"]
         manager.kv_args = types.SimpleNamespace(
             num_target_kv_entries=2,
