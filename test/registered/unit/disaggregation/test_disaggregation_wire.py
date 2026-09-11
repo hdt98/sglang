@@ -794,9 +794,7 @@ class TestHybridStateRegistration(unittest.TestCase):
 
     def test_hybrid_slot_strides_delegate_to_mamba_pool(self):
         pool = HybridLinearKVPool.__new__(HybridLinearKVPool)
-        pool.mamba_pool = SimpleNamespace(
-            get_state_slot_strides=lambda: [128, 256]
-        )
+        pool.mamba_pool = SimpleNamespace(get_state_slot_strides=lambda: [128, 256])
 
         self.assertEqual(pool.get_state_slot_strides(), [128, 256])
 

@@ -1146,9 +1146,7 @@ class MambaPool:
         slot_strides = []
         for _, state_tensor, _ in self._iter_transfer_state_tensors():
             slot_stride = state_tensor.stride(1) * state_tensor.element_size()
-            slot_strides += [
-                slot_stride for _ in range(self.num_mamba_layers)
-            ]
+            slot_strides += [slot_stride for _ in range(self.num_mamba_layers)]
         return slot_strides
 
     def get_state_dim_per_tensor(self):

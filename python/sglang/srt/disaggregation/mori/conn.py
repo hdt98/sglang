@@ -34,6 +34,21 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVSender,
     KVTransferError,
 )
+from sglang.srt.disaggregation.common.staging_buffer import (
+    StagingAllocator,
+    staging_grid_tokens,
+)
+from sglang.srt.disaggregation.common.staging_handler import (
+    STAGING_WATERMARK_WAIT_S,
+    DecodeStagingContext,
+    DecodeStagingHandler,
+    PrefillStagingContext,
+    StagingTransferInfo,
+    handle_staging_rsp,
+    handle_watermark_msg,
+    is_watermark_ready,
+    prefetch_staging_reqs,
+)
 from sglang.srt.disaggregation.common.utils import (
     AuxDataCodec,
     FastQueue,
@@ -41,21 +56,6 @@ from sglang.srt.disaggregation.common.utils import (
     group_concurrent_contiguous,
     pack_int_lists,
     unpack_int_lists,
-)
-from sglang.srt.disaggregation.common.staging_buffer import (
-    StagingAllocator,
-    staging_grid_tokens,
-)
-from sglang.srt.disaggregation.common.staging_handler import (
-    DecodeStagingContext,
-    DecodeStagingHandler,
-    PrefillStagingContext,
-    StagingTransferInfo,
-    STAGING_WATERMARK_WAIT_S,
-    handle_staging_rsp,
-    handle_watermark_msg,
-    is_watermark_ready,
-    prefetch_staging_reqs,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -187,10 +187,7 @@ class TransferInfo:
         # Mamba state, so state and decode-prefix metadata do not flip the KV
         # role. A partial prefix is informational for incremental KV transfer;
         # it must not turn a state-only peer into a KV writer.
-        is_dummy = (
-            dst_kv_indices.size == 0
-            and dst_aux_index < 0
-        )
+        is_dummy = dst_kv_indices.size == 0 and dst_aux_index < 0
         return cls(
             room=room,
             endpoint=endpoint,
@@ -283,9 +280,7 @@ class KVArgsRegisterInfo:
                 "Mori staging descriptor count mismatch: expected at most one"
             )
         dst_num_target_kv_entries = (
-            int(payload[17].decode("ascii"))
-            if len(payload) > 17 and payload[17]
-            else 0
+            int(payload[17].decode("ascii")) if len(payload) > 17 and payload[17] else 0
         )
         return cls(
             endpoint=endpoint,
@@ -376,9 +371,7 @@ def _map_views_to_registered_regions(
             f"ptrs={len(view_ptrs)}, lens={len(view_lens)}"
         )
     if not (
-        len(registration_ptrs)
-        == len(registration_lens)
-        == len(registration_descs)
+        len(registration_ptrs) == len(registration_lens) == len(registration_descs)
     ):
         raise ValueError(
             "Mori state registration metadata mismatch: "
@@ -665,9 +658,7 @@ class MoriKVManager(CommonKVManager):
         )
         if self.enable_staging and not staging_ready:
             with self._staging_ctx.watermark_cv:
-                self._staging_ctx.watermark_cv.wait(
-                    STAGING_WATERMARK_WAIT_S
-                )
+                self._staging_ctx.watermark_cv.wait(STAGING_WATERMARK_WAIT_S)
             if queue is not None:
                 queue.put(kv_chunk)
             else:
@@ -942,9 +933,7 @@ class MoriKVManager(CommonKVManager):
         )
         self._dispatch_transfer_chunk(shard_idx, chunk)
 
-    def _dispatch_transfer_chunk(
-        self, shard_idx: int, chunk: TransferKVChunk
-    ) -> None:
+    def _dispatch_transfer_chunk(self, shard_idx: int, chunk: TransferKVChunk) -> None:
         self._transfer_queues[shard_idx].put(chunk)
 
     def _connect_threadsafe(self, endpoint: str, is_ipv6: bool = False):
@@ -1150,9 +1139,7 @@ class MoriKVManager(CommonKVManager):
                         page_start = int(msg[3].decode("ascii"))
                         num_pages = int(msg[4].decode("ascii"))
                         writer_id = (
-                            msg[6].decode("ascii")
-                            if len(msg) > 6
-                            else "unknown"
+                            msg[6].decode("ascii") if len(msg) > 6 else "unknown"
                         )
                         self._staging_handler.handle_chunk_arrived(
                             room,
@@ -1581,9 +1568,7 @@ class MoriKVManager(CommonKVManager):
                     + (dst_start + page_idx) * tp_cfg.dst_item_len
                     + tp_cfg.dst_head_slice_offset
                 )
-                sizes.append(
-                    tp_cfg.page_size * tp_cfg.heads_bytes_per_token_to_send
-                )
+                sizes.append(tp_cfg.page_size * tp_cfg.heads_bytes_per_token_to_send)
 
         return BatchTransferPlan(
             local_offsets=local_offsets,
@@ -1598,11 +1583,7 @@ class MoriKVManager(CommonKVManager):
         dst_kv_indices: npt.NDArray[np.int32],
         staging_offset: Optional[int] = None,
     ) -> List[TransferStatus]:
-        if (
-            self.enable_staging
-            and staging_offset is not None
-            and staging_offset >= 0
-        ):
+        if self.enable_staging and staging_offset is not None and staging_offset >= 0:
             if peer_info.staging_mem_desc is None:
                 raise RuntimeError(
                     "Mori staged transfer is missing the decode staging descriptor"
@@ -1623,8 +1604,8 @@ class MoriKVManager(CommonKVManager):
         kv_item_len = self.kv_args.kv_item_lens[0]
 
         if self.is_mla_backend or self.is_hybrid_mla_backend:
-            src_descs, dst_descs, target_desc_count = (
-                self._get_mla_mem_desc_slices(peer_info.dst_kv_mem_descs)
+            src_descs, dst_descs, target_desc_count = self._get_mla_mem_desc_slices(
+                peer_info.dst_kv_mem_descs
             )
             draft_desc_count = len(src_descs) - target_desc_count
             dst_item_lens = list(
@@ -1759,9 +1740,8 @@ class MoriKVManager(CommonKVManager):
                         f"{self.attn_tp_size}, decode_tp="
                         f"{peer_info.decode_tp_size}"
                     )
-        elif (
-            list(self.kv_args.kv_item_lens[:num_target])
-            != list(peer_info.dst_kv_item_lens[:num_target])
+        elif list(self.kv_args.kv_item_lens[:num_target]) != list(
+            peer_info.dst_kv_item_lens[:num_target]
         ):
             raise ValueError(
                 "Mori staged transfer item lengths do not match "
@@ -2005,9 +1985,7 @@ class MoriKVManager(CommonKVManager):
             src_descs = self.state_mem_descs[i]
             dst_descs = peer_info.dst_state_mem_descs[i]
             src_desc_offsets = self.state_mem_desc_offsets[i]
-            peer_desc_offsets = getattr(
-                peer_info, "dst_state_mem_desc_offsets", []
-            )
+            peer_desc_offsets = getattr(peer_info, "dst_state_mem_desc_offsets", [])
             dst_desc_offsets = (
                 peer_desc_offsets[i]
                 if i < len(peer_desc_offsets)
@@ -2168,9 +2146,7 @@ class MoriKVManager(CommonKVManager):
         src_state_conv_shard_groups: List[Optional[List[int]]],
         src_state_slice_outer_counts: List[int],
     ) -> List[TransferStatus]:
-        state_pairs = pair_mamba_state_indices(
-            src_state_indices, dst_state_indices
-        )
+        state_pairs = pair_mamba_state_indices(src_state_indices, dst_state_indices)
 
         tp_mismatch = peer_info.decode_tp_size != self.attn_tp_size
         # If dim info is missing, degrade to the legacy whole-item copy.
@@ -2202,14 +2178,10 @@ class MoriKVManager(CommonKVManager):
             src_slot_stride = src_state_slot_strides[i]
             dst_slot_stride = dst_state_slot_strides[i]
             src_dim = (
-                src_state_dim_per_tensor[i]
-                if i < len(src_state_dim_per_tensor)
-                else 0
+                src_state_dim_per_tensor[i] if i < len(src_state_dim_per_tensor) else 0
             )
             dst_dim = (
-                dst_state_dim_per_tensor[i]
-                if i < len(dst_state_dim_per_tensor)
-                else 0
+                dst_state_dim_per_tensor[i] if i < len(dst_state_dim_per_tensor) else 0
             )
             conv_shard_groups = (
                 src_state_conv_shard_groups[i]
@@ -2264,7 +2236,6 @@ class MoriKVManager(CommonKVManager):
                         remote_offsets.append(dst_offset)
                         sizes.append(bytes_to_send)
                     continue
-
 
             statuses.extend(
                 self._submit_batch_transfer_plan(
@@ -2395,9 +2366,7 @@ class MoriKVManager(CommonKVManager):
         chunk_idx = int(msg[2].decode("ascii"))
         chunk_num_pages = int(msg[3].decode("ascii"))
         session_id = msg[4].decode("ascii")
-        requester_pp_rank = (
-            int(msg[5].decode("ascii")) if len(msg) > 5 else None
-        )
+        requester_pp_rank = int(msg[5].decode("ascii")) if len(msg) > 5 else None
 
         receiver = self._staging_ctx.room_receivers.get(room)
         if receiver is None:
@@ -2409,10 +2378,7 @@ class MoriKVManager(CommonKVManager):
             return
 
         infos = receiver.chunk_staging_infos
-        if (
-            chunk_idx < len(infos)
-            and infos[chunk_idx][0] >= 0
-        ):
+        if chunk_idx < len(infos) and infos[chunk_idx][0] >= 0:
             alloc_id, offset, alloc_round, alloc_end, _ = infos[chunk_idx]
         elif (
             chunk_idx < len(infos)
@@ -2476,7 +2442,7 @@ class MoriKVManager(CommonKVManager):
         alloc_end: int,
         session_id: str,
         requester_pp_rank: Optional[int],
-        ) -> None:
+    ) -> None:
         bootstrap_infos = self._staging_ctx.room_bootstrap.get(room, [])
         for bootstrap_info in bootstrap_infos:
             if (
@@ -2863,9 +2829,9 @@ class MoriKVReceiver(CommonKVReceiver):
             if self.kv_mgr.staging_mem_desc is not None
             else b""
         )
-        packed_num_target_kv_entries = str(
-            self.kv_mgr._num_target_kv_entries()
-        ).encode("ascii")
+        packed_num_target_kv_entries = str(self.kv_mgr._num_target_kv_entries()).encode(
+            "ascii"
+        )
 
         for bootstrap_info in self.bootstrap_infos:
             try:

@@ -85,6 +85,7 @@ def poll_and_all_reduce_pp(
         for rid in rids
     ]
 
+
 def get_dsa_seed_metadata_dim(hf_config) -> int:
     """Return the model-defined PD seed width, independent of local spec mode."""
     if not getattr(hf_config, "index_share_for_mtp_iteration", False):
@@ -95,9 +96,11 @@ def get_dsa_seed_metadata_dim(hf_config) -> int:
         return 0
     return get_dsa_mtp_topk_width(hf_config)
 
+
 def is_dsv4_c128_online_enabled() -> bool:
     """Return whether DSV4 C128 uses request-scoped online state."""
     return not _IS_HIP and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+
 
 def get_dsv4_c4_state_indices(
     req_pool_idx: int,
@@ -118,6 +121,7 @@ def get_dsv4_c4_state_indices(
     rows = int(req_pool_idx) * int(ring_size) + positions % int(ring_size)
     return rows.astype(np.int32)
 
+
 def get_dsv4_c128_state_indices(
     req_pool_idx: int,
     seq_len: int,
@@ -136,6 +140,7 @@ def get_dsv4_c128_state_indices(
     page = int(req_pool_idx) * pages_per_req + ((seq_len - 1) % ring_size) // 128
     return np.array([page], dtype=np.int32)
 
+
 class DisaggregationMode(Enum):
     NULL = "null"
     PREFILL = "prefill"
@@ -148,6 +153,7 @@ class DisaggregationMode(Enum):
         elif mode == DisaggregationMode.DECODE.value:
             return "decode"
         return "unified"
+
 
 def unified_memory_disagg_move_gate(scheduler):
     """Compaction move gate for a PD node running the unified memory pool.
@@ -192,9 +198,11 @@ def unified_memory_disagg_move_gate(scheduler):
         f"(mode={scheduler.disaggregation_mode})"
     )
 
+
 #########################
 # Synchronization
 #########################
+
 
 def _poll_with_failure_injection(pollers) -> List[int]:
     if (failure_prob := envs.SGLANG_TEST_DISAGG_FAILURE_PROB.get()) > 0:
@@ -204,11 +212,13 @@ def _poll_with_failure_injection(pollers) -> List[int]:
         ]
     return [int(poller.poll()) for poller in pollers]
 
+
 def _is_fake_transfer(req: Req) -> bool:
     return req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
         req.bootstrap_host is None
         and get_disagg().disaggregation_transfer_backend == "fake"
     )
+
 
 def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
     """Downgrade Success → Transferring for requests whose metadata hasn't landed.
@@ -227,11 +237,13 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
             if actual_room == 0:
                 polls[i] = int(KVPoll.Transferring)
 
+
 def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:
     """MIN-reduce poll states so no rank commits ahead of its peers."""
     tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
     dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
     return tensor_to_reduce.tolist()
+
 
 def poll_and_all_reduce(
     pollers,
@@ -247,6 +259,7 @@ def poll_and_all_reduce(
         _apply_metadata_gate(polls, decode_reqs, metadata_buffers)
     return _all_reduce_polls(polls, gloo_group)
 
+
 def poll_and_all_reduce_attn_cp_tp_group(
     pollers,
     attn_cp_cpu_group: dist.ProcessGroup,
@@ -259,6 +272,7 @@ def poll_and_all_reduce_attn_cp_tp_group(
     # Then sync across attn-cp ranks, so all TPxCP participants in one DP shard
     # converge to the same global status.
     return _all_reduce_polls(polls, attn_cp_cpu_group)
+
 
 def poll_and_all_reduce_with_staging(
     decode_reqs,
@@ -294,9 +308,11 @@ def poll_and_all_reduce_with_staging(
         _apply_metadata_gate(raw_polls, decode_reqs, metadata_buffers)
     return _all_reduce_polls(raw_polls, gloo_group)
 
+
 #########################
 # Metadata Buffers
 #########################
+
 
 class ReqToMetadataIdxAllocator:
     """A memory pool that maps a request to its first output token location."""
@@ -319,6 +335,7 @@ class ReqToMetadataIdxAllocator:
 
     def free(self, free_index: int):
         self.free_slots.append(free_index)
+
 
 class MetadataBuffers:
     def __init__(
@@ -581,9 +598,11 @@ class MetadataBuffers:
             req.bootstrap_room if req.bootstrap_room is not None else 0
         )
 
+
 #########################
 # Transfer Backend
 #########################
+
 
 class TransferBackend(Enum):
     MOONCAKE = "mooncake"
@@ -592,12 +611,14 @@ class TransferBackend(Enum):
     ASCEND = "ascend"
     FAKE = "fake"
 
+
 class KVClassType(Enum):
     KVARGS = "kvargs"
     MANAGER = "manager"
     SENDER = "sender"
     RECEIVER = "receiver"
     BOOTSTRAP_SERVER = "bootstrap_server"
+
 
 @overload
 def get_kv_class(
@@ -619,6 +640,7 @@ def get_kv_class(
 def get_kv_class(
     transfer_backend: TransferBackend, class_type: Literal[KVClassType.BOOTSTRAP_SERVER]
 ) -> Type[CommonKVBootstrapServer]: ...
+
 
 def get_kv_class(
     transfer_backend: TransferBackend, class_type: KVClassType
@@ -703,6 +725,7 @@ def get_kv_class(
 
     return class_mapping.get(class_type)
 
+
 def _get_cp_rank_page_bounds(
     total_pages: int, cp_rank: int, cp_size: int
 ) -> Tuple[int, int]:
@@ -711,6 +734,7 @@ def _get_cp_rank_page_bounds(
     local_start = cp_rank * base + min(cp_rank, rem)
     n_pages = base + (1 if cp_rank < rem else 0)
     return local_start, local_start + n_pages
+
 
 def filter_kv_indices_for_cp_rank(
     kv_mgr: CommonKVManager,
@@ -744,15 +768,18 @@ def filter_kv_indices_for_cp_rank(
         )
     return new_kv_indices, new_index_slice
 
+
 #########################
 # Misc
 #########################
+
 
 def is_mla_backend(target_kv_pool) -> bool:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
     return isinstance(target_kv_pool, (MLATokenToKVPool, DeepSeekV4TokenToKVPool))
+
 
 def compute_mamba_state_slice_blocks(
     src_dim: int,
@@ -825,6 +852,7 @@ def compute_mamba_state_slice_blocks(
         dst_off += dst_sub
     return blocks
 
+
 def compute_mamba_state_slice_byte_blocks(
     *,
     src_item_len: int,
@@ -869,6 +897,7 @@ def compute_mamba_state_slice_byte_blocks(
                 )
             )
     return blocks
+
 
 def build_transfer_entry_pairs(
     src_layer_ids: List[int],
@@ -916,6 +945,7 @@ def build_transfer_entry_pairs(
         )
     return [(i, i) for i in range(n_src)]
 
+
 def build_kv_layer_ids(
     *,
     token_to_kv_pool,
@@ -951,6 +981,7 @@ def build_kv_layer_ids(
     band_index = {lid: i for i, lid in enumerate(dict.fromkeys(draft_ids))}
     return layer_ids + [num_hidden_layers + band_index[lid] for lid in draft_ids]
 
+
 def _draft_entry_layer_ids(*, pool, num_entries: int) -> List[int]:
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
@@ -971,6 +1002,7 @@ def _draft_entry_layer_ids(*, pool, num_entries: int) -> List[int]:
             f"ids={len(ids)}, entries={num_entries}"
         )
     return ids
+
 
 def resolve_dcp_dst_entry_indices(
     src_layer_ids: List[int],
@@ -995,6 +1027,7 @@ def resolve_dcp_dst_entry_indices(
             src_layer_ids, dst_layer_ids, n_src, n_dst
         )
     ]
+
 
 def build_staging_slot_metadata(
     *,
@@ -1041,6 +1074,7 @@ def build_staging_slot_metadata(
         v_ids += ids[num_target + draft_half :]
     return k_buffers, v_buffers, k_ids + v_ids
 
+
 def append_state_component(
     kv_args: KVArgs,
     state_type: StateType,
@@ -1073,6 +1107,7 @@ def append_state_component(
     kv_args.state_slice_outer_counts.append(slice_outer_counts or [])
     kv_args.state_layer_ids.append(layer_ids or [])
 
+
 def get_dsa_tail_state_indices(pool, req_pool_idx: int, seq_len: int) -> List[int]:
     if getattr(pool, "use_dsa", False):
         pool = pool.full_kv_pool
@@ -1103,6 +1138,7 @@ def get_dsa_tail_state_indices(pool, req_pool_idx: int, seq_len: int) -> List[in
         tail_size,
     ]
 
+
 def slice_dsa_tail_dst_ptrs_for_pp(
     src_ptrs: List[int],
     dst_ptrs: List[int],
@@ -1132,6 +1168,7 @@ def slice_dsa_tail_dst_ptrs_for_pp(
     return list(dst_ptrs[start_layer:expected_end]) + list(
         dst_ptrs[dst_layers + start_layer : dst_layers + expected_end]
     )
+
 
 def build_dsa_tail_transfer_blocks(
     src_ptrs: List[int],
@@ -1254,6 +1291,7 @@ def build_dsa_tail_transfer_blocks(
                 dst_seg_idx += 1
                 dst_consumed = 0
     return transfer_blocks
+
 
 def setup_state_kv_args(
     kv_args: KVArgs,
@@ -1602,6 +1640,7 @@ def setup_state_kv_args(
                 slice_outer_counts,
             )
 
+
 def prepare_abort(req: Req, error_message: str, status_code=None):
     from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
@@ -1615,6 +1654,7 @@ def prepare_abort(req: Req, error_message: str, status_code=None):
         req.logprob.input_top_logprobs_idx = []
         req.logprob.input_token_ids_logprobs_val = []
         req.logprob.input_token_ids_logprobs_idx = []
+
 
 def is_aborted(req: Req) -> bool:
     from sglang.srt.managers.schedule_batch import FINISH_ABORT

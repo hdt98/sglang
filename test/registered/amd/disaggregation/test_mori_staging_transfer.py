@@ -1,5 +1,5 @@
-import types
 import threading
+import types
 import unittest
 from unittest.mock import Mock, patch
 
@@ -33,8 +33,8 @@ class TestMoriStagingTransfer(unittest.TestCase):
         )
         manager.kv_mem_descs = ["target-0", "target-1", "draft"]
         submitted = []
-        manager._submit_batch_transfer_plan = (
-            lambda src, dst, plan, **kwargs: submitted.append((src, dst, plan)) or []
+        manager._submit_batch_transfer_plan = lambda src, dst, plan, **kwargs: (
+            submitted.append((src, dst, plan)) or []
         )
         peer = types.SimpleNamespace(
             staging_mem_desc="decode-staging",
@@ -92,8 +92,8 @@ class TestMoriStagingTransfer(unittest.TestCase):
         manager.staging_mem_desc = "decode-staging"
         manager.kv_mem_descs = ["decode-0", "decode-1", "draft"]
         submitted = []
-        manager._submit_batch_transfer_plan = (
-            lambda src, dst, plan, **kwargs: submitted.append((src, dst, plan)) or []
+        manager._submit_batch_transfer_plan = lambda src, dst, plan, **kwargs: (
+            submitted.append((src, dst, plan)) or []
         )
         manager._wait_transfer_completion = Mock(return_value=None)
 
@@ -140,9 +140,7 @@ class TestMoriStagingTransfer(unittest.TestCase):
             room_receivers={5: receiver},
             room_bootstrap={5: []},
         )
-        manager._staging_handler = types.SimpleNamespace(
-            register_wm_subscriber=Mock()
-        )
+        manager._staging_handler = types.SimpleNamespace(register_wm_subscriber=Mock())
         manager._send_staging_rsp = Mock()
 
         manager._handle_staging_req(
@@ -185,18 +183,22 @@ class TestMoriStagingTransfer(unittest.TestCase):
             b"2",
         ]
 
-        with patch.object(
-            mori_conn.EngineDesc,
-            "unpack",
-            return_value=types.SimpleNamespace(key="engine"),
-        ), patch.object(
-            mori_conn,
-            "_unpack_mem_desc_list",
-            side_effect=[["target-0", "target-1"], [], ["staging"]],
-        ), patch.object(
-            mori_conn,
-            "_unpack_mem_desc_lists",
-            return_value=[],
+        with (
+            patch.object(
+                mori_conn.EngineDesc,
+                "unpack",
+                return_value=types.SimpleNamespace(key="engine"),
+            ),
+            patch.object(
+                mori_conn,
+                "_unpack_mem_desc_list",
+                side_effect=[["target-0", "target-1"], [], ["staging"]],
+            ),
+            patch.object(
+                mori_conn,
+                "_unpack_mem_desc_lists",
+                return_value=[],
+            ),
         ):
             info = KVArgsRegisterInfo.from_zmq(payload)
 
@@ -204,11 +206,8 @@ class TestMoriStagingTransfer(unittest.TestCase):
         self.assertEqual(info.staging_mem_desc, "staging")
         self.assertEqual(info.dst_kv_item_lens, [64, 32])
 
-
     def test_state_only_dummy_rank_stays_dummy_with_partial_prefix(self):
-        state_bytes = mori_conn._pack_state_indices(
-            [np.asarray([11], dtype=np.int32)]
-        )
+        state_bytes = mori_conn._pack_state_indices([np.asarray([11], dtype=np.int32)])
         payload = [
             b"5",
             b"decode",
