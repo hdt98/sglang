@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -22,28 +23,32 @@ class TestMoriStagingGate(unittest.TestCase):
     def test_mori_staging_enables_without_generic_staging(
         self, _mock_init, _mock_parallel, _mock_schedule
     ):
-        queue = PrefillBootstrapQueue(
-            token_to_kv_pool=SimpleNamespace(),
-            draft_token_to_kv_pool=None,
-            req_to_metadata_buffer_idx_allocator=SimpleNamespace(),
-            metadata_buffers=SimpleNamespace(),
-            tp_rank=0,
-            tp_size=1,
-            gpu_id=0,
-            bootstrap_port=0,
-            gloo_group=SimpleNamespace(),
-            max_total_num_tokens=1,
-            scheduler=SimpleNamespace(
-                token_to_kv_pool_allocator=SimpleNamespace(page_size=1),
-                tp_worker=SimpleNamespace(
-                    model_runner=SimpleNamespace(effective_max_total_num_tokens=1)
+        with patch.dict(
+            os.environ,
+            {"SGLANG_MORI_STAGING_BUFFER": "1"},
+        ):
+            queue = PrefillBootstrapQueue(
+                token_to_kv_pool=SimpleNamespace(),
+                draft_token_to_kv_pool=None,
+                req_to_metadata_buffer_idx_allocator=SimpleNamespace(),
+                metadata_buffers=SimpleNamespace(),
+                tp_rank=0,
+                tp_size=1,
+                gpu_id=0,
+                bootstrap_port=0,
+                gloo_group=SimpleNamespace(),
+                max_total_num_tokens=1,
+                scheduler=SimpleNamespace(
+                    token_to_kv_pool_allocator=SimpleNamespace(page_size=1),
+                    tp_worker=SimpleNamespace(
+                        model_runner=SimpleNamespace(effective_max_total_num_tokens=1)
+                    ),
                 ),
-            ),
-            scheduler_stage_metrics=SimpleNamespace(),
-            pp_rank=0,
-            pp_size=1,
-            transfer_backend=TransferBackend.MORI,
-        )
+                scheduler_stage_metrics=SimpleNamespace(),
+                pp_rank=0,
+                pp_size=1,
+                transfer_backend=TransferBackend.MORI,
+            )
 
         self.assertTrue(queue.enable_staging)
 
