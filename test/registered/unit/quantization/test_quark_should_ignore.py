@@ -4,6 +4,33 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
+class TestQuarkShouldIgnoreLayer(CustomTestCase):
+    def test_exact_fused_exclusion_is_not_expanded_away(self):
+        from sglang.srt.layers.quantization.quark.utils import should_ignore_layer
+
+        self.assertTrue(
+            should_ignore_layer(
+                "visual.blocks.0.attn.qkv_proj",
+                ignore=["visual.blocks.0.attn.qkv_proj"],
+                fused_mapping={"qkv_proj": ["q_proj", "k_proj", "v_proj"]},
+            )
+        )
+
+    def test_fused_shards_still_control_scheme(self):
+        from sglang.srt.layers.quantization.quark.utils import should_ignore_layer
+
+        self.assertFalse(
+            should_ignore_layer(
+                "model.layers.0.self_attn.qkv_proj",
+                ignore=[
+                    "model.layers.0.self_attn.k_proj",
+                    "model.layers.0.self_attn.v_proj",
+                ],
+                fused_mapping={"qkv_proj": ["q_proj", "k_proj", "v_proj"]},
+            )
+        )
+
+
 class TestGlm5NextNextNQuantConfig(CustomTestCase):
     def test_quark_exclude_is_unquantized_nextn(self):
         from types import SimpleNamespace
