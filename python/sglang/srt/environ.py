@@ -760,6 +760,11 @@ class Envs:
     # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
     SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
+    # Mori-specific staging intake: prefill writes into a decode-owned staging
+    # allocation, then decode copies staging -> KV locally. This avoids mapping
+    # decode's KV pool over XGMI IPC while prefill compute is active.
+    SGLANG_MORI_STAGING_BUFFER = EnvBool(False)
+    SGLANG_MORI_STAGING_POOL_SIZE_MB = EnvInt(4096)
     # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in
     # staging_buffer.py once Triton kernels are fully validated in production.
     SGLANG_STAGING_USE_TORCH = EnvBool(False)

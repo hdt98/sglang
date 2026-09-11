@@ -399,8 +399,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # support aborting them we would need an additional fix in the
         # scheduler. In practice this shouldn't arise in the RL scenario.
         self.held_rebootstrap_reqs: List[Req] = []
-        self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
-        if self.enable_staging and self.is_mla_backend:
+        generic_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        mori_staging = (
+            self.transfer_backend == TransferBackend.MORI
+            and envs.SGLANG_MORI_STAGING_BUFFER.get()
+        )
+        self.enable_staging = generic_staging or mori_staging
+        if generic_staging and self.is_mla_backend:
             raise RuntimeError(
                 "SGLANG_DISAGG_STAGING_BUFFER is designed for non-MLA models "
                 "(e.g. GQA, MHA). MLA models should not set this flag."
@@ -573,6 +578,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             num_draft_entries=num_draft_entries,
             num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
         )
+        kv_args.num_target_kv_entries = len(kv_data_ptrs) - num_draft_entries
         if self.transfer_backend == TransferBackend.NIXL:
             kv_args.kv_data_mem_kinds = kv_data_mem_kinds
         kv_args.page_size = self.token_to_kv_pool.page_size
@@ -2069,7 +2075,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.scheduler = scheduler
         self.tree_cache = tree_cache
         self.spec_algorithm = scheduler.spec_algorithm
-        self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        self.enable_staging = (
+            envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+            or envs.SGLANG_MORI_STAGING_BUFFER.get()
+        )
         self.staging_handler = None
         self.enable_deferred_kv_release = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
@@ -2282,13 +2291,18 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def _init_staging_handler(self, kv_manager):
         """Create staging handler from kv_manager. Must be called exactly once."""
-        from sglang.srt.disaggregation.common.staging_handler import (
-            DecodeStagingHandler,
-        )
+        if hasattr(kv_manager, "create_staging_handler"):
+            self.staging_handler = kv_manager.create_staging_handler(
+                self.scheduler, self.tp_rank
+            )
+        else:
+            from sglang.srt.disaggregation.common.staging_handler import (
+                DecodeStagingHandler,
+            )
 
-        self.staging_handler = DecodeStagingHandler.create(
-            kv_manager, self.scheduler, self.tp_rank
-        )
+            self.staging_handler = DecodeStagingHandler.create(
+                kv_manager, self.scheduler, self.tp_rank
+            )
         kv_manager._staging_handler = self.staging_handler
 
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
