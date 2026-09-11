@@ -32,22 +32,26 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
         )
 
     def _resolve_nextn_quant_config(self, config, quant_config):
-        """Mixed checkpoints list the BF16 NextN block in ``quantization_config.ignore``;
-        inheriting global FP8 quantization would corrupt its QKV weights."""
+        """Checkpoints declare an unquantized NextN block through ``ignore`` or
+        Quark ``exclude``; Quark expands the latter to concrete module names."""
         raw_quant_config = getattr(config, "quantization_config", None) or {}
         if hasattr(raw_quant_config, "to_dict"):
             raw_quant_config = raw_quant_config.to_dict()
-        ignored = (
-            raw_quant_config.get("ignore", [])
+        nextn_layer_prefix = f"model.layers.{config.num_hidden_layers}."
+        declared_unquantized = tuple(
+            raw_quant_config.get(key, [])
+            for key in ("ignore", "exclude")
             if isinstance(raw_quant_config, dict)
-            else []
         )
-        nextn_layer_pattern = f"model.layers.{config.num_hidden_layers}.*"
-        if nextn_layer_pattern in ignored:
+        if any(
+            entry == nextn_layer_prefix[:-1] or entry.startswith(nextn_layer_prefix)
+            for entries in declared_unquantized
+            for entry in entries
+        ):
             logger.warning(
                 "GLM5 NextN layer %s is checkpoint-declared unquantized; "
                 "using BF16 draft modules",
-                nextn_layer_pattern,
+                nextn_layer_prefix[:-1],
             )
             return None
         return super()._resolve_nextn_quant_config(config, quant_config)
