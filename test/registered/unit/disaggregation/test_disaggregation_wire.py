@@ -896,7 +896,7 @@ class TestMoriStagingGate(unittest.TestCase):
     )
     @patch(
         "sglang.srt.disaggregation.prefill.get_parallel",
-        return_value=SimpleNamespace(enable_prefill_context_parallel=False),
+        return_value=SimpleNamespace(enable_prefill_cp=False),
     )
     @patch.object(PrefillBootstrapQueue, "_init_kv_manager")
     def test_mori_staging_enables_without_generic_staging(

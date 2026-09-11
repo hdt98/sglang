@@ -19,7 +19,7 @@ class TestQuarkShouldIgnoreLayer(CustomTestCase):
     def test_fused_shards_still_control_scheme(self):
         from sglang.srt.layers.quantization.quark.utils import should_ignore_layer
 
-        self.assertFalse(
+        with self.assertRaises(ValueError):
             should_ignore_layer(
                 "model.layers.0.self_attn.qkv_proj",
                 ignore=[
@@ -28,7 +28,6 @@ class TestQuarkShouldIgnoreLayer(CustomTestCase):
                 ],
                 fused_mapping={"qkv_proj": ["q_proj", "k_proj", "v_proj"]},
             )
-        )
 
 
 class TestGlm5NextNextNQuantConfig(CustomTestCase):

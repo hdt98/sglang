@@ -208,7 +208,7 @@ class PrefillBootstrapQueue:
                     "SGLANG_DISAGG_STAGING_BUFFER with pp_size > 1 is only "
                     "supported by Mooncake."
                 )
-            if get_parallel().enable_prefill_context_parallel:
+            if get_parallel().enable_prefill_cp:
                 # CP rewrites index_slice per rank, breaking the chunk grid.
                 raise RuntimeError(
                     "SGLANG_DISAGG_STAGING_BUFFER does not support "
@@ -229,7 +229,7 @@ class PrefillBootstrapQueue:
                     f"chunked_prefill_size that is a multiple of page_size "
                     f"({page_size}); got {chunked_prefill_size}."
                 )
-            if get_parallel().enable_prefill_context_parallel:
+            if get_parallel().enable_prefill_cp:
                 raise RuntimeError(
                     "SGLANG_MORI_STAGING_BUFFER does not support prefill "
                     "context parallelism."
