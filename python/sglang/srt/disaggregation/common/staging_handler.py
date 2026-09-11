@@ -936,6 +936,7 @@ def prefetch_staging_reqs(
     staging_requested: set,
     prefetch_sockets: dict,
     requester_pp_rank: Optional[int] = None,
+    max_new_chunks_per_session: Optional[int] = None,
 ) -> None:
     """Send STAGING_REQ for all chunks before the prefill forward starts.
 
@@ -951,7 +952,15 @@ def prefetch_staging_reqs(
     full_chunk_pages = staging_grid_tokens(chunked_prefill_size, page_size) // page_size
 
     for session_id, tinfo in transfer_infos[room].items():
-        if tinfo.is_dummy:
+        emitted_for_session = 0
+
+        # mooncake exposes is_dummy as a dataclass bool field, NIXL exposes it
+        # as a method (it consults decode_prefix_len). Normalize via callable()
+        # so this shared helper works for either backend; treating a bound
+        # method as truthy (the previous behavior) silently dropped every
+        # STAGING_REQ on NIXL and deadlocked the prefill transfer worker.
+        is_dummy_attr = tinfo.is_dummy
+        if is_dummy_attr() if callable(is_dummy_attr) else is_dummy_attr:
             continue
         total_pages = len(tinfo.dst_kv_indices)
         if total_pages == 0:
@@ -959,6 +968,12 @@ def prefetch_staging_reqs(
         num_chunks = (total_pages + full_chunk_pages - 1) // full_chunk_pages
 
         for chunk_idx in range(num_chunks):
+            if (
+                max_new_chunks_per_session is not None
+                and emitted_for_session >= max_new_chunks_per_session
+            ):
+                break
+
             stg_key = (room, chunk_idx, session_id)
             if stg_key in staging_requested:
                 continue
@@ -985,5 +1000,6 @@ def prefetch_staging_reqs(
                 if requester_pp_rank is not None:
                     request.append(str(requester_pp_rank).encode("ascii"))
                 prefetch_sockets[ep].send_multipart(request)
+                emitted_for_session += 1
             except Exception:
                 staging_requested.discard(stg_key)
