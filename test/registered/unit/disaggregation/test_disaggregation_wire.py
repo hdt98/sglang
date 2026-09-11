@@ -5,8 +5,19 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import msgspec
 import numpy as np
 import torch
+
+from sglang.srt.configs import model_config
+
+with patch.object(
+    model_config,
+    "get_dsa_mtp_topk_width",
+    lambda config: 1,
+    create=True,
+):
+    from sglang.srt.disaggregation.mori import conn as mori_conn
 
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
@@ -789,6 +800,91 @@ class TestHybridStateRegistration(unittest.TestCase):
         pool.mamba_pool = SimpleNamespace(get_state_slot_strides=lambda: [128, 256])
 
         self.assertEqual(pool.get_state_slot_strides(), [128, 256])
+
+
+class _StubEngineDesc:
+    @classmethod
+    def unpack(cls, blob: bytes):
+        return SimpleNamespace(key=f"engine:{blob!r}")
+
+
+class _StubMemoryDesc:
+    def __init__(self, blob: bytes = b""):
+        self.blob = blob
+
+    @classmethod
+    def unpack(cls, blob: bytes) -> "_StubMemoryDesc":
+        return cls(blob)
+
+
+class TestMoriRegistrationWireSchema(unittest.TestCase):
+    """Verify Mori register-wire positions after the staging trim.
+
+    The staging descriptor and target-count frames shifted to indices 15/16;
+    distinct sentinel values at every shifted position fail loudly if the
+    parser reads a stale index.
+    """
+
+    def test_from_zmq_parses_shifted_staging_and_target_count(self):
+        payload = [
+            b"None",                                   # [0] register sentinel
+            b"10.0.0.1",                               # [1] endpoint
+            b"5000",                                   # [2] dst_port
+            b"engine-blob",                            # [3] engine_desc
+            msgspec.msgpack.encode([b"kv0", b"kv1"]),  # [4] dst_kv_mem_descs
+            msgspec.msgpack.encode([b"aux0"]),         # [5] dst_aux_mem_descs
+            msgspec.msgpack.encode([[b"st0"]]),        # [6] dst_state_mem_descs
+            b"0",                                      # [7] gpu_id
+            b"8",                                      # [8] decode_tp_size
+            b"3",                                      # [9] decode_tp_rank
+            b"192",                                    # [10] dst_kv_item_len
+            pack_int_lists([[64]], "I"),               # [11] dst_state_item_lens
+            pack_int_lists([[8]], "I"),                # [12] dst_state_dim_per_tensor
+            struct.pack("2Q", 192, 96),                # [13] dst_kv_item_lens
+            pack_int_lists([[16], [32]], "Q"),         # [14] dst_state_slot_strides
+            msgspec.msgpack.encode([b"staging-blob"]),  # [15] staging_mem_descs
+            b"40",                                     # [16] dst_num_target_kv_entries
+        ]
+
+        with patch.object(mori_conn, "EngineDesc", _StubEngineDesc), patch.object(
+            mori_conn, "MemoryDesc", _StubMemoryDesc
+        ):
+            info = mori_conn.KVArgsRegisterInfo.from_zmq(payload)
+
+        self.assertEqual(info.endpoint, "10.0.0.1")
+        self.assertEqual(info.dst_port, 5000)
+        self.assertEqual(info.dst_kv_item_lens, [192, 96])
+        self.assertEqual(info.dst_state_slot_strides, [[16], [32]])
+        self.assertEqual(info.staging_mem_desc.blob, b"staging-blob")
+        self.assertEqual(info.dst_num_target_kv_entries, 40)
+
+    def test_from_zmq_defaults_without_shifted_frames(self):
+        payload = [
+            b"None",
+            b"10.0.0.1",
+            b"5000",
+            b"engine-blob",
+            msgspec.msgpack.encode([b"kv0", b"kv1", b"kv2"]),
+            msgspec.msgpack.encode([b"aux0"]),
+            msgspec.msgpack.encode([[b"st0"]]),
+            b"0",
+            b"8",
+            b"3",
+            b"192",
+            pack_int_lists([[64]], "I"),
+            pack_int_lists([[8]], "I"),
+            # Frames [13]-[16] absent: sender from before the staging schema.
+        ]
+
+        with patch.object(mori_conn, "EngineDesc", _StubEngineDesc), patch.object(
+            mori_conn, "MemoryDesc", _StubMemoryDesc
+        ):
+            info = mori_conn.KVArgsRegisterInfo.from_zmq(payload)
+
+        self.assertEqual(info.dst_kv_item_lens, [192, 192, 192])
+        self.assertEqual(info.dst_state_slot_strides, [[64]])
+        self.assertIsNone(info.staging_mem_desc)
+        self.assertEqual(info.dst_num_target_kv_entries, 0)
 
 
 class TestMoriStagingGate(unittest.TestCase):
