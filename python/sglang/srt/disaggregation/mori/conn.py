@@ -690,8 +690,6 @@ class MoriKVManager(CommonKVManager):
             return
 
         failure_reason = self._wait_transfer_completion(statuses)
-        if failure_reason is None:
-            self._release_completed_chunk_mappings()
         if self._should_skip_transfer(room):
             return
         if failure_reason is not None:
@@ -826,15 +824,6 @@ class MoriKVManager(CommonKVManager):
             socket_getter=self._connect_threadsafe,
         )
 
-    def _release_completed_chunk_mappings(self) -> None:
-        if not self._release_xgmi_mappings_after_chunk:
-            return
-        released = self.engine.release_xgmi_remote_mappings()
-        logger.info(
-            "Released %s Mori XGMI remote mapping(s) after completed chunk",
-            released,
-        )
-
     def _wait_transfer_completion(
         self, statuses: List[TransferStatus]
     ) -> Optional[str]:
@@ -956,10 +945,7 @@ class MoriKVManager(CommonKVManager):
     def _dispatch_transfer_chunk(
         self, shard_idx: int, chunk: TransferKVChunk
     ) -> None:
-        if self._synchronous_chunk_transfer:
-            self._process_transfer_chunk(chunk, self._transfer_queues[shard_idx])
-        else:
-            self._transfer_queues[shard_idx].put(chunk)
+        self._transfer_queues[shard_idx].put(chunk)
 
     def _connect_threadsafe(self, endpoint: str, is_ipv6: bool = False):
         """Thread-local ZMQ socket cache with shared Context.

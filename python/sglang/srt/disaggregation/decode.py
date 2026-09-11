@@ -2066,6 +2066,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         metadata_buffers: MetadataBuffers,
         scheduler: Scheduler,
         tree_cache: BasePrefixCache,
+        transfer_backend: TransferBackend,
     ):
         self.queue: List[DecodeRequest] = []
         self.gloo_group = gloo_group
@@ -2074,11 +2075,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.metadata_buffers = metadata_buffers
         self.scheduler = scheduler
         self.tree_cache = tree_cache
+        self.transfer_backend = transfer_backend
         self.spec_algorithm = scheduler.spec_algorithm
-        self.enable_staging = (
-            envs.SGLANG_DISAGG_STAGING_BUFFER.get()
-            or envs.SGLANG_MORI_STAGING_BUFFER.get()
+        generic_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        mori_staging = (
+            self.transfer_backend == TransferBackend.MORI
+            and envs.SGLANG_MORI_STAGING_BUFFER.get()
         )
+        self.enable_staging = generic_staging or mori_staging
         self.staging_handler = None
         self.enable_deferred_kv_release = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
