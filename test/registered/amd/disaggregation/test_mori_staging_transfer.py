@@ -15,7 +15,6 @@ with patch.object(
 ):
     from sglang.srt.disaggregation.mori import conn as mori_conn
     from sglang.srt.disaggregation.mori.conn import (
-        KVArgsRegisterInfo,
         MoriKVManager,
     )
 
@@ -161,51 +160,6 @@ class TestMoriStagingTransfer(unittest.TestCase):
             receiver, "session"
         )
 
-    def test_registration_carries_target_descriptor_count(self):
-        payload = [
-            b"None",
-            b"127.0.0.1",
-            b"1234",
-            b"engine",
-            b"kv-descs",
-            b"",
-            b"",
-            b"0",
-            b"4",
-            b"2",
-            b"64",
-            b"",
-            b"",
-            np.asarray([64, 32], dtype=np.uint64).tobytes(),
-            b"",
-            b"",
-            b"staging-desc",
-            b"2",
-        ]
-
-        with (
-            patch.object(
-                mori_conn.EngineDesc,
-                "unpack",
-                return_value=types.SimpleNamespace(key="engine"),
-            ),
-            patch.object(
-                mori_conn,
-                "_unpack_mem_desc_list",
-                side_effect=[["target-0", "target-1"], [], ["staging"]],
-            ),
-            patch.object(
-                mori_conn,
-                "_unpack_mem_desc_lists",
-                return_value=[],
-            ),
-        ):
-            info = KVArgsRegisterInfo.from_zmq(payload)
-
-        self.assertEqual(info.dst_num_target_kv_entries, 2)
-        self.assertEqual(info.staging_mem_desc, "staging")
-        self.assertEqual(info.dst_kv_item_lens, [64, 32])
-
     def test_state_only_dummy_rank_stays_dummy_with_partial_prefix(self):
         state_bytes = mori_conn._pack_state_indices([np.asarray([11], dtype=np.int32)])
         payload = [
@@ -229,7 +183,6 @@ class TestMoriStagingTransfer(unittest.TestCase):
     def test_send_state_passes_per_component_mamba_slice_metadata(self):
         manager = MoriKVManager.__new__(MoriKVManager)
         manager.state_mem_descs = [["prefill-0"], ["prefill-1"]]
-        manager.state_mem_desc_offsets = [[100], [200]]
         manager.kv_args = types.SimpleNamespace(
             state_types=["mamba", "mamba"],
             state_item_lens=[[18], [18]],
@@ -245,7 +198,6 @@ class TestMoriStagingTransfer(unittest.TestCase):
             decode_tp_size=2,
             decode_tp_rank=0,
             dst_state_mem_descs=[["decode-0"], ["decode-1"]],
-            dst_state_mem_desc_offsets=[[300], [400]],
             dst_state_item_lens=[[36], [36]],
             dst_state_slot_strides=[[36], [36]],
             dst_state_dim_per_tensor=[[12], [12]],

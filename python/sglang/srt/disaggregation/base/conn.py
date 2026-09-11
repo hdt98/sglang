@@ -59,11 +59,6 @@ class KVArgs:
     state_types: List[StateType]
     state_data_ptrs: List[List[int]]
     state_data_lens: List[List[int]]
-    # Backing-storage regions used only for transport memory registration.
-    # Transfer addresses remain state_data_ptrs because they describe the
-    # logical per-layer views sent to peers.
-    state_registration_ptrs: List[List[int]]
-    state_registration_lens: List[List[int]]
     state_item_lens: List[List[int]]
     # Byte stride between request slots for every state tensor. This differs
     # from state_item_lens for page-major Mamba envelope views.

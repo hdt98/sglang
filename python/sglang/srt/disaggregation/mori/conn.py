@@ -218,9 +218,6 @@ class KVArgsRegisterInfo:
     dst_state_item_lens: List[List[int]]
     dst_state_dim_per_tensor: List[List[int]]
     dst_state_slot_strides: List[List[int]] = dataclasses.field(default_factory=list)
-    dst_state_mem_desc_offsets: List[List[int]] = dataclasses.field(
-        default_factory=list
-    )
     staging_mem_desc: Optional[MemoryDesc] = None
     dst_num_target_kv_entries: int = 0
 
@@ -265,14 +262,9 @@ class KVArgsRegisterInfo:
             if len(payload) > 14 and payload[14]
             else [list(component) for component in dst_state_item_lens]
         )
-        dst_state_mem_desc_offsets = (
-            unpack_int_lists(payload[15], "Q")
-            if len(payload) > 15 and payload[15]
-            else [[0] * len(component) for component in dst_state_mem_descs]
-        )
         staging_mem_descs = (
-            _unpack_mem_desc_list(payload[16])
-            if len(payload) > 16 and payload[16]
+            _unpack_mem_desc_list(payload[15])
+            if len(payload) > 15 and payload[15]
             else []
         )
         if len(staging_mem_descs) > 1:
@@ -280,7 +272,7 @@ class KVArgsRegisterInfo:
                 "Mori staging descriptor count mismatch: expected at most one"
             )
         dst_num_target_kv_entries = (
-            int(payload[17].decode("ascii")) if len(payload) > 17 and payload[17] else 0
+            int(payload[16].decode("ascii")) if len(payload) > 16 and payload[16] else 0
         )
         return cls(
             endpoint=endpoint,
@@ -296,7 +288,6 @@ class KVArgsRegisterInfo:
             dst_kv_item_lens=dst_kv_item_lens,
             dst_state_item_lens=dst_state_item_lens,
             dst_state_slot_strides=dst_state_slot_strides,
-            dst_state_mem_desc_offsets=dst_state_mem_desc_offsets,
             dst_state_dim_per_tensor=dst_state_dim_per_tensor,
             staging_mem_desc=staging_mem_descs[0] if staging_mem_descs else None,
             dst_num_target_kv_entries=dst_num_target_kv_entries,
@@ -357,49 +348,6 @@ class TransferTarget:
     peer_info: KVArgsRegisterInfo
 
 
-def _map_views_to_registered_regions(
-    view_ptrs: List[int],
-    view_lens: List[int],
-    registration_ptrs: List[int],
-    registration_lens: List[int],
-    registration_descs: List[MemoryDesc],
-) -> Tuple[List[MemoryDesc], List[int]]:
-    """Map logical tensor views onto their registered backing allocations."""
-    if len(view_ptrs) != len(view_lens):
-        raise ValueError(
-            "Mori state view metadata mismatch: "
-            f"ptrs={len(view_ptrs)}, lens={len(view_lens)}"
-        )
-    if not (
-        len(registration_ptrs) == len(registration_lens) == len(registration_descs)
-    ):
-        raise ValueError(
-            "Mori state registration metadata mismatch: "
-            f"ptrs={len(registration_ptrs)}, lens={len(registration_lens)}, "
-            f"descs={len(registration_descs)}"
-        )
-
-    mapped_descs: List[MemoryDesc] = []
-    mapped_offsets: List[int] = []
-    for view_ptr, view_len in zip(view_ptrs, view_lens):
-        view_end = view_ptr + view_len
-        for registration_ptr, registration_len, registration_desc in zip(
-            registration_ptrs, registration_lens, registration_descs
-        ):
-            registration_end = registration_ptr + registration_len
-            if registration_ptr <= view_ptr and view_end <= registration_end:
-                mapped_descs.append(registration_desc)
-                mapped_offsets.append(view_ptr - registration_ptr)
-                break
-        else:
-            raise ValueError(
-                "Mori state tensor view is outside registered backing memory: "
-                f"view=[{view_ptr}, {view_end}), "
-                f"regions={list(zip(registration_ptrs, registration_lens))}"
-            )
-    return mapped_descs, mapped_offsets
-
-
 class MoriKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
 
@@ -416,7 +364,6 @@ class MoriKVManager(CommonKVManager):
         self.kv_mem_descs: List[MemoryDesc] = []
         self.aux_mem_descs: List[MemoryDesc] = []
         self.state_mem_descs: List[List[MemoryDesc]] = []
-        self.state_mem_desc_offsets: List[List[int]] = []
         self.transfer_lock = threading.Lock()
         self._zmq_ctx = zmq.Context()
         self._socket_local = threading.local()
@@ -566,37 +513,19 @@ class MoriKVManager(CommonKVManager):
             )
             self.aux_mem_descs.append(desc)
         state_data_lens = getattr(self.kv_args, "state_data_lens", [])
-        registration_ptrs = getattr(
-            self.kv_args, "state_registration_ptrs", self.kv_args.state_data_ptrs
-        )
-        registration_lens = getattr(
-            self.kv_args, "state_registration_lens", state_data_lens
-        )
-        for component_idx, (component_ptrs, component_lens) in enumerate(
-            zip(self.kv_args.state_data_ptrs, state_data_lens)
+        for component_ptrs, component_lens in zip(
+            self.kv_args.state_data_ptrs, state_data_lens
         ):
-            component_registration_ptrs = registration_ptrs[component_idx]
-            component_registration_lens = registration_lens[component_idx]
-            registered_descs = [
+            component_descs = [
                 self.engine.register_memory(
                     ptr,
                     length,
                     self.kv_args.gpu_id,
                     MemoryLocationType.GPU,
                 )
-                for ptr, length in zip(
-                    component_registration_ptrs, component_registration_lens
-                )
+                for ptr, length in zip(component_ptrs, component_lens)
             ]
-            component_descs, component_offsets = _map_views_to_registered_regions(
-                component_ptrs,
-                component_lens,
-                component_registration_ptrs,
-                component_registration_lens,
-                registered_descs,
-            )
             self.state_mem_descs.append(component_descs)
-            self.state_mem_desc_offsets.append(component_offsets)
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
         current = self.request_status.get(bootstrap_room)
@@ -1424,16 +1353,10 @@ class MoriKVManager(CommonKVManager):
     def _build_tp_slice_config(
         self,
         peer_info: KVArgsRegisterInfo,
-        src_item_len: Optional[int] = None,
-        dst_item_len: Optional[int] = None,
     ) -> TPSliceConfig:
         page_size = self.kv_args.page_size
-        src_item_len = (
-            self.kv_args.kv_item_lens[0] if src_item_len is None else src_item_len
-        )
-        dst_item_len = (
-            peer_info.dst_kv_item_len if dst_item_len is None else dst_item_len
-        )
+        src_item_len = self.kv_args.kv_item_lens[0]
+        dst_item_len = peer_info.dst_kv_item_len
 
         bytes_per_token_src = src_item_len // page_size
         bytes_per_token_dst = dst_item_len // page_size
@@ -1534,41 +1457,6 @@ class MoriKVManager(CommonKVManager):
 
         if not local_offsets:
             return BatchTransferPlan([], [], [])
-
-        return BatchTransferPlan(
-            local_offsets=local_offsets,
-            remote_offsets=remote_offsets,
-            sizes=sizes,
-        )
-
-    def _build_staged_tp_slice_transfer_plan(
-        self,
-        grouped_plan: GroupedIndexPlan,
-        tp_cfg: TPSliceConfig,
-        staging_offset: int,
-        layer_offset: int,
-    ) -> BatchTransferPlan:
-        local_offsets: List[int] = []
-        remote_offsets: List[int] = []
-        sizes: List[int] = []
-
-        for src_start, dst_start, count in zip(
-            grouped_plan.src_starts,
-            grouped_plan.dst_starts,
-            grouped_plan.counts,
-        ):
-            for page_idx in range(count):
-                local_offsets.append(
-                    (src_start + page_idx) * tp_cfg.src_item_len
-                    + tp_cfg.src_head_slice_offset
-                )
-                remote_offsets.append(
-                    staging_offset
-                    + layer_offset
-                    + (dst_start + page_idx) * tp_cfg.dst_item_len
-                    + tp_cfg.dst_head_slice_offset
-                )
-                sizes.append(tp_cfg.page_size * tp_cfg.heads_bytes_per_token_to_send)
 
         return BatchTransferPlan(
             local_offsets=local_offsets,
@@ -1718,29 +1606,12 @@ class MoriKVManager(CommonKVManager):
         if peer_info.staging_mem_desc is None:
             raise RuntimeError("Mori staging descriptor is missing")
 
-        tp_mismatch = peer_info.decode_tp_size != self.attn_tp_size and not (
-            getattr(self, "is_mla_backend", False)
-            or getattr(self, "is_hybrid_mla_backend", False)
-        )
-        if tp_mismatch:
-            for layer_id, (src_item_len, dst_item_len) in enumerate(
-                zip(
-                    self.kv_args.kv_item_lens[:num_target],
-                    peer_info.dst_kv_item_lens[:num_target],
-                )
-            ):
-                if (
-                    src_item_len * self.attn_tp_size
-                    != dst_item_len * peer_info.decode_tp_size
-                ):
-                    raise ValueError(
-                        "Mori staged transfer TP item-length ratio mismatch at "
-                        f"descriptor {layer_id}: src={src_item_len}, "
-                        f"dst={dst_item_len}, prefill_tp="
-                        f"{self.attn_tp_size}, decode_tp="
-                        f"{peer_info.decode_tp_size}"
-                    )
-        elif list(self.kv_args.kv_item_lens[:num_target]) != list(
+        if peer_info.decode_tp_size != self.attn_tp_size:
+            raise ValueError(
+                "Mori staged transfer requires equal prefill and decode TP sizes: "
+                f"prefill={self.attn_tp_size}, decode={peer_info.decode_tp_size}"
+            )
+        if list(self.kv_args.kv_item_lens[:num_target]) != list(
             peer_info.dst_kv_item_lens[:num_target]
         ):
             raise ValueError(
@@ -1761,28 +1632,15 @@ class MoriKVManager(CommonKVManager):
         for layer_id in range(num_target):
             src_item_len = self.kv_args.kv_item_lens[layer_id]
             dst_item_len = peer_info.dst_kv_item_lens[layer_id]
-            if tp_mismatch:
-                tp_cfg = self._build_tp_slice_config(
-                    peer_info,
-                    src_item_len=src_item_len,
-                    dst_item_len=dst_item_len,
-                )
-                layer_plan = self._build_staged_tp_slice_transfer_plan(
-                    grouped_plan,
-                    tp_cfg,
-                    staging_offset,
-                    layer_offset,
-                )
-            else:
-                layer_plan = grouped_plan.materialize(src_item_len)
-                layer_plan = BatchTransferPlan(
-                    local_offsets=layer_plan.local_offsets,
-                    remote_offsets=[
-                        offset + staging_offset + layer_offset
-                        for offset in layer_plan.remote_offsets
-                    ],
-                    sizes=layer_plan.sizes,
-                )
+            layer_plan = grouped_plan.materialize(src_item_len)
+            layer_plan = BatchTransferPlan(
+                local_offsets=layer_plan.local_offsets,
+                remote_offsets=[
+                    offset + staging_offset + layer_offset
+                    for offset in layer_plan.remote_offsets
+                ],
+                sizes=layer_plan.sizes,
+            )
             statuses.extend(
                 self._submit_batch_transfer_plan(
                     self.kv_mem_descs[layer_id],
@@ -1984,13 +1842,6 @@ class MoriKVManager(CommonKVManager):
 
             src_descs = self.state_mem_descs[i]
             dst_descs = peer_info.dst_state_mem_descs[i]
-            src_desc_offsets = self.state_mem_desc_offsets[i]
-            peer_desc_offsets = getattr(peer_info, "dst_state_mem_desc_offsets", [])
-            dst_desc_offsets = (
-                peer_desc_offsets[i]
-                if i < len(peer_desc_offsets)
-                else [0] * len(dst_descs)
-            )
             src_lens = src_state_item_lens[i] if i < len(src_state_item_lens) else []
             src_strides = (
                 src_state_slot_strides[i]
@@ -2033,8 +1884,6 @@ class MoriKVManager(CommonKVManager):
                         dst_indices,
                         src_descs,
                         dst_descs,
-                        src_desc_offsets,
-                        dst_desc_offsets,
                         src_lens,
                         dst_lens,
                         src_strides,
@@ -2135,8 +1984,6 @@ class MoriKVManager(CommonKVManager):
         dst_state_indices: npt.NDArray[np.int32],
         src_state_mem_descs: List[MemoryDesc],
         dst_state_mem_descs: List[MemoryDesc],
-        src_state_mem_desc_offsets: List[int],
-        dst_state_mem_desc_offsets: List[int],
         src_state_item_lens: List[int],
         dst_state_item_lens: List[int],
         src_state_slot_strides: List[int],
@@ -2171,8 +2018,6 @@ class MoriKVManager(CommonKVManager):
 
         for i, src_desc in enumerate(src_state_mem_descs):
             dst_desc = dst_state_mem_descs[i]
-            src_desc_offset = src_state_mem_desc_offsets[i]
-            dst_desc_offset = dst_state_mem_desc_offsets[i]
             src_item_len = src_state_item_lens[i]
             dst_item_len = dst_state_item_lens[i]
             src_slot_stride = src_state_slot_strides[i]
@@ -2200,8 +2045,8 @@ class MoriKVManager(CommonKVManager):
             for src_idx, dst_idx in state_pairs:
                 if not tp_mismatch:
                     # same-TP: whole item copy
-                    src_offset = src_desc_offset + src_idx * src_slot_stride
-                    dst_offset = dst_desc_offset + dst_idx * dst_slot_stride
+                    src_offset = src_idx * src_slot_stride
+                    dst_offset = dst_idx * dst_slot_stride
                 else:
                     # Kimi/GDN conv state is [outer rows, TP-sharded channels],
                     # with q/k/v sub-blocks sharded independently. A flat slice
@@ -2222,16 +2067,8 @@ class MoriKVManager(CommonKVManager):
                         local_tp_rank_in_group=local_tp_rank,
                         conv_shard_groups=conv_shard_groups,
                     ):
-                        src_offset = (
-                            src_desc_offset
-                            + src_idx * src_slot_stride
-                            + src_slice_offset
-                        )
-                        dst_offset = (
-                            dst_desc_offset
-                            + dst_idx * dst_slot_stride
-                            + dst_slice_offset
-                        )
+                        src_offset = src_idx * src_slot_stride + src_slice_offset
+                        dst_offset = dst_idx * dst_slot_stride + dst_slice_offset
                         local_offsets.append(src_offset)
                         remote_offsets.append(dst_offset)
                         sizes.append(bytes_to_send)
@@ -2818,9 +2655,6 @@ class MoriKVReceiver(CommonKVReceiver):
         packed_state_slot_strides = pack_int_lists(
             self.kv_mgr.kv_args.state_slot_strides, "Q"
         )
-        packed_state_mem_desc_offsets = pack_int_lists(
-            self.kv_mgr.state_mem_desc_offsets, "Q"
-        )
         packed_state_dim_per_tensor = pack_int_lists(
             self.kv_mgr.kv_args.state_dim_per_tensor, "I"
         )
@@ -2855,7 +2689,6 @@ class MoriKVReceiver(CommonKVReceiver):
                             packed_state_dim_per_tensor,
                             packed_kv_item_lens,
                             packed_state_slot_strides,
-                            packed_state_mem_desc_offsets,
                             packed_staging_descs,
                             packed_num_target_kv_entries,
                         ]

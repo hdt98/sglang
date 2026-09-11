@@ -3989,10 +3989,6 @@ class HybridLinearKVPool(KVCache):
         )
         return mamba_data_ptrs, mamba_data_lens, mamba_item_lens
 
-    def get_state_registration_buf_infos(self):
-        data_ptrs, data_lens, _ = self.get_state_buf_infos()
-        return data_ptrs, data_lens
-
     def get_state_slot_strides(self):
         return self.mamba_pool.get_state_slot_strides()
 

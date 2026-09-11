@@ -1085,8 +1085,6 @@ def append_state_component(
     conv_shard_groups: Optional[List[Optional[List[int]]]] = None,
     slice_outer_counts: Optional[List[int]] = None,
     layer_ids: Optional[List[int]] = None,
-    registration_ptrs: Optional[List[int]] = None,
-    registration_lens: Optional[List[int]] = None,
     slot_strides: Optional[List[int]] = None,
 ) -> None:
     """Append one state component. Caller orders state_types consistently
@@ -1094,12 +1092,6 @@ def append_state_component(
     kv_args.state_types.append(state_type)
     kv_args.state_data_ptrs.append(data_ptrs)
     kv_args.state_data_lens.append(data_lens)
-    kv_args.state_registration_ptrs.append(
-        data_ptrs if registration_ptrs is None else registration_ptrs
-    )
-    kv_args.state_registration_lens.append(
-        data_lens if registration_lens is None else registration_lens
-    )
     kv_args.state_item_lens.append(item_lens)
     kv_args.state_slot_strides.append(slot_strides or item_lens)
     kv_args.state_dim_per_tensor.append(dim_per_tensor or [])
@@ -1315,8 +1307,6 @@ def setup_state_kv_args(
     kv_args.state_types = []
     kv_args.state_data_ptrs = []
     kv_args.state_data_lens = []
-    kv_args.state_registration_ptrs = []
-    kv_args.state_registration_lens = []
     kv_args.state_item_lens = []
     kv_args.state_slot_strides = []
     kv_args.state_dim_per_tensor = []
@@ -1430,9 +1420,6 @@ def setup_state_kv_args(
             # Global layer ids let the sender pair src/dst entries when the
             # prefill PP stage registers only its own subset of mamba layers.
             layer_ids = token_to_kv_pool.get_state_layer_ids()
-            registration_ptrs, registration_lens = (
-                token_to_kv_pool.get_state_registration_buf_infos()
-            )
             slot_strides = token_to_kv_pool.get_state_slot_strides()
             append_state_component(
                 kv_args,
@@ -1444,8 +1431,6 @@ def setup_state_kv_args(
                 conv_shard_groups,
                 slice_outer_counts,
                 layer_ids,
-                registration_ptrs,
-                registration_lens,
                 slot_strides,
             )
             # Hybrid DSA pools keep their index cache and kpool tail in the
