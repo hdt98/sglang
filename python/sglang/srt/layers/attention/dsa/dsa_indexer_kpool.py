@@ -113,7 +113,7 @@ class IndexerKPool(MultiPlatformOp):
         if is_cuda() and self.alt_stream is not None:
             self.compress_gate_stream = torch.cuda.Stream()
 
-        if is_cuda():
+        if is_cuda() or is_hip():
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
 
@@ -1581,5 +1581,5 @@ class IndexerKPool(MultiPlatformOp):
                         kpool_extend_cache=kpool_extend_cache,
                     )
         else:
-            raise NotImplementedError("kpool indexer is only supported on CUDA")
+            raise NotImplementedError("kpool indexer requires CUDA or ROCm")
         return topk_result
