@@ -1009,4 +1009,9 @@ def prefetch_staging_reqs(
                 emitted += 1
             except Exception:
                 staging_requested.discard(stg_key)
+                logger.exception(
+                    "Failed to send Mori staging request room=%s chunk=%d",
+                    room,
+                    chunk_idx,
+                )
     return emitted
