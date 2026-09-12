@@ -114,6 +114,25 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_radix_eviction_policy_explicitness_is_preserved(self):
+        omitted = prepare_server_args(["--model-path", "dummy"])
+        separated = prepare_server_args(
+            ["--model-path", "dummy", "--radix-eviction-policy", "lru"]
+        )
+        joined = prepare_server_args(
+            ["--model-path", "dummy", "--radix-eviction-policy=lru"]
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write("model-path: dummy\nradix-eviction-policy: lru\n")
+            config_path = f.name
+        self.addCleanup(os.unlink, config_path)
+        configured = prepare_server_args(["--config", config_path])
+
+        self.assertFalse(omitted._radix_eviction_policy_explicitly_set)
+        self.assertTrue(separated._radix_eviction_policy_explicitly_set)
+        self.assertTrue(joined._radix_eviction_policy_explicitly_set)
+        self.assertTrue(configured._radix_eviction_policy_explicitly_set)
+
     def test_ple_embedding_offload_rejects_generic_weight_offload(self):
         for generic_offload in (
             {"cpu_offload_gb": 1},
@@ -868,7 +887,13 @@ class TestLoadBalanceMethod(unittest.TestCase):
         )
 
         handle_pd_disaggregation(server_args)
-        handle_speculative_decoding(server_args)
+        with patch(
+            "sglang.srt.arg_groups.speculative_hook.model_config_of",
+            return_value=SimpleNamespace(
+                hf_config=SimpleNamespace(architectures=["DummyEagleModel"])
+            ),
+        ):
+            handle_speculative_decoding(server_args)
         self.assertFalse(resolution_result(server_args, "disable_radix_cache"))
         self.assertEqual(_resolve_speculative_algorithm_alias("NEXTN", None), "EAGLE")
         self.assertEqual(server_args.speculative_algorithm, "NEXTN")
@@ -3453,6 +3478,46 @@ class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
                     resolution_result(server_args, "enable_tp_lm_head_all_to_all")
                 )
                 self.assertNotIn("NCCL_GRAPH_REGISTER", os.environ)
+
+
+class TestDcpCommBackendDefault(CustomTestCase):
+    def _resolved(self, **fields):
+        args = ServerArgs(model_path="dummy", tp_size=8, **fields)
+        parallel_hook.handle_decode_context_parallelism(args)
+        return resolution_result(args, "dcp_comm_backend")
+
+    def test_no_dcp_is_ag_rs(self):
+        self.assertEqual(self._resolved(dcp_size=1), "ag_rs")
+
+    @override_platform(is_cuda=True, is_hip=False)
+    def test_fi_a2a_where_supported(self):
+        with patch(
+            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=True
+        ):
+            self.assertEqual(self._resolved(dcp_size=4), "fi_a2a")
+
+    @override_platform(is_cuda=True, is_hip=False)
+    def test_a2a_on_cuda_without_mnnvl(self):
+        with patch(
+            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=False
+        ):
+            self.assertEqual(self._resolved(dcp_size=4), "a2a")
+
+    @override_platform(is_cuda=False, is_hip=False)
+    def test_ag_rs_off_cuda(self):
+        with patch(
+            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=False
+        ):
+            self.assertEqual(self._resolved(dcp_size=4), "ag_rs")
+
+    @override_platform(is_cuda=True, is_hip=False)
+    def test_explicit_value_wins(self):
+        with patch(
+            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=True
+        ):
+            self.assertEqual(
+                self._resolved(dcp_size=4, dcp_comm_backend="ag_rs"), "ag_rs"
+            )
 
 
 if __name__ == "__main__":
