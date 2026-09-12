@@ -194,7 +194,8 @@ def transform_index_page_table_decode_fast(
     """
     assert page_size == 1
     assert page_table.shape[0] == topk_indices.shape[0]
-    assert topk_indices.shape[1] == 2048
+    # GLM Flash uses a 2056-token K-pool top-k.
+    assert topk_indices.shape[1] == 2056
     qo_len = topk_indices.shape[0]
     if result is None:
         result = torch.empty_like(topk_indices, dtype=torch.int32)
