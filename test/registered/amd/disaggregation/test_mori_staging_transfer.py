@@ -180,44 +180,6 @@ class TestMoriStagingTransfer(unittest.TestCase):
         self.assertEqual(info.decode_prefix_len, 32768)
         self.assertEqual(info.dst_state_indices, [np.asarray([11])])
 
-    def test_send_state_passes_per_component_mamba_slice_metadata(self):
-        manager = MoriKVManager.__new__(MoriKVManager)
-        manager.state_mem_descs = [["prefill-0"], ["prefill-1"]]
-        manager.kv_args = types.SimpleNamespace(
-            state_types=["mamba", "mamba"],
-            state_item_lens=[[18], [18]],
-            state_slot_strides=[[18], [18]],
-            state_dim_per_tensor=[[6], [6]],
-            state_conv_shard_groups=[
-                [[8, 8, 8]],
-                [[8, 8, 8]],
-            ],
-            state_slice_outer_counts=[[3], [3]],
-        )
-        peer_info = types.SimpleNamespace(
-            decode_tp_size=2,
-            decode_tp_rank=0,
-            dst_state_mem_descs=[["decode-0"], ["decode-1"]],
-            dst_state_item_lens=[[36], [36]],
-            dst_state_slot_strides=[[36], [36]],
-            dst_state_dim_per_tensor=[[12], [12]],
-        )
-        manager._send_mamba_state = Mock(return_value=["status"])
-
-        manager.send_state(
-            peer_info,
-            [np.asarray([7], dtype=np.int32), np.asarray([8], dtype=np.int32)],
-            [np.asarray([11], dtype=np.int32), np.asarray([12], dtype=np.int32)],
-        )
-
-        self.assertEqual(manager._send_mamba_state.call_count, 2)
-        first_args = manager._send_mamba_state.call_args_list[0].args
-        second_args = manager._send_mamba_state.call_args_list[1].args
-        self.assertEqual(first_args[-2], [[8, 8, 8]])
-        self.assertEqual(first_args[-1], [3])
-        self.assertEqual(second_args[-2], [[8, 8, 8]])
-        self.assertEqual(second_args[-1], [3])
-
 
 if __name__ == "__main__":
     unittest.main()

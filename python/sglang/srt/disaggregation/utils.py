@@ -872,6 +872,11 @@ def compute_mamba_state_slice_byte_blocks(
     conv state is ``[K - 1, slice_dim]``, so each logical channel slice expands
     into one byte block per convolution row.
     """
+    if outer_count <= 0 or src_dim <= 0 or dst_dim <= 0:
+        raise ValueError(
+            "Mamba TP-slice transfer requires positive state dimensions: "
+            f"outer_count={outer_count}, src_dim={src_dim}, dst_dim={dst_dim}"
+        )
     src_bytes_per_dim = src_item_len // (src_dim * outer_count)
     dst_bytes_per_dim = dst_item_len // (dst_dim * outer_count)
     logical_blocks = compute_mamba_state_slice_blocks(

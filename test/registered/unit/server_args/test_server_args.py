@@ -856,8 +856,22 @@ class TestLoadBalanceMethod(unittest.TestCase):
         handle_pd_disaggregation(server_args)
         self.assertFalse(resolution_result(server_args, "disable_radix_cache"))
         self.assertEqual(_resolve_speculative_algorithm_alias("EAGLE", None), "EAGLE")
-        self.assertEqual(_resolve_speculative_algorithm_alias("NEXTN", None), "EAGLE")
         self.assertEqual(server_args.speculative_algorithm, "EAGLE")
+
+    def test_pd_decode_radix_cache_accepts_raw_nextn(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="nixl",
+            speculative_algorithm="NEXTN",
+        )
+
+        handle_pd_disaggregation(server_args)
+        handle_speculative_decoding(server_args)
+        self.assertFalse(resolution_result(server_args, "disable_radix_cache"))
+        self.assertEqual(_resolve_speculative_algorithm_alias("NEXTN", None), "EAGLE")
+        self.assertEqual(server_args.speculative_algorithm, "NEXTN")
 
     def test_pd_decode_radix_cache_rejects_other_speculative_algorithms(self):
         for algorithm in ("EAGLE3", "DFLASH", "NGRAM"):

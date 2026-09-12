@@ -134,11 +134,11 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         cfg.disaggregation_mode == "decode"
         and cfg.disaggregation_decode_enable_radix_cache
         and cfg.speculative_algorithm is not None
-        and cfg.speculative_algorithm != "EAGLE"
+        and resolved_speculative_algorithm != "EAGLE"
     ):
         raise ValueError(
             "PD decode radix cache only supports resolved EAGLE speculative "
-            "decoding (raw EAGLE/NEXTN); got resolved "
+            "decoding (raw EAGLE/NEXTN); got "
             f"--speculative-algorithm {cfg.speculative_algorithm}"
         )
     # Validate --speculative-draft-window-size once, regardless of algorithm.

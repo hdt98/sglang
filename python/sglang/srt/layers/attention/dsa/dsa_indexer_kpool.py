@@ -994,6 +994,8 @@ class IndexerKPool(MultiPlatformOp):
     ):
         num_q = q_fp8.shape[0]
         num_k = k_fp8.shape[0] if k_fp8 is not None else 0
+        if num_q == 0:
+            return torch.empty((0, 0), dtype=torch.int32, device=q_fp8.device)
         chunk_rows = max(1, self._mqa_logits_chunk_rows(num_q, num_k))
         chunks = []
         for start in range(0, max(num_q, 1), chunk_rows):

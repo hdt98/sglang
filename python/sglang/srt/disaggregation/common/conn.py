@@ -599,8 +599,8 @@ class CommonKVManager(BaseKVManager):
             ):
                 return
             # Tell the staging handler no more chunks are coming, before any
-            # poller can see Success. Only mooncake gets here: NIXL arms the
-            # handler from its own notifications, mori has no staging.
+            # poller can see Success. NIXL arms the handler from its own
+            # notifications; Mooncake and Mori both arrive here.
             if self.enable_staging and self._staging_handler is not None:
                 handler = self._staging_handler
                 if handler.is_staging_room(bootstrap_room):

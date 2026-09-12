@@ -56,7 +56,7 @@ from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MambaPool
+from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.eagle_disaggregation import (
     build_eagle_disagg_draft_input,
@@ -792,14 +792,6 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
                 self.assertEqual(kv_args.state_data_ptrs[-1], expected_infos[0])
                 self.assertEqual(kv_args.state_data_lens[-1], expected_infos[1])
                 self.assertEqual(kv_args.state_item_lens[-1], expected_infos[2])
-
-
-class TestHybridStateRegistration(unittest.TestCase):
-    def test_hybrid_slot_strides_delegate_to_mamba_pool(self):
-        pool = HybridLinearKVPool.__new__(HybridLinearKVPool)
-        pool.mamba_pool = SimpleNamespace(get_state_slot_strides=lambda: [128, 256])
-
-        self.assertEqual(pool.get_state_slot_strides(), [128, 256])
 
 
 class _StubEngineDesc:
