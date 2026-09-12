@@ -113,7 +113,7 @@ class IndexerKPool(MultiPlatformOp):
         if is_cuda() and self.alt_stream is not None:
             self.compress_gate_stream = torch.cuda.Stream()
 
-        if is_cuda() or is_hip():
+        if is_cuda():
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
 
@@ -1553,7 +1553,7 @@ class IndexerKPool(MultiPlatformOp):
         if weights is None:
             weights = self._get_logits_head_gate(x, q_scale)
 
-        if is_cuda():
+        if is_cuda() or is_hip():
             if (
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
