@@ -1,3 +1,5 @@
+import unittest
+
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -75,3 +77,7 @@ class TestGlm5NextNextNQuantConfig(CustomTestCase):
                 None, config, object()
             )
         )
+
+
+if __name__ == "__main__":
+    unittest.main()
