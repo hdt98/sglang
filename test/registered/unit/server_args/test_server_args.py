@@ -867,7 +867,7 @@ class TestLoadBalanceMethod(unittest.TestCase):
                     disaggregation_mode="decode",
                     disaggregation_decode_enable_radix_cache=True,
                     disaggregation_transfer_backend="nixl",
-                speculative_algorithm=algorithm,
+                    speculative_algorithm=algorithm,
                 )
                 handle_pd_disaggregation(server_args)
                 self.assertNotEqual(
