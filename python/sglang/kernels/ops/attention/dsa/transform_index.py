@@ -220,8 +220,8 @@ def transform_index_page_table_prefill_fast(
     cu_seqlens_q: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     assert page_size == 1
-    # GLM Flash uses a 2056-token K-pool top-k.
-    assert topk_indices.shape[1] == 2056
+    # GLM Flash K-pool returns `topk + pool_size - 1` columns before trimming.
+    assert topk_indices.shape[1] in (2048, 2051)
     real_num_tokens = sum(extend_lens_cpu)
     result = _allocate_prefill_result(topk_indices, real_num_tokens, output_num_tokens)
     if real_num_tokens == 0:
