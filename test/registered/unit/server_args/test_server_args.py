@@ -869,10 +869,11 @@ class TestLoadBalanceMethod(unittest.TestCase):
                     disaggregation_transfer_backend="nixl",
                     speculative_algorithm=algorithm,
                 )
-                handle_pd_disaggregation(server_args)
-                self.assertNotEqual(
-                    _resolve_speculative_algorithm_alias(algorithm, None), "EAGLE"
-                )
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "PD decode radix cache only supports resolved EAGLE speculative decoding",
+                ):
+                    handle_speculative_decoding(server_args)
 
     def test_pd_decode_radix_cache_allows_mooncake_tcp(self):
         server_args = self._load_balance_args(
