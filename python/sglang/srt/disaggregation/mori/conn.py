@@ -742,6 +742,7 @@ class MoriKVManager(CommonKVManager):
             requester_pp_rank=self.pp_rank,
             max_new_chunks_per_session=1,
             socket_getter=self._connect_threadsafe,
+            socket_cache=False,
         )
 
     def _wait_transfer_completion(

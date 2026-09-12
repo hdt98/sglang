@@ -1268,6 +1268,9 @@ class IndexerKPool(MultiPlatformOp):
                 )
             else:
                 k_fp8 = k_scale = None
+                row_starts = torch.zeros(
+                    (q_len,), dtype=torch.int32, device=q_fp8.device
+                )
 
             page_table_local = None
             topk_offsets_local = None

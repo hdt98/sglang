@@ -938,6 +938,7 @@ def prefetch_staging_reqs(
     requester_pp_rank: Optional[int] = None,
     max_new_chunks_per_session: Optional[int] = None,
     socket_getter: Optional[Callable[..., object]] = None,
+    socket_cache: bool = True,
 ) -> int:
     """Send STAGING_REQ for all chunks before the prefill forward starts.
 
@@ -956,13 +957,7 @@ def prefetch_staging_reqs(
     for session_id, tinfo in transfer_infos[room].items():
         emitted_for_session = 0
 
-        # mooncake exposes is_dummy as a dataclass bool field, NIXL exposes it
-        # as a method (it consults decode_prefix_len). Normalize via callable()
-        # so this shared helper works for either backend; treating a bound
-        # method as truthy (the previous behavior) silently dropped every
-        # STAGING_REQ on NIXL and deadlocked the prefill transfer worker.
-        is_dummy_attr = tinfo.is_dummy
-        if is_dummy_attr() if callable(is_dummy_attr) else is_dummy_attr:
+        if tinfo.is_dummy:
             continue
         total_pages = len(tinfo.dst_kv_indices)
         if total_pages == 0:
@@ -986,7 +981,18 @@ def prefetch_staging_reqs(
             try:
                 na = NetworkAddress(tinfo.endpoint, tinfo.dst_port)
                 ep = na.to_tcp()
-                if ep not in prefetch_sockets:
+                if socket_cache:
+                    sock = prefetch_sockets.get(ep)
+                    if sock is None:
+                        if socket_getter is not None:
+                            sock = socket_getter(ep, is_ipv6=na.is_ipv6)
+                        else:
+                            sock = zmq.Context().socket(zmq.PUSH)
+                            if na.is_ipv6:
+                                sock.setsockopt(zmq.IPV6, 1)
+                            sock.connect(ep)
+                        prefetch_sockets[ep] = sock
+                else:
                     if socket_getter is not None:
                         sock = socket_getter(ep, is_ipv6=na.is_ipv6)
                     else:
@@ -994,7 +1000,6 @@ def prefetch_staging_reqs(
                         if na.is_ipv6:
                             sock.setsockopt(zmq.IPV6, 1)
                         sock.connect(ep)
-                    prefetch_sockets[ep] = sock
                 request = [
                     b"STAGING_REQ",
                     str(room).encode("ascii"),
@@ -1004,9 +1009,8 @@ def prefetch_staging_reqs(
                 ]
                 if requester_pp_rank is not None:
                     request.append(str(requester_pp_rank).encode("ascii"))
-                prefetch_sockets[ep].send_multipart(request)
+                sock.send_multipart(request)
                 emitted_for_session += 1
-                emitted += 1
             except Exception:
                 staging_requested.discard(stg_key)
                 logger.exception(

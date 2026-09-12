@@ -1144,9 +1144,8 @@ class MambaPool:
     def get_state_slot_strides(self):
         """Get the byte distance between adjacent Mamba state slots."""
         slot_strides = []
-        for _, state_tensor, _ in self._iter_transfer_state_tensors():
-            slot_stride = state_tensor.stride(1) * state_tensor.element_size()
-            slot_strides += [slot_stride for _ in range(self.num_mamba_layers)]
+        for _, state_tensor, _, _ in self._iter_transfer_state_entries():
+            slot_strides.append(state_tensor.stride(0) * state_tensor.element_size())
         return slot_strides
 
     def get_state_dim_per_tensor(self):

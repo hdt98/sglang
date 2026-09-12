@@ -1066,7 +1066,12 @@ class TestMambaStateSlotStrides(unittest.TestCase):
             stride=(20, 10, 1),
             storage_offset=0,
         )
-        pool._iter_transfer_state_tensors = lambda: iter([("temporal", state, 0)])
+        pool._iter_transfer_state_entries = lambda: iter(
+            [
+                ("temporal", state[0], None, 0),
+                ("temporal", state[1], None, 1),
+            ]
+        )
 
         # Each slot starts 10 float32 elements (40 bytes) apart, while one
         # state item is only 16 bytes.
