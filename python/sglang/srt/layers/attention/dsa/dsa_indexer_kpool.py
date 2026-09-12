@@ -1288,7 +1288,7 @@ class IndexerKPool(MultiPlatformOp):
         enable_dual_stream: bool,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
-        assert is_cuda(), "DSA kpool target_verify is CUDA-only"
+        assert is_cuda() or is_hip(), "DSA kpool target_verify requires CUDA or ROCm"
         plan = metadata.attn_metadata.kpool_write_plan
         assert plan is not None, "DSA kpool target_verify requires kpool_write_plan"
         num_draft_tokens = plan.num_draft_tokens
@@ -1410,7 +1410,9 @@ class IndexerKPool(MultiPlatformOp):
         metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
 
         enable_dual_stream = (
-            self.alt_stream is not None
+            # The split projections below use DeepGEMM's per-stream SM limit.
+            is_cuda()
+            and self.alt_stream is not None
             and get_is_capture_mode()
             and q_lora.shape[0] > 0
             and q_lora.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
