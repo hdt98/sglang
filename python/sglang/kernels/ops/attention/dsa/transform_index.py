@@ -11,7 +11,10 @@ def transform_index_page_table_prefill(**kwargs):
 
 
 def transform_index_page_table_decode(**kwargs):
-    return transform_index_page_table_decode_fast(**kwargs)
+    if kwargs["topk_indices"].shape[1] == 2048:
+        return transform_index_page_table_decode_fast(**kwargs)
+    # GLM Flash K-pool returns topk + pool_size - 1 columns before trimming.
+    return transform_index_page_table_decode_ref(**kwargs)
 
 
 @triton.jit
