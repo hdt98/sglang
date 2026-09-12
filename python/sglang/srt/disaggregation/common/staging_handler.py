@@ -1011,6 +1011,7 @@ def prefetch_staging_reqs(
                     request.append(str(requester_pp_rank).encode("ascii"))
                 sock.send_multipart(request)
                 emitted_for_session += 1
+                emitted += 1
             except Exception:
                 staging_requested.discard(stg_key)
                 logger.exception(
