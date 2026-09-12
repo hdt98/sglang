@@ -289,7 +289,11 @@ void setup_kernel_smem_once(host::DebugInfo where = {}) {
   [[maybe_unused]]
   static const auto result = [] {
     const auto fptr = std::bit_cast<const void*>(f);
+#ifdef USE_ROCM
+    return ::hipFuncSetAttribute(fptr, ::hipFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
+#else
     return ::cudaFuncSetAttribute(fptr, ::cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
+#endif
   }();
   host::RuntimeDeviceCheck(result, where);
 }
