@@ -11,7 +11,6 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
-#include <cuda_fp16.h>
 
 namespace sglang {
 namespace {
