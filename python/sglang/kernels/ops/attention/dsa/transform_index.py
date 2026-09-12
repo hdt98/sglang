@@ -194,8 +194,7 @@ def transform_index_page_table_decode_fast(
     """
     assert page_size == 1
     assert page_table.shape[0] == topk_indices.shape[0]
-    # GLM Flash uses a 2056-token K-pool top-k.
-    assert topk_indices.shape[1] == 2056
+    assert topk_indices.shape[1] == 2048
     qo_len = topk_indices.shape[0]
     if result is None:
         result = torch.empty_like(topk_indices, dtype=torch.int32)
@@ -221,7 +220,8 @@ def transform_index_page_table_prefill_fast(
     cu_seqlens_q: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     assert page_size == 1
-    assert topk_indices.shape[1] == 2048
+    # GLM Flash uses a 2056-token K-pool top-k.
+    assert topk_indices.shape[1] == 2056
     real_num_tokens = sum(extend_lens_cpu)
     result = _allocate_prefill_result(topk_indices, real_num_tokens, output_num_tokens)
     if real_num_tokens == 0:
