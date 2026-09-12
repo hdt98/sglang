@@ -18,9 +18,7 @@ tilelang.set_log_level("WARNING")
 # second compile sees indices already-converted for the first's len(params)
 # and silently builds the wrong adapter, leading to IndexError at call time.
 # Patch once on import to copy the list before mutation.
-from tilelang.jit.adapter.base import (  # noqa: E402
-    BaseKernelAdapter as _BaseKernelAdapter,
-)
+from tilelang.jit.adapter.base import BaseKernelAdapter as _BaseKernelAdapter  # noqa: E402
 
 if not getattr(_BaseKernelAdapter, "_legalize_result_idx_patched", False):
     _orig_legalize = _BaseKernelAdapter._legalize_result_idx
