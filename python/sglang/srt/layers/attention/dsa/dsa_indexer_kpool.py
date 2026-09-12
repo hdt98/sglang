@@ -823,11 +823,26 @@ class IndexerKPool(MultiPlatformOp):
                 block_tables,
                 seqlens_32,
                 blocksize,
-                build_schedule_metadata=not use_tilelang_paged_mqa,
+                build_schedule_metadata=not (is_hip() or use_tilelang_paged_mqa),
             )
         )
         pool_max_seq_len = pool_block_tables.shape[1] * blocksize
-        if use_tilelang_paged_mqa:
+        if is_hip():
+            from sglang.kernels.ops.attention.dsa.paged_mqa_logits import (
+                aiter_paged_mqa_logits,
+            )
+
+            logits = aiter_paged_mqa_logits(
+                q_fp8.squeeze(1),
+                kv_cache_fp8,
+                weights,
+                pool_seqlens,
+                pool_block_tables,
+                pool_max_seq_len,
+                preshuffle=True,
+                kv_block_size=blocksize,
+            )
+        elif use_tilelang_paged_mqa:
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits,
             )
