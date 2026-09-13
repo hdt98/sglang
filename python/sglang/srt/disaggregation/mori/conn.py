@@ -358,8 +358,12 @@ class MoriKVManager(CommonKVManager):
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
     ):
-        self.enable_staging = envs.SGLANG_MORI_STAGING_BUFFER.get()
+        mori_staging_enabled = envs.SGLANG_MORI_STAGING_BUFFER.get()
+        self.enable_staging = mori_staging_enabled
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        # CommonKVManager reinitializes decode-side staging state; restore the
+        # Mori setting after bootstrap registration and before mode branches run.
+        self.enable_staging = mori_staging_enabled
         self.engine = self._init_engine()
         self.engine_desc = self.engine.get_engine_desc()
         self.kv_mem_descs: List[MemoryDesc] = []
