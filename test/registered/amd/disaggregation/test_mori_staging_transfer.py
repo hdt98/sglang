@@ -325,6 +325,7 @@ class TestMoriStagingTransfer(unittest.TestCase):
 
     def test_state_transfer_is_not_gated_on_truthy_destination_state_indices(self):
         manager = MoriKVManager.__new__(MoriKVManager)
+        manager.disaggregation_mode = mori_conn.DisaggregationMode.PREFILL
         manager.transfer_lock = threading.Lock()
         manager.request_status = {5: 2}
         manager.enable_staging = False
