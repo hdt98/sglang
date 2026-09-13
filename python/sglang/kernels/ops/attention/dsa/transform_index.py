@@ -101,19 +101,38 @@ def transform_index_page_table_decode_kernel(
     result_ptr: torch.Tensor,
     page_size: tl.constexpr,
     page_table_row_stride: tl.constexpr,
+    page_table_stride_1: tl.constexpr,
+    topk_indices_stride_0: tl.constexpr,
+    topk_indices_stride_1: tl.constexpr,
+    result_stride_0: tl.constexpr,
+    result_stride_1: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
 ):
-    TOPK: tl.constexpr = 2048
     req_id = tl.program_id(0)
-    page_table_ptr = page_table_ptr + req_id * page_table_row_stride
-    topk_indices_ptr = topk_indices_ptr + req_id * TOPK
-    result_ptr = result_ptr + req_id * TOPK
+    topk_offsets = tl.program_id(1) * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
+    mask = topk_offsets < TOPK
 
-    offset = tl.arange(0, TOPK)  # topk should be 2048
-    loaded_topk_indices = tl.load(topk_indices_ptr + offset)
-    mask = loaded_topk_indices >= 0
-    loaded_kv_indices = tl.load(page_table_ptr + loaded_topk_indices, mask=mask)
-    tl.store(result_ptr + offset, loaded_kv_indices, mask=mask)
-    tl.store(result_ptr + offset, -1, mask=~mask)
+    loaded_topk_indices = tl.load(
+        topk_indices_ptr
+        + req_id * topk_indices_stride_0
+        + topk_offsets * topk_indices_stride_1,
+        mask=mask,
+        other=-1,
+    )
+    valid_topk_mask = mask & (loaded_topk_indices >= 0)
+    loaded_kv_indices = tl.load(
+        page_table_ptr
+        + req_id * page_table_row_stride
+        + loaded_topk_indices * page_table_stride_1,
+        mask=valid_topk_mask,
+        other=-1,
+    )
+    tl.store(
+        result_ptr + req_id * result_stride_0 + topk_offsets * result_stride_1,
+        loaded_kv_indices,
+        mask=mask,
+    )
 
 
 # Expanded EAGLE page tables are contiguous, so their row stride changes with
@@ -194,18 +213,27 @@ def transform_index_page_table_decode_fast(
     """
     assert page_size == 1
     assert page_table.shape[0] == topk_indices.shape[0]
-    assert topk_indices.shape[1] == 2048
     qo_len = topk_indices.shape[0]
     if result is None:
         result = torch.empty_like(topk_indices, dtype=torch.int32)
+    assert result.shape == topk_indices.shape
     # Launch triton kernel
-    grid = (qo_len,)
+    block_topk = 256
+    grid = (qo_len, triton.cdiv(topk_indices.shape[1], block_topk))
     transform_index_page_table_decode_kernel[grid](
         page_table,
         topk_indices,
         result,
         page_size,
         page_table_row_stride=page_table.stride(0),
+        page_table_stride_1=page_table.stride(1),
+        topk_indices_stride_0=topk_indices.stride(0),
+        topk_indices_stride_1=topk_indices.stride(1),
+        result_stride_0=result.stride(0),
+        result_stride_1=result.stride(1),
+        TOPK=topk_indices.shape[1],
+        BLOCK_TOPK=block_topk,
+        num_warps=4,
     )
     return result
 
@@ -220,7 +248,8 @@ def transform_index_page_table_prefill_fast(
     cu_seqlens_q: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     assert page_size == 1
-    assert topk_indices.shape[1] == 2048
+    # GLM Flash K-pool returns `topk + pool_size - 1` columns before trimming.
+    assert topk_indices.shape[1] in (2048, 2051)
     real_num_tokens = sum(extend_lens_cpu)
     result = _allocate_prefill_result(topk_indices, real_num_tokens, output_num_tokens)
     if real_num_tokens == 0:

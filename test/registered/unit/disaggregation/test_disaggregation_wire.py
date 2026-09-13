@@ -1,11 +1,23 @@
+import os
 import struct
 import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import msgspec
 import numpy as np
 import torch
+
+from sglang.srt.configs import model_config
+
+with patch.object(
+    model_config,
+    "get_dsa_mtp_topk_width",
+    lambda config: 1,
+    create=True,
+):
+    from sglang.srt.disaggregation.mori import conn as mori_conn
 
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
@@ -31,8 +43,10 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVManager,
     TransferInfo,
 )
+from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
+    TransferBackend,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
     get_dsv4_c4_state_indices,
@@ -46,6 +60,7 @@ from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.mem_cache.qsa_kv_pool import (
     QSA_ROPE_STATE_LAYER_ID,
     QSATokenToKVPool,
@@ -911,6 +926,156 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
                 self.assertEqual(kv_args.state_data_ptrs[-1], expected_infos[0])
                 self.assertEqual(kv_args.state_data_lens[-1], expected_infos[1])
                 self.assertEqual(kv_args.state_item_lens[-1], expected_infos[2])
+
+
+class _StubEngineDesc:
+    @classmethod
+    def unpack(cls, blob: bytes):
+        return SimpleNamespace(key=f"engine:{blob!r}")
+
+
+class _StubMemoryDesc:
+    def __init__(self, blob: bytes = b""):
+        self.blob = blob
+
+    @classmethod
+    def unpack(cls, blob: bytes) -> "_StubMemoryDesc":
+        return cls(blob)
+
+
+class TestMoriRegistrationWireSchema(unittest.TestCase):
+    """Verify Mori register-wire positions after the staging trim.
+
+    The staging descriptor and target-count frames shifted to indices 15/16;
+    distinct sentinel values at every shifted position fail loudly if the
+    parser reads a stale index.
+    """
+
+    def test_from_zmq_parses_shifted_staging_and_target_count(self):
+        payload = [
+            b"None",  # [0] register sentinel
+            b"10.0.0.1",  # [1] endpoint
+            b"5000",  # [2] dst_port
+            b"engine-blob",  # [3] engine_desc
+            msgspec.msgpack.encode([b"kv0", b"kv1"]),  # [4] dst_kv_mem_descs
+            msgspec.msgpack.encode([b"aux0"]),  # [5] dst_aux_mem_descs
+            msgspec.msgpack.encode([[b"st0"]]),  # [6] dst_state_mem_descs
+            b"0",  # [7] gpu_id
+            b"8",  # [8] decode_tp_size
+            b"3",  # [9] decode_tp_rank
+            b"192",  # [10] dst_kv_item_len
+            pack_int_lists([[64]], "I"),  # [11] dst_state_item_lens
+            pack_int_lists([[8]], "I"),  # [12] dst_state_dim_per_tensor
+            struct.pack("2Q", 192, 96),  # [13] dst_kv_item_lens
+            pack_int_lists([[16], [32]], "Q"),  # [14] dst_state_slot_strides
+            msgspec.msgpack.encode([b"staging-blob"]),  # [15] staging_mem_descs
+            b"40",  # [16] dst_num_target_kv_entries
+        ]
+
+        with (
+            patch.object(mori_conn, "EngineDesc", _StubEngineDesc),
+            patch.object(mori_conn, "MemoryDesc", _StubMemoryDesc),
+        ):
+            info = mori_conn.KVArgsRegisterInfo.from_zmq(payload)
+
+        self.assertEqual(info.endpoint, "10.0.0.1")
+        self.assertEqual(info.dst_port, 5000)
+        self.assertEqual(info.dst_kv_item_lens, [192, 96])
+        self.assertEqual(info.dst_state_slot_strides, [[16], [32]])
+        self.assertEqual(info.staging_mem_desc.blob, b"staging-blob")
+        self.assertEqual(info.dst_num_target_kv_entries, 40)
+
+    def test_from_zmq_defaults_without_shifted_frames(self):
+        payload = [
+            b"None",
+            b"10.0.0.1",
+            b"5000",
+            b"engine-blob",
+            msgspec.msgpack.encode([b"kv0", b"kv1", b"kv2"]),
+            msgspec.msgpack.encode([b"aux0"]),
+            msgspec.msgpack.encode([[b"st0"]]),
+            b"0",
+            b"8",
+            b"3",
+            b"192",
+            pack_int_lists([[64]], "I"),
+            pack_int_lists([[8]], "I"),
+            # Frames [13]-[16] absent: sender from before the staging schema.
+        ]
+
+        with (
+            patch.object(mori_conn, "EngineDesc", _StubEngineDesc),
+            patch.object(mori_conn, "MemoryDesc", _StubMemoryDesc),
+        ):
+            info = mori_conn.KVArgsRegisterInfo.from_zmq(payload)
+
+        self.assertEqual(info.dst_kv_item_lens, [192, 192, 192])
+        self.assertEqual(info.dst_state_slot_strides, [[64]])
+        self.assertIsNone(info.staging_mem_desc)
+        self.assertEqual(info.dst_num_target_kv_entries, 0)
+
+
+class TestMoriStagingGate(unittest.TestCase):
+    @patch(
+        "sglang.srt.disaggregation.prefill.get_schedule",
+        return_value=SimpleNamespace(chunked_prefill_size=8192),
+    )
+    @patch(
+        "sglang.srt.disaggregation.prefill.get_parallel",
+        return_value=SimpleNamespace(enable_prefill_cp=False),
+    )
+    @patch.object(PrefillBootstrapQueue, "_init_kv_manager")
+    def test_mori_staging_enables_without_generic_staging(
+        self, _mock_init, _mock_parallel, _mock_schedule
+    ):
+        with patch.dict(os.environ, {"SGLANG_MORI_STAGING_BUFFER": "1"}):
+            queue = PrefillBootstrapQueue(
+                token_to_kv_pool=SimpleNamespace(),
+                draft_token_to_kv_pool=None,
+                req_to_metadata_buffer_idx_allocator=SimpleNamespace(),
+                metadata_buffers=SimpleNamespace(),
+                tp_rank=0,
+                tp_size=1,
+                gpu_id=0,
+                bootstrap_port=0,
+                gloo_group=SimpleNamespace(),
+                max_total_num_tokens=1,
+                scheduler=SimpleNamespace(
+                    token_to_kv_pool_allocator=SimpleNamespace(page_size=1),
+                    tp_worker=SimpleNamespace(
+                        model_runner=SimpleNamespace(effective_max_total_num_tokens=1)
+                    ),
+                ),
+                scheduler_stage_metrics=SimpleNamespace(),
+                pp_rank=0,
+                pp_size=1,
+                transfer_backend=TransferBackend.MORI,
+            )
+
+        self.assertTrue(queue.enable_staging)
+
+
+class TestMambaStateSlotStrides(unittest.TestCase):
+    def test_slot_strides_use_slot_axis_not_item_length(self):
+        pool = MambaPool.__new__(MambaPool)
+        pool.num_mamba_layers = 2
+        raw = torch.zeros(200, dtype=torch.uint8)
+        state = torch.as_strided(
+            raw.view(torch.float32),
+            size=(2, 3, 4),
+            stride=(20, 10, 1),
+            storage_offset=0,
+        )
+        pool._iter_transfer_state_entries = lambda: iter(
+            [
+                ("temporal", state[0], None, 0),
+                ("temporal", state[1], None, 1),
+            ]
+        )
+
+        # Each slot starts 10 float32 elements (40 bytes) apart, while one
+        # state item is only 16 bytes.
+        self.assertEqual(pool.get_state_slot_strides(), [40, 40])
 
 
 if __name__ == "__main__":

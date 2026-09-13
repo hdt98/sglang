@@ -51,6 +51,9 @@ class KVArgs:
     kv_data_lens: List[int]
     kv_item_lens: List[int]
     kv_layer_ids: List[int]
+    # Number of target-model entries in kv_data_ptrs (draft entries excluded).
+    # Used by staging-capable backends to size/copy only target KV.
+    num_target_kv_entries: int = 0
     kv_cache_dtype_str: str
     aux_data_ptrs: List[int]
     aux_data_lens: List[int]
@@ -59,6 +62,9 @@ class KVArgs:
     state_data_ptrs: List[List[int]]
     state_data_lens: List[List[int]]
     state_item_lens: List[List[int]]
+    # Byte stride between request slots for every state tensor. This differs
+    # from state_item_lens for page-major Mamba envelope views.
+    state_slot_strides: List[List[int]]
     state_layer_ids: List[List[int]]
     # Per-tensor TP slice dim, used when prefill/decode attn_tp_size differ.
     state_dim_per_tensor: List[List[int]]

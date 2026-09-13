@@ -13,7 +13,7 @@ import logging
 import struct
 import threading
 import time
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 
@@ -936,7 +936,11 @@ def prefetch_staging_reqs(
     staging_requested: set,
     prefetch_sockets: dict,
     requester_pp_rank: Optional[int] = None,
-) -> None:
+    max_new_chunks_per_session: Optional[int] = None,
+    socket_getter: Optional[Callable[..., object]] = None,
+    socket_cache: bool = True,
+    return_complete: bool = False,
+) -> Tuple[int, bool] | int:
     """Send STAGING_REQ for all chunks before the prefill forward starts.
 
     Called from the scheduler right after batch formation, so that decode
@@ -950,7 +954,11 @@ def prefetch_staging_reqs(
     page_size = kv_buffer_tensors["page_size"]
     full_chunk_pages = staging_grid_tokens(chunked_prefill_size, page_size) // page_size
 
+    emitted = 0
+    all_requests_sent = True
     for session_id, tinfo in transfer_infos[room].items():
+        emitted_for_session = 0
+
         if tinfo.is_dummy:
             continue
         total_pages = len(tinfo.dst_kv_indices)
@@ -959,6 +967,12 @@ def prefetch_staging_reqs(
         num_chunks = (total_pages + full_chunk_pages - 1) // full_chunk_pages
 
         for chunk_idx in range(num_chunks):
+            if (
+                max_new_chunks_per_session is not None
+                and emitted_for_session >= max_new_chunks_per_session
+            ):
+                break
+
             stg_key = (room, chunk_idx, session_id)
             if stg_key in staging_requested:
                 continue
@@ -969,12 +983,25 @@ def prefetch_staging_reqs(
             try:
                 na = NetworkAddress(tinfo.endpoint, tinfo.dst_port)
                 ep = na.to_tcp()
-                if ep not in prefetch_sockets:
-                    sock = zmq.Context().socket(zmq.PUSH)
-                    if na.is_ipv6:
-                        sock.setsockopt(zmq.IPV6, 1)
-                    sock.connect(ep)
-                    prefetch_sockets[ep] = sock
+                if socket_cache:
+                    sock = prefetch_sockets.get(ep)
+                    if sock is None:
+                        if socket_getter is not None:
+                            sock = socket_getter(ep, is_ipv6=na.is_ipv6)
+                        else:
+                            sock = zmq.Context().socket(zmq.PUSH)
+                            if na.is_ipv6:
+                                sock.setsockopt(zmq.IPV6, 1)
+                            sock.connect(ep)
+                        prefetch_sockets[ep] = sock
+                else:
+                    if socket_getter is not None:
+                        sock = socket_getter(ep, is_ipv6=na.is_ipv6)
+                    else:
+                        sock = zmq.Context().socket(zmq.PUSH)
+                        if na.is_ipv6:
+                            sock.setsockopt(zmq.IPV6, 1)
+                        sock.connect(ep)
                 request = [
                     b"STAGING_REQ",
                     str(room).encode("ascii"),
@@ -984,6 +1011,17 @@ def prefetch_staging_reqs(
                 ]
                 if requester_pp_rank is not None:
                     request.append(str(requester_pp_rank).encode("ascii"))
-                prefetch_sockets[ep].send_multipart(request)
+                sock.send_multipart(request)
+                emitted_for_session += 1
+                emitted += 1
             except Exception:
                 staging_requested.discard(stg_key)
+                all_requests_sent = False
+                logger.exception(
+                    "Failed to send Mori staging request room=%s chunk=%d",
+                    room,
+                    chunk_idx,
+                )
+    if return_complete:
+        return emitted, all_requests_sent
+    return emitted
