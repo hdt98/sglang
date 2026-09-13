@@ -356,7 +356,7 @@ class TestMoriStagingTransfer(unittest.TestCase):
             state_indices=state_indices,
         )
 
-        manager.send_state.assert_called_once_with(peer, state_indices)
+        manager.send_state.assert_called_once_with(peer, state_indices, [])
 
 
 if __name__ == "__main__":
