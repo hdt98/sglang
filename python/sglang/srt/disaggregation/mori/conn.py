@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+from concurrent.futures import Future, ThreadPoolExecutor
 import logging
 import os
 import struct
@@ -2480,9 +2481,24 @@ class MoriKVManager(CommonKVManager):
 class MoriDecodeStagingHandler(DecodeStagingHandler):
     """Mori-specific staging handler for contiguous target and draft KV."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._scatter_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix=f"mori-staging-copy-{self.tp_rank}",
+        )
+
+    def shutdown(self, wait: bool = False, cancel_futures: bool = False) -> None:
+        """Stop the staging-copy worker without joining a live run by default."""
+        self._scatter_executor.shutdown(wait=wait, cancel_futures=cancel_futures)
+
     def unregister_decode_req(self, room: int) -> None:
         with self.kv_manager.transfer_lock:
             super().unregister_decode_req(room)
+
+    def register_decode_req(self, room: int, decode_req) -> None:
+        decode_req._staging_last_requested = False
+        super().register_decode_req(room, decode_req)
 
     @classmethod
     def create(cls, kv_manager, scheduler, tp_rank: int):
@@ -2543,13 +2559,72 @@ class MoriDecodeStagingHandler(DecodeStagingHandler):
         if staging_offset < 0 or alloc_id < 0:
             return False
 
+        # Consume the staging slot immediately so the event loop sees the room
+        # as in flight, but do not return the allocation until the Mori copy
+        # finishes. Reclamation stays on the main event loop, matching the
+        # common staging handler's event-driven contract.
+        chunk_infos[chunk_idx] = (-1, -1, 0, -1, 0)
+        future = self._scatter_executor.submit(
+            self._scatter_chunk,
+            decode_req,
+            room,
+            chunk_idx,
+            staging_offset,
+            page_start,
+            num_pages,
+        )
+        completion = MoriStagingCompletion(future)
+        decode_req._chunk_events.append((completion, alloc_id))
+        return True
+
+    def submit_last_scatter_async(self, room: int) -> bool:
+        decode_req = self._room_to_decode_req.get(room)
+        if decode_req is None:
+            return super().submit_last_scatter_async(room)
+
+        # Do not publish all-ranks Success until the queued Mori copies have
+        # drained. advance_scatter converts this request into Success below.
+        decode_req._staging_success_ts = time.monotonic()
+        decode_req._staging_last_requested = True
+        return True
+
+    def advance_scatter(self, decode_req) -> None:
+        # Poll and reclaim completed staging allocations first. The base only
+        # completes the room when _staging_all_success is set, so we finish
+        # that handshake here after every queued copy has completed.
+        super().advance_scatter(decode_req)
+        if (
+            decode_req._staging_failed
+            or not getattr(decode_req, "_staging_last_requested", False)
+            or decode_req._chunk_events
+        ):
+            return
+
+        room = decode_req.req.bootstrap_room
+        receiver = self._room_to_receiver.get(room)
+        chunk_infos = receiver.chunk_staging_infos if receiver is not None else []
+        if any(info[0] >= 0 for info in chunk_infos):
+            return
+
+        decode_req._staging_all_success = True
+        decode_req._staging_scatter_done = True
+
+    def _scatter_chunk(
+        self,
+        decode_req,
+        room: int,
+        chunk_idx: int,
+        staging_offset: int,
+        page_start: int,
+        num_pages: int,
+    ) -> None:
         try:
-            ok = self._scatter_region(
+            self._scatter_region(
                 staging_offset,
                 page_start,
                 num_pages,
                 decode_req,
-                receiver,
+                self._room_to_receiver.get(room),
             )
         except Exception:
             logger.exception(
@@ -2558,11 +2633,16 @@ class MoriDecodeStagingHandler(DecodeStagingHandler):
                 chunk_idx,
             )
             decode_req._staging_failed = True
-            ok = False
 
-        self._free_and_send_watermark(alloc_id, decode_req)
-        chunk_infos[chunk_idx] = (-1, -1, 0, -1, 0)
-        return ok
+
+class MoriStagingCompletion:
+    """Adapter that lets the main loop poll a queued Mori staging copy."""
+
+    def __init__(self, future: Future) -> None:
+        self._future = future
+
+    def query(self) -> bool:
+        return self._future.done()
 
 
 class MoriKVSender(CommonKVSender):
