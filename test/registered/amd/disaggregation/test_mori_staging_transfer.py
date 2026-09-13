@@ -323,6 +323,40 @@ class TestMoriStagingTransfer(unittest.TestCase):
         self.assertEqual(info.decode_prefix_len, 32768)
         self.assertEqual(info.dst_state_indices, [np.asarray([11])])
 
+    def test_state_transfer_is_not_gated_on_truthy_destination_state_indices(self):
+        manager = MoriKVManager.__new__(MoriKVManager)
+        manager.transfer_lock = threading.Lock()
+        manager.request_status = {5: 2}
+        manager.enable_staging = False
+        manager.state_mem_descs = ["state"]
+        manager.pp_group = types.SimpleNamespace(is_last_rank=False)
+        manager.update_status = Mock()
+        manager.send_kvcache = Mock(return_value=[])
+        manager.send_state = Mock(return_value=[])
+        manager.send_aux = Mock(return_value=[])
+        info = types.SimpleNamespace(
+            is_dummy=False,
+            engine_key="decode",
+            dst_kv_indices=np.asarray([1], dtype=np.int32),
+            dst_state_indices=[],
+            dst_aux_index=0,
+        )
+        peer = types.SimpleNamespace()
+        manager.transfer_infos = {5: {"decode": info}}
+        manager.decode_kv_args_table = {"decode": peer}
+
+        state_indices = [np.asarray([2], dtype=np.int32)]
+
+        manager._submit_kv_transfer(
+            5,
+            np.asarray([1], dtype=np.int32),
+            slice(0, 1),
+            True,
+            state_indices=state_indices,
+        )
+
+        manager.send_state.assert_called_once_with(peer, state_indices)
+
 
 if __name__ == "__main__":
     unittest.main()

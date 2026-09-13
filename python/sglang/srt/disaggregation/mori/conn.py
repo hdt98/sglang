@@ -2447,7 +2447,7 @@ class MoriKVManager(CommonKVManager):
                 if (
                     is_last_chunk
                     and state_indices is not None
-                    and info.dst_state_indices
+                    and not info.is_dummy
                     and self.state_mem_descs
                 ):
                     result_statuses.extend(
