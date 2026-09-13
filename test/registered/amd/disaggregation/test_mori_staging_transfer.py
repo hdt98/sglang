@@ -271,6 +271,38 @@ class TestMoriStagingTransfer(unittest.TestCase):
             receiver, "session"
         )
 
+    def test_whole_item_mamba_transfer_submits_nonempty_plan(self):
+        manager = MoriKVManager.__new__(MoriKVManager)
+        manager.kv_args = types.SimpleNamespace(engine_rank=0)
+        manager.attn_tp_size = 1
+        submitted = []
+        manager._submit_batch_transfer_plan = lambda src, dst, plan, **kwargs: (
+            submitted.append((src, dst, plan)) or []
+        )
+
+        manager._send_mamba_state(
+            types.SimpleNamespace(decode_tp_size=1, decode_tp_rank=0),
+            np.asarray([2], dtype=np.int32),
+            np.asarray([3], dtype=np.int32),
+            ["src"],
+            ["dst"],
+            [100],
+            [100],
+            [200],
+            [200],
+            [0],
+            [0],
+            [],
+            [],
+        )
+
+        self.assertEqual(len(submitted), 1)
+        self.assertEqual(submitted[0][0], "src")
+        self.assertEqual(submitted[0][1], "dst")
+        self.assertEqual(submitted[0][2].local_offsets, [400])
+        self.assertEqual(submitted[0][2].remote_offsets, [600])
+        self.assertEqual(submitted[0][2].sizes, [100])
+
     def test_state_only_dummy_rank_stays_dummy_with_partial_prefix(self):
         state_bytes = mori_conn._pack_state_indices([np.asarray([11], dtype=np.int32)])
         payload = [

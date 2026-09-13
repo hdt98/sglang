@@ -2107,6 +2107,7 @@ class MoriKVManager(CommonKVManager):
                     # same-TP: whole item copy
                     src_offset = src_idx * src_slot_stride
                     dst_offset = dst_idx * dst_slot_stride
+                    size = src_item_len
                 else:
                     # Kimi/GDN conv state is [outer rows, TP-sharded channels],
                     # with q/k/v sub-blocks sharded independently. A flat slice
