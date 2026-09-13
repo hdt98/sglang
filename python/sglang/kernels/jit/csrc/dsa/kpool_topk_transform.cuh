@@ -52,14 +52,14 @@ __device__ __forceinline__ auto convert_to_uint32(float x) -> uint32_t {
 
 __device__ __forceinline__ auto make_topk_key(float score, int index) -> uint64_t {
   // Larger scores win. For exact score ties, smaller indices win.
-  return (static_cast<uint64_t>(convert_to_uint32(score)) << 32) |
-         static_cast<uint32_t>(~static_cast<uint32_t>(index));
+  return (static_cast<uint64_t>(convert_to_uint32(score)) << 32) | static_cast<uint32_t>(~static_cast<uint32_t>(index));
 }
 
 template <int N>
 constexpr int next_power_of_two() {
   int value = 1;
-  while (value < N) value <<= 1;
+  while (value < N)
+    value <<= 1;
   return value;
 }
 
@@ -205,8 +205,7 @@ fast_topk_cuda_tl_impl(const float* __restrict__ input, int* __restrict__ index,
           const auto coarse_bin = convert_to_uint8(raw_input);
           const auto key = make_topk_key(raw_input, idx);
           const auto key_prefix = key >> (64 - prefix_bits);
-          if (coarse_bin > threshold_bin ||
-              (coarse_bin == threshold_bin && key_prefix > selected_prefix)) {
+          if (coarse_bin > threshold_bin || (coarse_bin == threshold_bin && key_prefix > selected_prefix)) {
             const auto pos = ::atomicAdd(&s_counter, 1);
             index[pos] = idx;
           }
