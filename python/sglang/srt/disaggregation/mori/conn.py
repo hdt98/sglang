@@ -2108,6 +2108,9 @@ class MoriKVManager(CommonKVManager):
                     src_offset = src_idx * src_slot_stride
                     dst_offset = dst_idx * dst_slot_stride
                     size = src_item_len
+                    local_offsets.append(src_offset)
+                    remote_offsets.append(dst_offset)
+                    sizes.append(size)
                 else:
                     # Kimi/GDN conv state is [outer rows, TP-sharded channels],
                     # with q/k/v sub-blocks sharded independently. A flat slice
