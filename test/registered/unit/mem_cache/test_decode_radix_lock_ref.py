@@ -184,6 +184,25 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
             "SWA eviction insufficient: needed=192, available=128, req=req-1",
         )
 
+    def test_pd_prealloc_evicts_cached_mamba_states(self):
+        """PD prealloc budgets the request and ping-pong Mamba slots it needs."""
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        allocator = MagicMock()
+        allocator.schedulable_available_size.side_effect = [0, 3, 3]
+        queue.req_to_token_pool = SimpleNamespace(
+            mamba_allocator=allocator,
+            enable_mamba_extra_buffer=True,
+            mamba_ping_pong_track_buffer_size=2,
+        )
+        queue.tree_cache = MagicMock()
+        queue.tree_cache.supports_mamba.return_value = True
+
+        self.assertTrue(queue._ensure_mamba_prealloc_slots(request_count=1))
+
+        params = queue.tree_cache.evict_for_alloc.call_args.args[0]
+        self.assertEqual(params.num_tokens, 0)
+        self.assertEqual(params.mamba_num, 3)
+
     def _populate_prefix(self, cache, prefix_ids, prefix_values):
         """Insert a prefix into the tree so future requests can match it."""
         cache.insert(

@@ -484,6 +484,49 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return self.token_to_kv_pool_allocator.full_available_size()
         return self.token_to_kv_pool_allocator.available_size()
 
+    def _mamba_slots_per_prealloc(self) -> int:
+        """Return conservative Mamba slots consumed by one new preallocated request."""
+        pool = self.req_to_token_pool
+        if not hasattr(pool, "mamba_allocator") or pool.mamba_allocator is None:
+            return 0
+        if not getattr(pool, "enable_mamba_extra_buffer", False):
+            return 1
+        return 1 + pool.mamba_ping_pong_track_buffer_size
+
+    def _ensure_mamba_prealloc_slots(self, request_count: int) -> bool:
+        """Ensure allocator capacity for Mamba request and ping-pong slots.
+
+        A decoded prefix can keep Mamba states cached in the tree. The normal
+        admission path evicts those states, but the PD preallocation path only
+        budgeted full-attention tokens. Evict the same Mamba component here
+        before ``req_to_token_pool.alloc`` tries to take its slots.
+        """
+        slots_per_req = self._mamba_slots_per_prealloc()
+        if slots_per_req == 0:
+            return True
+
+        allocator = self.req_to_token_pool.mamba_allocator
+        required = slots_per_req * request_count
+        available = allocator.schedulable_available_size()
+        if available >= required:
+            return True
+
+        shortfall = required - available
+        result = self.tree_cache.evict_for_alloc(
+            EvictParams(num_tokens=0, mamba_num=shortfall)
+        )
+        available = allocator.schedulable_available_size()
+        if available < required:
+            logger.warning(
+                "Mamba eviction insufficient for PD prealloc: needed=%d, "
+                "available=%d, evicted=%d",
+                required,
+                available,
+                result.mamba_num_evicted,
+            )
+            return False
+        return True
+
     def _swa_tail_len(self, seq_len: int) -> int:
         if not self._uses_swa_tail_prealloc() or seq_len <= 0:
             return max(seq_len, 0)
@@ -1350,6 +1393,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     failed_reqs.append(decode_req)
                     indices_to_remove.add(i)
                     continue
+
+            if not self._ensure_mamba_prealloc_slots(request_count=1):
+                if prefix_match is not None and prefix_match.l1_prefix_len > 0:
+                    self._release_matched_prefix_lock(decode_req.req)
+                break
+
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
