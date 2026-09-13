@@ -611,7 +611,11 @@ class GrammarTree:
 
     def resolve(self) -> Tuple[torch.Tensor, ...]:
         if self._done is not None:
-            self._done.synchronize()
+            # Event.wait() can block the scheduler even after the host copy is
+            # complete. On HIP this shows up in decode scheduler samples, so
+            # query first and synchronize only for a genuinely pending event.
+            if not self._done.query():
+                self._done.synchronize()
         return self._host
 
 
