@@ -1528,6 +1528,7 @@ class Scheduler(
                 metadata_buffers=self.disagg_metadata_buffers,
                 scheduler=self,
                 tree_cache=self.tree_cache,
+                transfer_backend=self.transfer_backend,
             )
 
             # The decode requests pending for pre-allocation
@@ -1589,7 +1590,9 @@ class Scheduler(
             # Requests with a sent chunk that are not yet on the inflight queue.
             self.disagg_prefill_pending_chunk_rids: Set[str] = set()
 
-            self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+            # Keep this gate aligned with PrefillBootstrapQueue: prefill's event
+            # loops only call Mori staging prefetch when the flag is enabled.
+            self.enable_staging = self.disagg_prefill_bootstrap_queue.enable_staging
 
         if (
             self.enable_unified_memory

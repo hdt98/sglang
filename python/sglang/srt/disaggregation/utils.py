@@ -49,6 +49,25 @@ FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 _IS_HIP = is_hip()
 
 
+def pair_mamba_state_indices(src_indices, dst_indices) -> List[Tuple[int, int]]:
+    """Pair active and optional checkpoint Mamba rows in wire order."""
+    src = np.asarray(src_indices, dtype=np.int64).ravel().tolist()
+    dst = np.asarray(dst_indices, dtype=np.int64).ravel().tolist()
+    if not src:
+        return []
+    if len(src) not in (1, 2) or len(dst) not in (1, 2):
+        raise RuntimeError(
+            "PD Mamba state transfer expects active plus at most one checkpoint "
+            f"row, got src={len(src)} dst={len(dst)}"
+        )
+    if len(src) > len(dst):
+        raise RuntimeError(
+            "Decode did not register a destination for every Mamba state row: "
+            f"src={len(src)} dst={len(dst)}"
+        )
+    return list(zip(src, dst[: len(src)]))
+
+
 def poll_and_all_reduce_pp(
     rids: Iterable[str],
     ready_poll: int,
@@ -1129,6 +1148,7 @@ def append_state_component(
     conv_shard_groups: Optional[List[Optional[List[int]]]] = None,
     slice_outer_counts: Optional[List[int]] = None,
     layer_ids: Optional[List[int]] = None,
+    slot_strides: Optional[List[int]] = None,
 ) -> None:
     """Append one state component. Caller orders state_types consistently
     on prefill and decode sides."""
@@ -1136,6 +1156,7 @@ def append_state_component(
     kv_args.state_data_ptrs.append(data_ptrs)
     kv_args.state_data_lens.append(data_lens)
     kv_args.state_item_lens.append(item_lens)
+    kv_args.state_slot_strides.append(slot_strides or item_lens)
     kv_args.state_dim_per_tensor.append(dim_per_tensor or [])
     kv_args.state_conv_shard_groups.append(conv_shard_groups or [])
     kv_args.state_slice_outer_counts.append(slice_outer_counts or [])
@@ -1351,6 +1372,7 @@ def setup_state_kv_args(
     kv_args.state_data_ptrs = []
     kv_args.state_data_lens = []
     kv_args.state_item_lens = []
+    kv_args.state_slot_strides = []
     kv_args.state_dim_per_tensor = []
     kv_args.state_slice_outer_counts = []
     kv_args.state_layer_ids = []
@@ -1462,6 +1484,7 @@ def setup_state_kv_args(
             # Global layer ids let the sender pair src/dst entries when the
             # prefill PP stage registers only its own subset of mamba layers.
             layer_ids = token_to_kv_pool.get_state_layer_ids()
+            slot_strides = token_to_kv_pool.get_state_slot_strides()
             append_state_component(
                 kv_args,
                 StateType.MAMBA,
@@ -1472,6 +1495,7 @@ def setup_state_kv_args(
                 conv_shard_groups,
                 slice_outer_counts,
                 layer_ids,
+                slot_strides,
             )
             # Hybrid DSA pools keep their index cache and kpool tail in the
             # full-attention sub-pool rather than in the Mamba state above.

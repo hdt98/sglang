@@ -893,6 +893,81 @@ class IndexerKPool(MultiPlatformOp):
         need_chunk = (logits_bytes * 2 > free_mem) or (logits_bytes > total_mem * 0.3)
         return need_chunk, free_mem
 
+    def _get_topk_ragged_kpool_plan(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
+            gather_index_k_scale_prefix_into,
+        )
+
+        plan = metadata.attn_metadata.kpool_extend_plan
+        assert plan is not None, "kpool extend plan is required"
+        assert len(weights.shape) == 3
+        weights = weights.squeeze(-1)
+
+        device = q_fp8.device
+        total_q = q_fp8.shape[0]
+        seq_lens_expanded = plan.seq_lens_expanded
+        pool_lens = plan.pooled_seq_lens_expanded
+        ks_per_q = plan.ragged_q_ks
+        ke_per_q = plan.ragged_q_ke
+        total_k_rows = plan.ragged_total_k_rows
+
+        n_real = seq_lens_expanded.shape[0]
+        assert n_real <= total_q, (
+            f"plan has more real rows ({n_real}) than q_fp8 ({total_q})"
+        )
+
+        if total_k_rows > 0:
+            k_u8 = plan.ragged_k_u8
+            k_scale = plan.ragged_k_scale
+            assert k_u8 is not None and k_scale is not None
+            pool = get_token_to_kv_pool()
+            gather_index_k_scale_prefix_into(
+                pool=pool,
+                buf=self._get_index_k_read_buffer(pool, layer_id),
+                page_indices=plan.ragged_concat_page_table,
+                seq_len=total_k_rows,
+                k_out=k_u8,
+                scale_out=k_scale,
+            )
+            k_fp8 = k_u8.view(torch.float8_e4m3fn).contiguous()
+            k_scale = k_scale.contiguous()
+        else:
+            k_fp8 = k_scale = None
+
+        topk_method = metadata.topk_transform_method
+        attn_metadata = metadata.attn_metadata
+        page_table_all = None
+        page_table_row_index_all = None
+        topk_offsets_all = None
+        if envs.SGLANG_DSA_FUSE_TOPK.get():
+            if topk_method == TopkTransformMethod.PAGED:
+                page_table_all = plan.ragged_paged_page_table
+                page_table_row_index_all = plan.ragged_paged_page_table_row_index
+            elif topk_method == TopkTransformMethod.RAGGED:
+                topk_offsets_all = attn_metadata.topk_indices_offset
+
+        return self._topk_from_ragged_kpool(
+            q_fp8[:n_real],
+            k_fp8,
+            k_scale,
+            weights[:n_real],
+            ks_per_q,
+            ke_per_q,
+            pool_lens,
+            seq_lens_expanded,
+            page_table=page_table_all,
+            topk_offsets=topk_offsets_all,
+            out_rows=total_q,
+            page_table_row_index=page_table_row_index_all,
+        )
+
     @staticmethod
     def _mqa_logits_chunk_rows(num_q: int, num_k: int) -> int:
         if not is_hip() or num_q == 0 or num_k == 0:
@@ -919,6 +994,8 @@ class IndexerKPool(MultiPlatformOp):
     ):
         num_q = q_fp8.shape[0]
         num_k = k_fp8.shape[0] if k_fp8 is not None else 0
+        if num_q == 0:
+            return torch.empty((0, 0), dtype=torch.int32, device=q_fp8.device)
         chunk_rows = max(1, self._mqa_logits_chunk_rows(num_q, num_k))
         chunks = []
         for start in range(0, max(num_q, 1), chunk_rows):
@@ -987,80 +1064,6 @@ class IndexerKPool(MultiPlatformOp):
             row_starts,
             row_ends,
             clean_logits=True,
-        )
-
-    def _get_topk_ragged_kpool_plan(
-        self,
-        forward_batch: ForwardBatch,
-        layer_id: int,
-        q_fp8: torch.Tensor,
-        weights: torch.Tensor,
-        metadata: BaseIndexerMetadata,
-    ) -> torch.Tensor:
-        from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
-            gather_index_k_scale_prefix_into,
-        )
-
-        plan = metadata.attn_metadata.kpool_extend_plan
-        assert plan is not None, "kpool extend plan is required"
-        assert len(weights.shape) == 3
-        weights = weights.squeeze(-1)
-
-        total_q = q_fp8.shape[0]
-        seq_lens_expanded = plan.seq_lens_expanded
-        pool_lens = plan.pooled_seq_lens_expanded
-        ks_per_q = plan.ragged_q_ks
-        ke_per_q = plan.ragged_q_ke
-        total_k_rows = plan.ragged_total_k_rows
-
-        n_real = seq_lens_expanded.shape[0]
-        assert n_real <= total_q, (
-            f"plan has more real rows ({n_real}) than q_fp8 ({total_q})"
-        )
-
-        if total_k_rows > 0:
-            k_u8 = plan.ragged_k_u8
-            k_scale = plan.ragged_k_scale
-            assert k_u8 is not None and k_scale is not None
-            pool = get_token_to_kv_pool()
-            gather_index_k_scale_prefix_into(
-                pool=pool,
-                buf=self._get_index_k_read_buffer(pool, layer_id),
-                page_indices=plan.ragged_concat_page_table,
-                seq_len=total_k_rows,
-                k_out=k_u8,
-                scale_out=k_scale,
-            )
-            k_fp8 = k_u8.view(torch.float8_e4m3fn).contiguous()
-            k_scale = k_scale.contiguous()
-        else:
-            k_fp8 = k_scale = None
-
-        topk_method = metadata.topk_transform_method
-        attn_metadata = metadata.attn_metadata
-        page_table_all = None
-        page_table_row_index_all = None
-        topk_offsets_all = None
-        if envs.SGLANG_DSA_FUSE_TOPK.get():
-            if topk_method == TopkTransformMethod.PAGED:
-                page_table_all = plan.ragged_paged_page_table
-                page_table_row_index_all = plan.ragged_paged_page_table_row_index
-            elif topk_method == TopkTransformMethod.RAGGED:
-                topk_offsets_all = attn_metadata.topk_indices_offset
-
-        return self._topk_from_ragged_kpool(
-            q_fp8[:n_real],
-            k_fp8,
-            k_scale,
-            weights[:n_real],
-            ks_per_q,
-            ke_per_q,
-            pool_lens,
-            seq_lens_expanded,
-            page_table=page_table_all,
-            topk_offsets=topk_offsets_all,
-            out_rows=total_q,
-            page_table_row_index=page_table_row_index_all,
         )
 
     def _get_topk_ragged_kpool(
@@ -1257,14 +1260,17 @@ class IndexerKPool(MultiPlatformOp):
                     k_scale = k_scale.view(torch.float32).squeeze(-1)
                 k_fp8 = k_fp8.contiguous()
                 k_scale = k_scale.contiguous()
+                row_starts = (
+                    zero_starts_by_batch[i]
+                    if zero_starts_by_batch is not None
+                    and zero_starts_by_batch[i] is not None
+                    else torch.zeros((q_len,), dtype=torch.int32, device=q_fp8.device)
+                )
             else:
                 k_fp8 = k_scale = None
-            row_starts = (
-                zero_starts_by_batch[i]
-                if zero_starts_by_batch is not None
-                and zero_starts_by_batch[i] is not None
-                else torch.zeros((q_len,), dtype=torch.int32, device=q_fp8.device)
-            )
+                row_starts = torch.zeros(
+                    (q_len,), dtype=torch.int32, device=q_fp8.device
+                )
 
             page_table_local = None
             topk_offsets_local = None
@@ -1392,7 +1398,7 @@ class IndexerKPool(MultiPlatformOp):
         enable_dual_stream: bool,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
-        assert is_cuda() or is_hip(), "DSA kpool target_verify requires CUDA or HIP"
+        assert is_cuda() or is_hip(), "DSA kpool target_verify requires CUDA or ROCm"
         plan = metadata.attn_metadata.kpool_write_plan
         assert plan is not None, "DSA kpool target_verify requires kpool_write_plan"
         num_draft_tokens = plan.num_draft_tokens
@@ -1670,5 +1676,5 @@ class IndexerKPool(MultiPlatformOp):
                         kpool_extend_cache=kpool_extend_cache,
                     )
         else:
-            raise NotImplementedError("kpool indexer requires CUDA or HIP")
+            raise NotImplementedError("kpool indexer requires CUDA or ROCm")
         return topk_result

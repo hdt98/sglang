@@ -12,9 +12,13 @@
 # limitations under the License.
 # ==============================================================================
 
+import logging
+
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
 from sglang.srt.models.utils import WeightsMapper
+
+logger = logging.getLogger(__name__)
 
 
 class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
@@ -39,6 +43,36 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
             orig_to_new_substr=special_mapping,
             orig_to_new_prefix=decoder_mapping,
         )
+
+    def _resolve_nextn_quant_config(self, config, quant_config):
+        """Checkpoints declare an unquantized NextN block through ``ignore`` or
+        Quark ``exclude``; Quark expands the latter to concrete module names."""
+        raw_quant_config = getattr(config, "quantization_config", None) or {}
+        if hasattr(raw_quant_config, "to_dict"):
+            raw_quant_config = raw_quant_config.to_dict()
+        num_hidden_layers = getattr(config, "num_hidden_layers", None)
+        if num_hidden_layers is None:
+            num_hidden_layers = getattr(
+                getattr(config, "text_config", config), "num_hidden_layers"
+            )
+        nextn_layer_prefix = f"model.layers.{num_hidden_layers}."
+        declared_unquantized = tuple(
+            raw_quant_config.get(key, [])
+            for key in ("ignore", "exclude")
+            if isinstance(raw_quant_config, dict)
+        )
+        if any(
+            entry == nextn_layer_prefix[:-1] or entry.startswith(nextn_layer_prefix)
+            for entries in declared_unquantized
+            for entry in entries
+        ):
+            logger.warning(
+                "GLM5 NextN layer %s is checkpoint-declared unquantized; "
+                "using BF16 draft modules",
+                nextn_layer_prefix[:-1],
+            )
+            return None
+        return super()._resolve_nextn_quant_config(config, quant_config)
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(
