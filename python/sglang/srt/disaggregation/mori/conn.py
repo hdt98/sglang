@@ -358,6 +358,7 @@ class MoriKVManager(CommonKVManager):
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
     ):
+        self.enable_staging = envs.SGLANG_MORI_STAGING_BUFFER.get()
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.engine = self._init_engine()
         self.engine_desc = self.engine.get_engine_desc()
@@ -368,7 +369,6 @@ class MoriKVManager(CommonKVManager):
         self._zmq_ctx = zmq.Context()
         self._socket_local = threading.local()
         self._send_aux_rdma = envs.SGLANG_MORI_SEND_AUX_RDMA.get()
-        self.enable_staging = envs.SGLANG_MORI_STAGING_BUFFER.get()
         self.staging_mem_desc: Optional[MemoryDesc] = None
         self._wait_poll_ms = envs.SGLANG_MORI_WAIT_POLL_MS.get()
         self._transfer_timeout_ms = envs.SGLANG_MORI_TRANSFER_TIMEOUT_MS.get()
@@ -617,12 +617,18 @@ class MoriKVManager(CommonKVManager):
             return
 
         if self.enable_staging and has_kv_pages and target_infos:
-            self._send_chunk_ready(
+            ready_sent = self._send_chunk_ready(
                 [info for info in target_infos if not info.is_dummy],
                 room,
                 kv_chunk.index_slice,
                 len(kv_chunk.prefill_kv_indices),
             )
+            if not ready_sent:
+                self._conclude_room_failure(
+                    room,
+                    "Failed to notify decode that the Mori staging chunk is ready",
+                )
+                return
             if not kv_chunk.is_last_chunk:
                 self._request_next_staging_chunks(room)
 
@@ -690,7 +696,7 @@ class MoriKVManager(CommonKVManager):
         room: int,
         index_slice: slice,
         num_pages: int,
-    ) -> None:
+    ) -> bool:
         chunk_idx = (
             index_slice.start // self._staging_full_chunk_pages
             if self._staging_full_chunk_pages > 0
@@ -717,6 +723,8 @@ class MoriKVManager(CommonKVManager):
                     room,
                     chunk_idx,
                 )
+                return False
+        return True
 
     def _prefetch_staging_reqs(self, room: int) -> None:
         if not self.enable_staging:
@@ -725,10 +733,10 @@ class MoriKVManager(CommonKVManager):
             return
 
         requested = self._request_next_staging_chunks(room)
-        if requested > 0:
+        if requested[0] > 0 and requested[1]:
             self._staging_ctx.prefetched_rooms.add(room)
 
-    def _request_next_staging_chunks(self, room: int) -> int:
+    def _request_next_staging_chunks(self, room: int) -> Tuple[int, bool]:
         """Advance Mori's per-session staging allocation window by one chunk."""
         if room not in self.transfer_infos:
             return 0
@@ -743,6 +751,7 @@ class MoriKVManager(CommonKVManager):
             max_new_chunks_per_session=1,
             socket_getter=self._connect_threadsafe,
             socket_cache=False,
+            return_complete=True,
         )
 
     def _wait_transfer_completion(
@@ -2650,6 +2659,7 @@ class MoriKVReceiver(CommonKVReceiver):
             return
         if self.kv_mgr.enable_staging:
             self.require_staging = True
+            self._validate_prefill_staging_capability()
             if self.prefill_info.pp_size != self.kv_mgr.pp_size:
                 raise RuntimeError(
                     "Mori staging intake currently requires matching prefill and "
@@ -2657,6 +2667,12 @@ class MoriKVReceiver(CommonKVReceiver):
                     f"{self.prefill_info.pp_size}, decode={self.kv_mgr.pp_size})"
                 )
         self.kv_mgr.room_to_bootstrap_addr[self.bootstrap_room] = self.bootstrap_addr
+
+    def _validate_prefill_staging_capability(self):
+        if not self.prefill_info.enable_staging:
+            raise RuntimeError(
+                "Mori staging must be enabled on both the prefill and decode servers"
+            )
 
     def _register_kv_args(self) -> bool:
         if self.bootstrap_infos is None:

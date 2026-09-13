@@ -6,6 +6,10 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from sglang.srt.configs import model_config
+from sglang.srt.disaggregation.common.conn import PrefillServerInfo
+from sglang.srt.disaggregation.common.staging_handler import (
+    prefetch_staging_reqs,
+)
 
 with patch.object(
     model_config,
@@ -16,6 +20,7 @@ with patch.object(
     from sglang.srt.disaggregation.mori import conn as mori_conn
     from sglang.srt.disaggregation.mori.conn import (
         MoriKVManager,
+        MoriKVReceiver,
     )
 
 from sglang.test.ci.ci_register import register_amd_ci
@@ -24,6 +29,112 @@ register_amd_ci(est_time=5, suite="stage-a-test-1-gpu-small-amd")
 
 
 class TestMoriStagingTransfer(unittest.TestCase):
+    def test_prefetch_reports_incomplete_without_shared_socket_cache(self):
+        sockets = []
+
+        def socket_getter(endpoint, is_ipv6=False):
+            sockets.append(endpoint)
+            return Mock()
+
+        tinfo = types.SimpleNamespace(
+            is_dummy=False,
+            endpoint="127.0.0.1",
+            dst_port=1111,
+            dst_kv_indices=np.arange(128),
+        )
+        requested = set()
+        emitted, complete = prefetch_staging_reqs(
+            5,
+            {5: {"session": tinfo}},
+            {"page_size": 64},
+            1024,
+            requested,
+            {},
+            requester_pp_rank=0,
+            socket_getter=socket_getter,
+            socket_cache=False,
+            return_complete=True,
+        )
+
+        self.assertEqual(emitted, 8)
+        self.assertTrue(complete)
+        self.assertEqual(len(sockets), 8)
+        self.assertEqual(requested, {(5, idx, "session") for idx in range(8)})
+
+    def test_prefetch_reports_partial_failure_as_incomplete(self):
+        def socket_getter(endpoint, is_ipv6=False):
+            if endpoint == "tcp://127.0.0.1:1112":
+                raise AssertionError("intentional test failure")
+            return Mock()
+
+        infos = {
+            "good": types.SimpleNamespace(
+                is_dummy=False,
+                endpoint="127.0.0.1",
+                dst_port=1111,
+                dst_kv_indices=np.arange(64),
+            ),
+            "bad": types.SimpleNamespace(
+                is_dummy=False,
+                endpoint="127.0.0.1",
+                dst_port=1112,
+                dst_kv_indices=np.arange(64),
+            ),
+        }
+        requested = set()
+        emitted, complete = prefetch_staging_reqs(
+            5,
+            {5: infos},
+            {"page_size": 64},
+            1024,
+            requested,
+            {},
+            requester_pp_rank=0,
+            socket_getter=socket_getter,
+            socket_cache=False,
+            return_complete=True,
+        )
+
+        self.assertEqual(emitted, 4)
+        self.assertFalse(complete)
+        self.assertEqual(requested, {(5, idx, "good") for idx in range(4)})
+
+    def test_chunk_ready_send_failure_is_reported(self):
+        manager = MoriKVManager.__new__(MoriKVManager)
+        manager._staging_full_chunk_pages = 64
+        manager._compute_prefill_unique_rank = lambda: "writer"
+        manager._connect_threadsafe = Mock(
+            side_effect=[
+                Mock(send_multipart=Mock()),
+                AssertionError("intentional test failure"),
+            ]
+        )
+        infos = [
+            types.SimpleNamespace(engine_key="good", endpoint="1", dst_port=1),
+            types.SimpleNamespace(engine_key="bad", endpoint="2", dst_port=2),
+        ]
+
+        self.assertFalse(manager._send_chunk_ready(infos, 5, slice(0, 64), 64))
+
+    def test_mori_staging_requires_prefill_capability(self):
+        receiver = MoriKVReceiver.__new__(MoriKVReceiver)
+        receiver.kv_mgr = types.SimpleNamespace(enable_staging=True, pp_size=4)
+        receiver.prefill_info = PrefillServerInfo(
+            attn_tp_size=4,
+            attn_cp_size=1,
+            dp_size=1,
+            pp_size=4,
+            page_size=64,
+            kv_cache_dtype="fp8_e4m3",
+            follow_bootstrap_room=True,
+            enable_staging=False,
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError, "both the prefill and decode servers"
+        ):
+            receiver._validate_prefill_staging_capability()
+
     def test_staged_prefill_write_uses_target_descriptors_and_layer_offsets(self):
         manager = MoriKVManager.__new__(MoriKVManager)
         manager.kv_args = types.SimpleNamespace(

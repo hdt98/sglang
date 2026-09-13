@@ -939,7 +939,8 @@ def prefetch_staging_reqs(
     max_new_chunks_per_session: Optional[int] = None,
     socket_getter: Optional[Callable[..., object]] = None,
     socket_cache: bool = True,
-) -> int:
+    return_complete: bool = False,
+) -> Tuple[int, bool] | int:
     """Send STAGING_REQ for all chunks before the prefill forward starts.
 
     Called from the scheduler right after batch formation, so that decode
@@ -954,6 +955,7 @@ def prefetch_staging_reqs(
     full_chunk_pages = staging_grid_tokens(chunked_prefill_size, page_size) // page_size
 
     emitted = 0
+    all_requests_sent = True
     for session_id, tinfo in transfer_infos[room].items():
         emitted_for_session = 0
 
@@ -1014,9 +1016,12 @@ def prefetch_staging_reqs(
                 emitted += 1
             except Exception:
                 staging_requested.discard(stg_key)
+                all_requests_sent = False
                 logger.exception(
                     "Failed to send Mori staging request room=%s chunk=%d",
                     room,
                     chunk_idx,
                 )
+    if return_complete:
+        return emitted, all_requests_sent
     return emitted
