@@ -821,13 +821,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         has_initial_state = forward_batch.extend_prefix_lens > 0
 
         physical_num_tokens = mixed_qkv.shape[0]
-        # DP attention pads q beyond real tokens. Use the CPU-side sequence
-        # lengths when available so this does not synchronize every KDA layer.
-        logical_num_tokens = (
-            sum(forward_batch.extend_seq_lens_cpu)
-            if forward_batch.extend_seq_lens_cpu is not None
-            else int(query_start_loc[-1])
-        )
+        logical_num_tokens = int(query_start_loc[-1])
         if logical_num_tokens < physical_num_tokens:
             mixed_qkv = mixed_qkv[:logical_num_tokens]
             a = a[:, :logical_num_tokens]
