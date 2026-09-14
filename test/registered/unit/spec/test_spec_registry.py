@@ -234,6 +234,7 @@ class TestServerArgsHook(_RegistryIsolated):
             speculative_draft_window_size=None,
             speculative_skip_dp_mlp_sync=False,
             speculative_adaptive=False,
+            disaggregation_mode=None,
         )
 
         handle_speculative_decoding(server_args)

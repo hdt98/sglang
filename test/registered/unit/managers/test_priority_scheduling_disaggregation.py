@@ -146,6 +146,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue._pre_alloc = MagicMock(side_effect=pre_alloc_mock)
 
         queue.req_to_token_pool = MagicMock()
+        queue.req_to_token_pool.mamba_allocator = None
         queue.req_to_token_pool.available_size.return_value = 100
         queue.req_to_token_pool.req_to_token = torch.arange(
             8 * 16, dtype=torch.int64

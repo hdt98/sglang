@@ -17,7 +17,10 @@ with patch.object(
     lambda config: 1,
     create=True,
 ):
-    from sglang.srt.disaggregation.mori import conn as mori_conn
+    try:
+        from sglang.srt.disaggregation.mori import conn as mori_conn
+    except ImportError:
+        mori_conn = None
 
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
@@ -945,6 +948,7 @@ class _StubMemoryDesc:
         return cls(blob)
 
 
+@unittest.skipIf(mori_conn is None, "mori module not available")
 class TestMoriRegistrationWireSchema(unittest.TestCase):
     """Verify Mori register-wire positions after the staging trim.
 
