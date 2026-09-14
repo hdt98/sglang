@@ -408,8 +408,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # support aborting them we would need an additional fix in the
         # scheduler. In practice this shouldn't arise in the RL scenario.
         self.held_rebootstrap_reqs: List[Req] = []
-        self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
-        if self.enable_staging and self.is_mla_backend:
+        generic_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        mori_staging = (
+            self.transfer_backend == TransferBackend.MORI
+            and envs.SGLANG_MORI_STAGING_BUFFER.get()
+        )
+        self.enable_staging = generic_staging or mori_staging
+        if generic_staging and self.is_mla_backend:
             raise RuntimeError(
                 "SGLANG_DISAGG_STAGING_BUFFER is designed for non-MLA models "
                 "(e.g. GQA, MHA). MLA models should not set this flag."
@@ -478,6 +483,49 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self.scheduler.tp_worker.is_hybrid_swa:
             return self.token_to_kv_pool_allocator.full_available_size()
         return self.token_to_kv_pool_allocator.available_size()
+
+    def _mamba_slots_per_prealloc(self) -> int:
+        """Return conservative Mamba slots consumed by one new preallocated request."""
+        pool = self.req_to_token_pool
+        if not hasattr(pool, "mamba_allocator") or pool.mamba_allocator is None:
+            return 0
+        if not getattr(pool, "enable_mamba_extra_buffer", False):
+            return 1
+        return 1 + pool.mamba_ping_pong_track_buffer_size
+
+    def _ensure_mamba_prealloc_slots(self, request_count: int) -> bool:
+        """Ensure allocator capacity for Mamba request and ping-pong slots.
+
+        A decoded prefix can keep Mamba states cached in the tree. The normal
+        admission path evicts those states, but the PD preallocation path only
+        budgeted full-attention tokens. Evict the same Mamba component here
+        before ``req_to_token_pool.alloc`` tries to take its slots.
+        """
+        slots_per_req = self._mamba_slots_per_prealloc()
+        if slots_per_req == 0:
+            return True
+
+        allocator = self.req_to_token_pool.mamba_allocator
+        required = slots_per_req * request_count
+        available = allocator.schedulable_available_size()
+        if available >= required:
+            return True
+
+        shortfall = required - available
+        result = self.tree_cache.evict_for_alloc(
+            EvictParams(num_tokens=0, mamba_num=shortfall)
+        )
+        available = allocator.schedulable_available_size()
+        if available < required:
+            logger.warning(
+                "Mamba eviction insufficient for PD prealloc: needed=%d, "
+                "available=%d, evicted=%d",
+                required,
+                available,
+                result.mamba_num_evicted,
+            )
+            return False
+        return True
 
     def _swa_tail_len(self, seq_len: int) -> int:
         if not self._uses_swa_tail_prealloc() or seq_len <= 0:
@@ -583,6 +631,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             num_draft_entries=num_draft_entries,
             num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
         )
+        kv_args.num_target_kv_entries = len(kv_data_ptrs) - num_draft_entries
         if self.transfer_backend == TransferBackend.NIXL:
             kv_args.kv_data_mem_kinds = kv_data_mem_kinds
         kv_args.page_size = self.token_to_kv_pool.page_size
@@ -1344,6 +1393,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     failed_reqs.append(decode_req)
                     indices_to_remove.add(i)
                     continue
+
+            if not self._ensure_mamba_prealloc_slots(request_count=1):
+                if prefix_match is not None and prefix_match.l1_prefix_len > 0:
+                    self._release_matched_prefix_lock(decode_req.req)
+                break
+
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
@@ -1423,8 +1478,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 return kv_to_page_indices(window_kv_indices_swa, page_size)
 
             def _full_kv_pages_payload():
+                # The matched decode prefix already owns its DSA rows. Register
+                # destinations only for the suffix that prefill will send.
                 kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.kv.req_pool_idx, :seq_len
+                    decode_req.req.kv.req_pool_idx, total_prefix_len:seq_len
                 ]
                 # Indexer lives on device pool; always use device page_size
                 device_page_size = self.token_to_kv_pool.page_size
@@ -2077,6 +2134,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         metadata_buffers: MetadataBuffers,
         scheduler: Scheduler,
         tree_cache: BasePrefixCache,
+        transfer_backend: TransferBackend,
     ):
         self.queue: List[DecodeRequest] = []
         self.gloo_group = gloo_group
@@ -2085,8 +2143,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.metadata_buffers = metadata_buffers
         self.scheduler = scheduler
         self.tree_cache = tree_cache
+        self.transfer_backend = transfer_backend
         self.spec_algorithm = scheduler.spec_algorithm
-        self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        generic_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        mori_staging = (
+            self.transfer_backend == TransferBackend.MORI
+            and envs.SGLANG_MORI_STAGING_BUFFER.get()
+        )
+        self.enable_staging = generic_staging or mori_staging
         self.staging_handler = None
         self.enable_deferred_kv_release = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
@@ -2299,13 +2363,18 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def _init_staging_handler(self, kv_manager):
         """Create staging handler from kv_manager. Must be called exactly once."""
-        from sglang.srt.disaggregation.common.staging_handler import (
-            DecodeStagingHandler,
-        )
+        if hasattr(kv_manager, "create_staging_handler"):
+            self.staging_handler = kv_manager.create_staging_handler(
+                self.scheduler, self.tp_rank
+            )
+        else:
+            from sglang.srt.disaggregation.common.staging_handler import (
+                DecodeStagingHandler,
+            )
 
-        self.staging_handler = DecodeStagingHandler.create(
-            kv_manager, self.scheduler, self.tp_rank
-        )
+            self.staging_handler = DecodeStagingHandler.create(
+                kv_manager, self.scheduler, self.tp_rank
+            )
         kv_manager._staging_handler = self.staging_handler
 
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:

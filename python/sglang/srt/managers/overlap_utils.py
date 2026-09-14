@@ -528,8 +528,11 @@ class FutureMap:
                 assert self._publish_fresh, "resolve without a fresh forward publish"
                 self._publish_fresh = False
             if _is_hip:
-                # Temporary workaround: Event.wait() regresses TPOT on AMD MI355.
-                self.publish_ready.synchronize()
+                # Event.wait() regresses TPOT on AMD MI355. A completed event
+                # still has to avoid the blocking synchronize; query() is
+                # nonblocking and preserves the fallback for pending events.
+                if not self.publish_ready.query():
+                    self.publish_ready.synchronize()
             else:
                 self.publish_ready.wait()
         batch.seq_lens = self.new_seq_lens_buf[fi]
