@@ -4343,8 +4343,9 @@ class DeepseekV4Model(nn.Module):
                 self.config.model_type == "deepseek_v41"
                 and i + 1 < self.end_layer
                 and tail is None
-                and hidden_states.is_cuda
                 and get_platform().is_blackwell
+                and hidden_states is not None
+                and hidden_states.is_cuda
                 and 0 < hidden_states.shape[0] <= 8
                 and (
                     forward_batch.forward_mode.is_decode()
