@@ -353,6 +353,19 @@ class DSparkWorkerV2(BaseSpecWorker):
                 f"{self._simulate_acc_len}."
             )
 
+        self._plan_stream = None
+        self._plan_stream_ctx = nullcontext()
+        self._plan_ready_event = None
+        if (
+            envs.SGLANG_DSPARK_VERIFY_PREPLAN_STREAM.get()
+            and not _is_npu
+            and not self._target_is_mambaish
+        ):
+            device_module = torch.get_device_module(str(self.device))
+            self._plan_stream = device_module.Stream()
+            self._plan_stream_ctx = device_module.stream(self._plan_stream)
+            self._plan_ready_event = device_module.Event()
+
         self._verify_executor = TargetVerifyExecutor(
             target_worker=self.target_worker,
             gamma=self.gamma,
@@ -362,6 +375,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             tp_sync=self._tp_sync,
             verify_epilogue=self._verify_epilogue,
             simulate_acc_len=self._simulate_acc_len,
+            plan_stream=self._plan_stream,
+            plan_stream_ctx=self._plan_stream_ctx,
         )
 
         self._forced_budget_frac: Optional[float] = None
@@ -675,6 +690,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             new_seq_lens=next_draft_input.new_seq_lens,
         )
 
+    def _plan_frontier_event(self):
+        if self._plan_stream is None:
+            return None
+        self._plan_ready_event.record()
+        return self._plan_ready_event
+
     def _forward_decode(
         self, batch: ScheduleBatch, on_publish, grammar_barrier=None
     ) -> GenerationBatchResult:
@@ -716,6 +737,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
         sampling_info = batch.sampling_info
+        plan_ready_event = self._plan_frontier_event()
         with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
             proposal = self._proposer.propose(
                 batch=batch,
@@ -811,6 +833,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     verify_ids_2d=verify_ids_2d,
                     verify_window=verify_window,
                     sampling_info=sampling_info,
+                    plan_ready_event=plan_ready_event,
                 )
                 hidden_strided = None
         logits_output = target_verify.logits_output

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from typing import Optional
 
 import msgspec
@@ -54,6 +55,14 @@ _is_npu = is_npu()
 # Draft proposal probs feeding rejection sampling; the data layer is the
 # in-kernel NaN-q guard in reject_sampling.py, so this is signal-only.
 _VERIFY_DRAFT_PROBS = Invariant("dspark.verify.draft_probs", Bucket.GUARD, NotNaN())
+
+
+def _record_plan_stream_reads(plan_stream, tensors) -> None:
+    if plan_stream is None:
+        return
+    for tensor in tensors:
+        if tensor is not None and getattr(tensor, "is_cuda", False):
+            tensor.record_stream(plan_stream)
 
 
 def verify_logits_adjustments_are_noop(sampling_info) -> bool:
@@ -118,6 +127,8 @@ class TargetVerifyExecutor:
         tp_sync: SpecTpSync,
         verify_epilogue=None,
         simulate_acc_len: float = 0.0,
+        plan_stream=None,
+        plan_stream_ctx=None,
     ) -> None:
         self.target_worker = target_worker
         self.gamma = int(gamma)
@@ -129,6 +140,10 @@ class TargetVerifyExecutor:
         self._verify_backend_self_adds_seq_lens_cache: Optional[bool] = None
         self._simulate_acc_len = float(simulate_acc_len)
         self._simulated_correct_drafts_buf: Optional[torch.Tensor] = None
+        self._plan_stream = plan_stream
+        self._plan_stream_ctx = (
+            plan_stream_ctx if plan_stream is not None else contextlib.nullcontext()
+        )
 
     def accept_and_finalize(
         self,
@@ -276,6 +291,7 @@ class TargetVerifyExecutor:
         verify_ids_2d: torch.Tensor,
         verify_window: VerifyWindow,
         sampling_info,
+        plan_ready_event=None,
     ) -> TargetVerifyResult:
         verify_w = self.verify_num_draft_tokens
         positions_2d = verify_window.positions_2d
@@ -292,6 +308,7 @@ class TargetVerifyExecutor:
         batch.out_cache_loc = verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
+        record_extra = (verify_ids_2d, verify_cache_loc, positions_2d)
         if not self._verify_backend_self_adds_seq_lens():
             if seq_lens_cpu_backup is not None:
                 batch.seq_lens_cpu = seq_lens_cpu_backup + verify_w
@@ -305,6 +322,10 @@ class TargetVerifyExecutor:
             verify_input=verify_input,
             seq_lens_cpu_backup=seq_lens_cpu_backup,
             seq_lens_sum_backup=seq_lens_sum_backup,
+            plan_stream=self._plan_stream,
+            plan_stream_ctx=self._plan_stream_ctx,
+            plan_ready_event=plan_ready_event,
+            record_extra=record_extra,
         )
 
         if sampling_info is not None:
@@ -323,16 +344,51 @@ class TargetVerifyExecutor:
         verify_input: DFlashVerifyInput,
         seq_lens_cpu_backup,
         seq_lens_sum_backup,
+        plan_stream=None,
+        plan_stream_ctx=None,
+        plan_ready_event=None,
+        record_extra: tuple = (),
     ) -> TargetVerifyResult:
         if verify_input.live_seq_lens_cpu is None:
             verify_input.candidate_max_seq_len_upper_bound = (
                 candidate_request_length_bound(batch.reqs, self.verify_num_draft_tokens)
             )
-        verify_forward_batch, _ = verify_input.prepare_for_verify(
-            batch, self.target_worker
-        )
-        batch.seq_lens_cpu = seq_lens_cpu_backup
-        batch.seq_lens_sum = seq_lens_sum_backup
+        caller_stream = None
+        if plan_stream is not None:
+            caller_stream = torch.get_device_module(
+                self.model_runner.device
+            ).current_stream()
+        if caller_stream is None:
+            verify_forward_batch, _ = verify_input.prepare_for_verify(
+                batch, self.target_worker
+            )
+            batch.seq_lens_cpu = seq_lens_cpu_backup
+            batch.seq_lens_sum = seq_lens_sum_backup
+        else:
+            try:
+                with (plan_stream_ctx or contextlib.nullcontext()):
+                    if plan_ready_event is not None:
+                        plan_stream.wait_event(plan_ready_event)
+                    else:
+                        plan_stream.wait_stream(caller_stream)
+                    verify_forward_batch, _ = verify_input.prepare_for_verify(
+                        batch, self.target_worker
+                    )
+                    batch.seq_lens_cpu = seq_lens_cpu_backup
+                    batch.seq_lens_sum = seq_lens_sum_backup
+            finally:
+                _record_plan_stream_reads(
+                    plan_stream,
+                    (
+                        batch.seq_lens,
+                        batch.req_pool_indices,
+                        batch.out_cache_loc,
+                        verify_input.draft_token,
+                        verify_input.positions,
+                        *record_extra,
+                    ),
+                )
+                caller_stream.wait_stream(plan_stream)
 
         target_out = self.target_worker.forward_batch_generation(
             batch=None,

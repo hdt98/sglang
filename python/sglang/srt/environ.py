@@ -555,6 +555,10 @@ class Envs:
     SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
+    # Run non-compact target-verify metadata preparation on a dedicated
+    # stream while the draft kernels execute. This stays opt-in until the
+    # overlap path has production coverage across all DSpark targets.
+    SGLANG_DSPARK_VERIFY_PREPLAN_STREAM = EnvBool(False)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
