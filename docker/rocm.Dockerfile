@@ -379,6 +379,8 @@ ARG TORCHAUDIO_ROCM_VERSION="2.11.0+rocm7.2"
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_COMMIT=""
 ENV AITER_COMMIT="${AITER_COMMIT:-${AITER_COMMIT_DEFAULT}}"
+ARG AITER_PR_5561_COMMIT="610a95851ca044dcb457f40e1633eab19fc2ceda"
+ARG AITER_PR_5562_COMMIT="a2506c5bcb43d2df0feedb99a68b301c899ae695"
 
 ARG LLVM_REPO="https://github.com/jrbyrnes/llvm-project.git"
 ARG LLVM_BRANCH="MainOpSelV2"
@@ -569,15 +571,22 @@ RUN pip uninstall -y aiter
 # produced by a fresh `git clone` above, so there are no real user changes to
 # preserve.
 # cherry pick ROCm/aiter#5283 and #5279 gfx950 dsv4 a8w8 blockscale bpreshuffle configs
-# Drop this synchronization patch after the AITER pin includes ROCm/aiter#5561.
-COPY docker/patches/rocm/aiter_flydsl_moe_stage1_lds_dma_drain.patch /tmp/aiter_patches/
+# ROCm/aiter#5561 fixes the FlyDSL stage-1 LDS-DMA barrier, and #5562 adds the
+# gfx950 DeepSeek-V4.1 Flash EP4 a8w4 FMoE tuning. Fetch the PR refs because
+# both heads live in a fork, then verify the immutable commits before applying.
 # apply fix for v4 fp4 indexer, may be removed in next aiter upgrade
 RUN git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout -f ${AITER_COMMIT} \
+ && git fetch --no-tags origin \
+      refs/pull/5561/head:refs/remotes/origin/pr-5561 \
+      refs/pull/5562/head:refs/remotes/origin/pr-5562 \
+ && test "$(git rev-parse refs/remotes/origin/pr-5561)" = "${AITER_PR_5561_COMMIT}" \
+ && test "$(git rev-parse refs/remotes/origin/pr-5562)" = "${AITER_PR_5562_COMMIT}" \
  && git cherry-pick --no-commit 7b481fbcaf834ce98b66004ea329c2ca2bba87d7 \
  && git cherry-pick --no-commit 24a62b1c122f23645a19b9d8b0abd4750c59359b \
- && git apply --verbose /tmp/aiter_patches/aiter_flydsl_moe_stage1_lds_dma_drain.patch \
+ && git cherry-pick --no-commit ${AITER_PR_5561_COMMIT} \
+ && git cherry-pick --no-commit ${AITER_PR_5562_COMMIT} \
  && sed -i 's/from functools import lru_cache/from functools import cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && sed -i 's/@lru_cache(maxsize=32)/@cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && git submodule update --init --recursive \
@@ -1178,8 +1187,6 @@ ENV SGLANG_ROCM_FUSED_DECODE_MLA=1
 ENV SGLANG_SET_CPU_AFFINITY=1
 ENV SGLANG_USE_AITER=1
 ENV SGLANG_USE_ROCM700A=1
-# Drop after the AITER pin includes ROCm/aiter#5562; model_configs preserves other models' rows.
-COPY docker/configs/rocm/aiter_fmoe_gfx950_dsv41_ep4_a8w4.csv /sgl-workspace/aiter/aiter/configs/model_configs/a8w4_tuned_fmoe_dsv41_flash_gfx950.csv
 
 ENV NCCL_MIN_NCHANNELS=112
 ENV ROCM_QUICK_REDUCE_QUANTIZATION=INT8
