@@ -11,9 +11,11 @@ graph launch.
 
 Correctness contract:
 
-- The caller only routes here when the replay is padding-free
+- The caller only routes here when the replay is padding-free and non-ragged
   (raw_bs == padded bs) and TBO / pdmux / LoRA are off, so every
-  Python-visible branch inside the backends is constant per key.
+  Python-visible branch inside the backends is constant per key. The replay
+  view also replaces the planner's per-step ``out_cache_loc`` allocation with
+  the registry's refreshed, pointer-stable slot before capture.
 - Python side effects (each backend's ``forward_metadata`` object) are
   snapshotted at capture time and re-installed on every replay; the graph
   replays only the device ops that refresh the tensors those objects point to.
@@ -21,14 +23,14 @@ Correctness contract:
   happen outside capture.
 - Any capture failure (e.g. a backend syncing or reading host values inside
   its prep) permanently disables the glue graph and falls back to eager.
-- Backends whose prep computes values on the HOST each replay (e.g. the
+- Backends whose prep computes values on the HOST each replay (e.g. most
   DFlash-family host-fed fast verify plans) must never be glued: capture
   records only device ops, so the host-written plan inputs would replay
   frozen at their capture-time values. Note the failure is SILENT — capture
   succeeds, outputs stay correct, only accept length collapses. Callers must
   gate such configurations off before routing here
-  (``decode_cuda_graph_runner`` force-disables the glue for DFlash-family
-  spec).
+  (``decode_cuda_graph_runner`` requires an explicit per-tier backend opt-in
+  for DFlash-family spec).
 """
 
 from __future__ import annotations

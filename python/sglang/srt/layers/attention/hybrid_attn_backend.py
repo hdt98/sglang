@@ -89,6 +89,13 @@ class HybridAttnBackend(AttentionBackend):
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         return self._select_backend(fm).shared_read_ends(fm)
 
+    def supports_dflash_metadata_glue_graph(
+        self, forward_mode: ForwardMode, batch_size: int
+    ) -> bool:
+        return self._select_backend(
+            forward_mode
+        ).supports_dflash_metadata_glue_graph(forward_mode, batch_size)
+
     @property
     def supports_full_cuda_graph_chunked_prefix(self) -> bool:
         return self.prefill_backend.supports_full_cuda_graph_chunked_prefix

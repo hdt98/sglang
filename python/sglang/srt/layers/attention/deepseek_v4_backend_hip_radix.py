@@ -1078,6 +1078,46 @@ class DeepseekV4HipRadixBackend(
             **low_ratio_indexer_metadata,
         )
 
+    def supports_dflash_metadata_glue_graph(
+        self, forward_mode: ForwardMode, batch_size: int
+    ) -> bool:
+        """Opt in only the raw, uniform target-verify metadata path.
+
+        Draft workers still build host-visible/full metadata. FP4 verify tiers
+        above the fused row limit also fall back to a non-capture-safe AITER
+        preamble, so those tiers stay eager.
+        """
+        if (
+            not forward_mode.is_target_verify()
+            or not self.is_dspark
+            or self.is_draft_worker
+        ):
+            return False
+        return self._fp4_graph_row_limit is None or (
+            self.target_verify_num_draft_tokens * batch_size
+            <= self._fp4_graph_row_limit
+        )
+
+    def _can_defer_target_verify_metadata(
+        self,
+        *,
+        batch_size: int,
+        out_cache_loc: Optional[torch.Tensor],
+        ragged_layout,
+        use_prefill_cuda_graph: bool,
+    ) -> bool:
+        return (
+            use_prefill_cuda_graph
+            and self.is_dspark
+            and ragged_layout is None
+            and out_cache_loc is not None
+            and (
+                self._fp4_graph_row_limit is None
+                or self.target_verify_num_draft_tokens * batch_size
+                <= self._fp4_graph_row_limit
+            )
+        )
+
     def init_forward_metadata_target_verify(
         self,
         max_seq_len: int,
@@ -1095,17 +1135,11 @@ class DeepseekV4HipRadixBackend(
         # table by MAX_SEQ_LEN_FOR_CAPTURE, far wider than the live max_seq_len
         # an eager caller passes. EAGLE and ragged layouts stay eager -- no raw
         # expansion, and EAGLE's fixed-tier plan trips planner invariants.
-        if (
-            use_prefill_cuda_graph
-            and self.is_dspark
-            and ragged_layout is None
-            and out_cache_loc is not None
-            # Oversized batches keep the eager build; see _fp4_graph_row_limit.
-            and (
-                self._fp4_graph_row_limit is None
-                or self.target_verify_num_draft_tokens * len(seq_lens)
-                <= self._fp4_graph_row_limit
-            )
+        if self._can_defer_target_verify_metadata(
+            batch_size=len(seq_lens),
+            out_cache_loc=out_cache_loc,
+            ragged_layout=ragged_layout,
+            use_prefill_cuda_graph=use_prefill_cuda_graph,
         ):
             return DSV4RawVerifyMetadata(
                 req_pool_indices=req_pool_indices,
@@ -1616,7 +1650,7 @@ class DeepseekV4HipRadixBackend(
             else:
                 out_cache_loc = None
             actual_forward_mode = forward_batch.forward_mode
-            seq_lens_cpu = seq_lens.cpu()
+            seq_lens_cpu = None
         else:
             out_cache_loc = forward_batch.out_cache_loc
             actual_forward_mode = getattr(
@@ -1638,15 +1672,39 @@ class DeepseekV4HipRadixBackend(
             )
             out_cache_loc = torch.zeros(bs, dtype=torch.int64, device=device)
 
-        if seq_lens_cpu is None:
-            seq_lens_cpu = seq_lens.cpu()
         seq_lens = seq_lens[:bs]
-        seq_lens_cpu = seq_lens_cpu[:bs]
         req_pool_indices = req_pool_indices[:bs]
 
-        actual_max_seq_len = seq_lens_cpu.max().item()
+        uses_dspark_draft_window = (
+            bucket == _GraphBucket.TARGET_VERIFY
+            and self._uses_dspark_draft_window()
+        )
+        ragged_layout = (
+            resolve_ragged_verify_layout(forward_batch)
+            if bucket == _GraphBucket.TARGET_VERIFY
+            and not uses_dspark_draft_window
+            else None
+        )
+        can_defer_target_verify = (
+            bucket == _GraphBucket.TARGET_VERIFY
+            and not uses_dspark_draft_window
+            and self._can_defer_target_verify_metadata(
+                batch_size=bs,
+                out_cache_loc=out_cache_loc,
+                ragged_layout=ragged_layout,
+                use_prefill_cuda_graph=True,
+            )
+        )
+
+        if seq_lens_cpu is None and not can_defer_target_verify:
+            seq_lens_cpu = seq_lens.cpu()
+        if seq_lens_cpu is not None:
+            seq_lens_cpu = seq_lens_cpu[:bs]
+
         chosen_max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
-        assert actual_max_seq_len <= chosen_max_seq_len
+        if not can_defer_target_verify:
+            actual_max_seq_len = seq_lens_cpu.max().item()
+            assert actual_max_seq_len <= chosen_max_seq_len
 
         graph_key = bs
 
@@ -1665,7 +1723,7 @@ class DeepseekV4HipRadixBackend(
                 seq_lens=seq_lens,
                 out_cache_loc=out_cache_loc_padded,
             )
-        elif bucket == _GraphBucket.TARGET_VERIFY and self._uses_dspark_draft_window():
+        elif bucket == _GraphBucket.TARGET_VERIFY and uses_dspark_draft_window:
             assert out_cache_loc is not None
             block_size = self.target_verify_num_draft_tokens
             num_tokens_v = block_size * bs
@@ -1684,7 +1742,6 @@ class DeepseekV4HipRadixBackend(
             )
         elif bucket == _GraphBucket.TARGET_VERIFY:
             assert out_cache_loc is not None
-            ragged_layout = resolve_ragged_verify_layout(forward_batch)
             if ragged_layout is not None:
                 ragged_layout = ragged_layout.padded_to_bucket(padded_bs=bs)
                 num_tokens_v = ragged_layout.graph_num_tokens
@@ -1703,9 +1760,14 @@ class DeepseekV4HipRadixBackend(
                 seq_lens=seq_lens,
                 out_cache_loc=out_cache_loc_padded,
                 use_prefill_cuda_graph=True,
-                # CPU mirror already available here (== seq_lens, no D2H);
-                # pass it so target_verify skips the per-iter seq_lens.tolist() sync.
-                seq_lens_cpu=seq_lens_cpu.tolist(),
+                # Raw DSpark verify rebuilds from live device tensors inside
+                # the main graph and does not need a CPU mirror. Eager/ragged
+                # paths retain their existing host plan.
+                seq_lens_cpu=(
+                    None
+                    if can_defer_target_verify
+                    else seq_lens_cpu.tolist()
+                ),
                 ragged_layout=ragged_layout,
             )
         elif bucket == _GraphBucket.DRAFT_EXTEND:

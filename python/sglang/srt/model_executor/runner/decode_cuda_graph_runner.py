@@ -211,6 +211,17 @@ def build_replay_fb_view(
     )
 
 
+def bind_metadata_glue_static_inputs(
+    fb_view: SimpleNamespace,
+    buffers: DecodeInputBuffers,
+    num_tokens: int,
+) -> SimpleNamespace:
+    """Bind per-step inputs to registry slots whose addresses survive replay."""
+    assert num_tokens <= buffers.out_cache_loc.shape[0]
+    fb_view.out_cache_loc = buffers.out_cache_loc[:num_tokens]
+    return fb_view
+
+
 class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     """Decode-phase CUDA graph runner.
 
@@ -438,16 +449,23 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # Captures the per-replay attention-metadata prep into a small CUDA
         # graph; see metadata_glue_graph.py for the correctness contract.
-        # Force-off for DFlash-family spec: verify installs host-fed fast
-        # plans (sync-free begin_forward that recomputes plan inputs on the
-        # host every replay), and capturing one freezes the capture-time
-        # plan — drafts go stale and accept length collapses to ~1.
+        # Most DFlash-family backends install host-fed plans that would freeze
+        # silently under capture. An audited backend may opt in only the shape
+        # tiers whose plans are rebuilt from raw device metadata in the main
+        # graph.
         enable_metadata_glue = envs.SGLANG_ENABLE_METADATA_GLUE_GRAPH.get()
-        if enable_metadata_glue and model_runner.spec_algorithm.is_dflash_family():
+        if (
+            enable_metadata_glue
+            and model_runner.spec_algorithm.is_dflash_family()
+            and not any(
+                self._metadata_glue_backend_eligible(self.attn_backend, bs)
+                for bs in self.capture_bs
+            )
+        ):
             logger.warning(
                 "SGLANG_ENABLE_METADATA_GLUE_GRAPH is incompatible with "
-                "DFlash-family speculative decoding (host-fed fast verify "
-                "plans must re-run on the host every replay); disabling the "
+                "this DFlash-family attention backend (its replay metadata "
+                "is host-fed for every captured shape); disabling the "
                 "metadata glue graph."
             )
             enable_metadata_glue = False
@@ -489,6 +507,34 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.enable_pdmux:
             return self.model_runner.decode_attn_backend_group[get_current_stream_idx()]
         return self.attn_backend
+
+    def _metadata_glue_backend_eligible(
+        self, attn_backend: AttentionBackend, batch_size: int
+    ) -> bool:
+        if not self.model_runner.spec_algorithm.is_dflash_family():
+            return True
+        return attn_backend.supports_dflash_metadata_glue_graph(
+            self.capture_forward_mode, batch_size
+        )
+
+    def _metadata_glue_replay_eligible(
+        self,
+        attn_backend: AttentionBackend,
+        *,
+        batch_size: int,
+        raw_batch_size: int,
+        attached_ragged_layout,
+    ) -> bool:
+        return (
+            self._metadata_glue is not None
+            and not self._metadata_glue.disabled
+            and raw_batch_size == batch_size
+            and attached_ragged_layout is None
+            and not self.enable_two_batch_overlap
+            and not self.enable_pdmux
+            and self.model_runner.lora_manager is None
+            and self._metadata_glue_backend_eligible(attn_backend, batch_size)
+        )
 
     def _resolve_shared_read_ends(self, attn_backend, forward_mode) -> SharedReadEnds:
         declared = attn_backend.shared_read_ends(forward_mode)
@@ -993,6 +1039,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return forward_batch, attn_backend, pp_proxy_tensors
 
     def capture(self) -> None:
+        if self._metadata_glue is not None:
+            # A recapture may rebuild backend metadata/static pools. Never let
+            # an old glue graph retain their dead addresses.
+            self._metadata_glue.reset()
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
@@ -1238,10 +1288,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
+        attached_ragged_layout = resolve_ragged_verify_layout(forward_batch)
         ragged_layout = (
-            resolve_ragged_verify_layout(forward_batch)
-            if self.ragged_verify_mode
-            else None
+            attached_ragged_layout if self.ragged_verify_mode else None
         )
         is_ragged = ragged_layout is not None
 
@@ -1359,14 +1408,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Glue-graph fast path: pointer-stable prep (static buffers + pool
         # tensors only) is captured per key; guards keep every python-visible
         # branch inside the backends constant for that key.
-        if (
-            self._metadata_glue is not None
-            and not self._metadata_glue.disabled
-            and raw_bs == bs
-            and not self.enable_two_batch_overlap
-            and not self.enable_pdmux
-            and self.model_runner.lora_manager is None
+        if self._metadata_glue_replay_eligible(
+            attn_backend,
+            batch_size=bs,
+            raw_batch_size=raw_bs,
+            attached_ragged_layout=attached_ragged_layout,
         ):
+            # The registry copied this iteration's cache locations before the
+            # glue launch. Capture must read this stable slot rather than the
+            # fresh planner allocation carried by forward_batch, otherwise
+            # replay would keep reading the capture-time pointer.
+            bind_metadata_glue_static_inputs(fb_view, buffers, padded_num_tokens)
             # actual_forward_mode belongs in the key even though the captured
             # graph always targets capture_forward_mode: DSV4's replay prep
             # substitutes seq_lens / seq_lens_cpu / seq_lens_sum /

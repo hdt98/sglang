@@ -138,6 +138,17 @@ class AttentionBackend(ABC):
         :py:meth:`init_forward_metadata_out_graph` call."""
         return False
 
+    def supports_dflash_metadata_glue_graph(
+        self, forward_mode: ForwardMode, batch_size: int
+    ) -> bool:
+        """Whether DFlash-family replay metadata prep is safe to graph-capture.
+
+        DFlash-family backends default to false because host-fed verify plans
+        can be frozen silently by the metadata glue graph. Audited backends may
+        opt in for individual modes and shape tiers.
+        """
+        return False
+
     # Opt out only when this backend never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = True
 
