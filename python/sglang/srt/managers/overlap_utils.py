@@ -67,6 +67,11 @@ def decide_needs_confidence_relay() -> bool:
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_GPU_ONLY_SEQ_LENS_MODE = (
+    envs.SGLANG_DSV4_GPU_ONLY_SEQ_LENS.get().strip().lower()
+)
+if _GPU_ONLY_SEQ_LENS_MODE not in ("1", "true", "stream"):
+    _GPU_ONLY_SEQ_LENS_MODE = ""
 
 # Token-buf consume tracking: init to -1, assert non-negative on gather,
 # write -1 back. Catches "gather without intermediate stash" bugs. CI enables
@@ -117,7 +122,17 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
     # Only the overlap path relays spec extras through the future_map; the
     # synchronous (non-overlap) V2 path installs next_draft_input directly.
     if batch.enable_overlap and not batch.spec_algorithm.is_none():
+        future_map.resolve_gpu_only_seq_lens_forward(batch)
         future_map._resolve_spec_extras(batch)
+
+
+def _is_mixed_like_batch(batch: ScheduleBatch) -> bool:
+    """Whether an overlap relay batch also carries prefill/extend rows."""
+    if getattr(batch, "mix_running_indices", None) is not None:
+        return True
+    if getattr(batch, "prefill_input_ids_cpu", None) is not None:
+        return True
+    return batch.forward_mode.is_mixed()
 
 
 CONFIDENCE_RELAY_RING_LAG: int = 2
@@ -313,6 +328,9 @@ class FutureMap:
         # Debug consume-once state: armed by a recording publish, consumed by
         # resolve; arm/consume strictly alternate across all batch interleavings.
         self._publish_fresh = False
+        # Stable target for the deferred forward-stream gather. Schedule-side
+        # placeholder shuffles never alias a transient allocation.
+        self.gpu_only_seq_lens_view: Optional[torch.Tensor] = None
 
         self.confidence_relay = ConfidenceRelay(
             device=self.device,
@@ -521,6 +539,18 @@ class FutureMap:
         fi = draft_input.future_indices
         if fi is None:
             return
+        gpu_only_step = (
+            _GPU_ONLY_SEQ_LENS_MODE != ""
+            and not self.needs_cpu_seq_lens
+            and not _is_mixed_like_batch(batch)
+        )
+        if gpu_only_step:
+            # The previous publish and the next gather execute on the same
+            # forward stream, so this pure DSpark step needs no host or
+            # scheduler-stream fence. Both None fields mark the pending gather.
+            batch.seq_lens_cpu = None
+            batch.seq_lens_sum = None
+            return
         if self.publish_ready is not None:
             if _DEBUG_ASSERT:
                 # Consume-once: every event wait must be re-armed by a fresh
@@ -534,7 +564,7 @@ class FutureMap:
                 self.publish_ready.wait()
         batch.seq_lens = self.new_seq_lens_buf[fi]
 
-        if not self.needs_cpu_seq_lens:
+        if not self.needs_cpu_seq_lens and not _is_mixed_like_batch(batch):
             # GPU gather above is kept (SB.seq_lens must advance each verify);
             # skip the .cpu() D2H. Downstream takes the GPU-only path.
             batch.seq_lens_cpu = None
@@ -567,6 +597,37 @@ class FutureMap:
             # After the D2H copy completed (synchronize above), so the pinned
             # mirror is not poisoned.
             _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
+
+    def resolve_gpu_only_seq_lens_forward(self, batch: ScheduleBatch) -> None:
+        """Gather deferred seq_lens at forward entry without an event fence."""
+        if _GPU_ONLY_SEQ_LENS_MODE == "" or self.needs_cpu_seq_lens:
+            return
+        draft_input = batch.spec_info
+        if draft_input is None:
+            return
+        fi = draft_input.future_indices
+        if fi is None:
+            return
+        if batch.seq_lens_cpu is not None or batch.seq_lens_sum is not None:
+            return
+        if batch.forward_mode.is_mixed():
+            return
+        if self.gpu_only_seq_lens_view is None:
+            self.gpu_only_seq_lens_view = torch.empty(
+                (self.req_pool_size,),
+                dtype=self.new_seq_lens_buf.dtype,
+                device=self.new_seq_lens_buf.device,
+            )
+        if _DEBUG_ASSERT:
+            assert self._publish_fresh, (
+                "forward-entry resolve without a fresh forward publish"
+            )
+            self._publish_fresh = False
+        view = self.gpu_only_seq_lens_view[: int(fi.shape[0])]
+        view.copy_(self.new_seq_lens_buf[fi])
+        batch.seq_lens = view
+        if _DEBUG_ASSERT:
+            _assert_nonneg_and_invalidate(view, self.new_seq_lens_buf, fi)
 
     def publish(
         self,

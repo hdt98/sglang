@@ -157,6 +157,22 @@ def _fold_lengths_for_aiter_sparse(
     return folded
 
 
+def _gpu_only_seq_lens_opt_out(
+    *,
+    mode: str,
+    is_hip: bool,
+    is_dspark: bool,
+    is_dspark_draft: bool,
+    uses_unified_kv_triton: bool,
+) -> bool:
+    """Whether this backend can build decode metadata without a host mirror."""
+    if mode not in ("1", "true", "stream"):
+        return False
+    if not is_hip or not (is_dspark or is_dspark_draft):
+        return False
+    return not uses_unified_kv_triton
+
+
 def _create_flashmla_metadata():
     from sglang.srt.utils import is_hip
 
@@ -832,6 +848,18 @@ class DeepseekV4HipRadixBackend(
             # CUDA-side convention gamma + 1, so use an explicit effective value
             # instead of mutating speculative_num_draft_tokens in place.
             self.target_verify_num_draft_tokens = self.speculative_num_draft_tokens - 1
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
+        )
+        from sglang.srt.utils import is_hip as is_hip_runtime
+
+        self.needs_cpu_seq_lens = not _gpu_only_seq_lens_opt_out(
+            mode=envs.SGLANG_DSV4_GPU_ONLY_SEQ_LENS.get().strip().lower(),
+            is_hip=is_hip_runtime(),
+            is_dspark=self.is_dspark,
+            is_dspark_draft=self.is_dspark_draft,
+            uses_unified_kv_triton=is_unified_kv_triton(),
+        )
         # Past MAX_FUSED_ROWS the fp4 schedule falls back to AITER's preamble,
         # which frees the scratch its kernels read -- not capture-safe.
         self._fp4_graph_row_limit: Optional[int] = None
@@ -1086,6 +1114,7 @@ class DeepseekV4HipRadixBackend(
             )
         if seq_lens_cpu is None:
             seq_lens_cpu = seq_lens.tolist()
+            max_seq_len = max(seq_lens_cpu)
         return self.init_forward_metadata_target_verify_old(
             max_seq_len=max_seq_len,
             req_pool_indices=req_pool_indices,
@@ -1609,7 +1638,8 @@ class DeepseekV4HipRadixBackend(
             )
             out_cache_loc = torch.zeros(bs, dtype=torch.int64, device=device)
 
-        assert seq_lens_cpu is not None
+        if seq_lens_cpu is None:
+            seq_lens_cpu = seq_lens.cpu()
         seq_lens = seq_lens[:bs]
         seq_lens_cpu = seq_lens_cpu[:bs]
         req_pool_indices = req_pool_indices[:bs]
@@ -1727,8 +1757,12 @@ class DeepseekV4HipRadixBackend(
         assert self.req_to_token_pool.req_to_token is self.req_to_token
 
         assert self.swa_page_size % SWA_WINDOW == 0 and self.page_size % 128 == 0
-        assert seq_lens_cpu is not None
-        max_seq_len = int(seq_lens_cpu.max().item())
+        if seq_lens_cpu is None:
+            # Decode and raw-verify metadata do not consume the live maximum;
+            # eager verify re-derives it after its existing tolist fallback.
+            max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
+        else:
+            max_seq_len = int(seq_lens_cpu.max().item())
 
         if forward_batch.forward_mode.is_decode_or_idle():
             # DSv4 bakes this step's KV write target (c4/c128) into metadata,

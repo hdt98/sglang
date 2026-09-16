@@ -5,6 +5,7 @@ keep-list."""
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -257,6 +258,127 @@ class TestHybridNeedsCpuSeqLens(CustomTestCase):
         self.assertFalse(
             self._make(False, False, spec_mode="prefill").needs_cpu_seq_lens
         )
+
+
+class TestGpuOnlySeqLensBackendGate(CustomTestCase):
+    def test_gate_truth_table(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
+            _gpu_only_seq_lens_opt_out,
+        )
+
+        common = dict(
+            is_hip=True,
+            is_dspark=True,
+            is_dspark_draft=False,
+            uses_unified_kv_triton=False,
+        )
+        self.assertTrue(_gpu_only_seq_lens_opt_out(mode="1", **common))
+        self.assertTrue(_gpu_only_seq_lens_opt_out(mode="stream", **common))
+        self.assertFalse(_gpu_only_seq_lens_opt_out(mode="", **common))
+        self.assertFalse(
+            _gpu_only_seq_lens_opt_out(mode="1", **(common | {"is_hip": False}))
+        )
+        self.assertFalse(
+            _gpu_only_seq_lens_opt_out(
+                mode="1", **(common | {"uses_unified_kv_triton": True})
+            )
+        )
+
+
+class _PublishEvent:
+    def __init__(self):
+        self.synchronize_calls = 0
+        self.wait_calls = 0
+
+    def synchronize(self):
+        self.synchronize_calls += 1
+
+    def wait(self):
+        self.wait_calls += 1
+
+
+class TestGpuOnlySeqLensDeferredGather(CustomTestCase):
+    @staticmethod
+    def _batch(*, mixed=False):
+        return SimpleNamespace(
+            spec_info=SimpleNamespace(
+                future_indices=torch.tensor([1, 3], dtype=torch.int64)
+            ),
+            seq_lens=torch.tensor([10, 20], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([10, 20], dtype=torch.int64),
+            seq_lens_sum=30,
+            mix_running_indices=(
+                torch.tensor([1, 3], dtype=torch.int64) if mixed else None
+            ),
+            prefill_input_ids_cpu=(
+                torch.tensor([7], dtype=torch.int64) if mixed else None
+            ),
+            forward_mode=SimpleNamespace(is_mixed=lambda: mixed),
+        )
+
+    @staticmethod
+    def _future_map(event):
+        return SimpleNamespace(
+            publish_ready=event,
+            new_seq_lens_buf=torch.arange(8, dtype=torch.int64),
+            needs_cpu_seq_lens=False,
+            fwd_prepare_d2h_stream=None,
+            req_pool_size=8,
+            gpu_only_seq_lens_view=None,
+            _publish_fresh=True,
+        )
+
+    def test_pure_step_defers_without_a_fence_and_reuses_view(self):
+        from sglang.srt.managers import overlap_utils
+
+        event = _PublishEvent()
+        future_map = self._future_map(event)
+        batch = self._batch()
+        with (
+            patch.object(overlap_utils, "_is_hip", True),
+            patch.object(overlap_utils, "_GPU_ONLY_SEQ_LENS_MODE", "1"),
+            patch.object(overlap_utils, "_DEBUG_ASSERT", False),
+        ):
+            overlap_utils.FutureMap.resolve_seq_lens_cpu(future_map, batch)
+            self.assertEqual(event.synchronize_calls, 0)
+            self.assertEqual(event.wait_calls, 0)
+            torch.testing.assert_close(batch.seq_lens, torch.tensor([10, 20]))
+            self.assertIsNone(batch.seq_lens_cpu)
+            self.assertIsNone(batch.seq_lens_sum)
+
+            overlap_utils.FutureMap.resolve_gpu_only_seq_lens_forward(
+                future_map, batch
+            )
+            first_storage = batch.seq_lens.data_ptr()
+            torch.testing.assert_close(batch.seq_lens, torch.tensor([1, 3]))
+
+            future_map.new_seq_lens_buf[1] = 2
+            future_map.new_seq_lens_buf[3] = 4
+            overlap_utils.FutureMap.resolve_gpu_only_seq_lens_forward(
+                future_map, batch
+            )
+
+        self.assertEqual(batch.seq_lens.data_ptr(), first_storage)
+        torch.testing.assert_close(batch.seq_lens, torch.tensor([2, 4]))
+
+    def test_mixed_step_keeps_the_host_mirror_and_fence(self):
+        from sglang.srt.managers import overlap_utils
+
+        event = _PublishEvent()
+        future_map = self._future_map(event)
+        batch = self._batch(mixed=True)
+        with (
+            patch.object(overlap_utils, "_is_hip", True),
+            patch.object(overlap_utils, "_GPU_ONLY_SEQ_LENS_MODE", "1"),
+            patch.object(overlap_utils, "_DEBUG_ASSERT", False),
+        ):
+            overlap_utils.FutureMap.resolve_seq_lens_cpu(future_map, batch)
+
+        self.assertEqual(event.synchronize_calls, 1)
+        self.assertEqual(event.wait_calls, 0)
+        torch.testing.assert_close(batch.seq_lens, torch.tensor([1, 3]))
+        torch.testing.assert_close(batch.seq_lens_cpu, torch.tensor([1, 3]))
+        self.assertEqual(batch.seq_lens_sum, 4)
 
 
 class TestFilterBatchHostIndices(CustomTestCase):

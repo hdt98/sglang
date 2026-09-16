@@ -945,6 +945,9 @@ class Envs:
     # aiter_sparse decode: a pinned split-KV count keeps the fp32 combine order, hence the bits,
     # the same at every batch size; 0 keeps aiter's cost model, which re-splits past 64 rows
     SGLANG_OPT_HIP_ATTN_KV_SPLITS = EnvInt(4)
+    # DSpark + HIP radix only: avoid publishing a per-step host seq-lens mirror
+    # and gather the live lengths at the next forward-stream entry instead.
+    SGLANG_DSV4_GPU_ONLY_SEQ_LENS = EnvStr("")
 
     # ===================================================================
     # Apple Silicon and MLX
