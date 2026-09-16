@@ -487,16 +487,23 @@ class FutureMap:
     def resolve_mixed_spec_tails(self, batch: ScheduleBatch) -> None:
         """Late-bind a spec mixed batch's decode tails (overlap): schedule-time
         lengths lag the in-flight step's accept count, so rebuild the tail rows
-        from the published committed lengths behind the publish fence."""
+        from the published committed lengths at forward entry.
+
+        The only caller (overlap resolve_forward_inputs) runs inside
+        forward_stream_ctx after forward_stream.wait_stream(schedule_stream),
+        and the publish scatter + record were enqueued on this same forward
+        stream, so the gathers below are stream-ordered after the publish with
+        no fence enqueued here. A stream-ordered wait regressed TPOT on MI355,
+        while the legacy publish_ready.synchronize() duplicated the ordering
+        already imposed by the host-mirror D2H below. That D2H still gates CPU
+        data by synchronizing the current stream after the publish."""
         idx = batch.mix_running_indices
         n = int(idx.shape[0])
         if n == 0:
             return
-        if self.publish_ready is not None:
-            if _is_hip:
-                self.publish_ready.synchronize()
-            else:
-                self.publish_ready.wait()
+        if self.publish_ready is not None and not _is_hip:
+            # Non-HIP platforms keep the stream-ordered wait (no host block).
+            self.publish_ready.wait()
         fresh = self.new_seq_lens_buf[idx]
         seq_lens = batch.seq_lens.clone()
         seq_lens[-n:] = fresh + 1
