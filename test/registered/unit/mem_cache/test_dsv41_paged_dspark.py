@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -103,7 +104,13 @@ class TestPagedDSparkWithEncoderReplay(CustomTestCase):
             spec_algorithm=spec,
             spec_aux_config=SimpleNamespace(dflash_draft_num_layers=3),
         )
-        planner = DSV4PoolConfigurator(kvc)
+        # Exercise the HIP-only indexer sizing branch. A function-local import
+        # of get_exec below that branch makes this constructor fail with
+        # UnboundLocalError even though get_exec is imported at module scope.
+        with patch(
+            "sglang.srt.model_executor.pool_configurator._is_hip", True
+        ):
+            planner = DSV4PoolConfigurator(kvc)
         self.assertEqual(planner.bytes_per_swa_token, 3 * 584)
         self.assertGreater(planner.swa_cap_tokens, 0)
         budget = 256 * 1024 * 1024
