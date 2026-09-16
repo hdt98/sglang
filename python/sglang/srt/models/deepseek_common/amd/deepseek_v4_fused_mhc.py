@@ -436,6 +436,8 @@ def hc_boundary(
     hc_fn: torch.Tensor,
     hc_scale: torch.Tensor,
     hc_base: torch.Tensor,
+    *,
+    stats_stream: Optional[torch.cuda.Stream] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, "HcCoefficients"]:
     """Fused sublayer boundary (ROCm): apply the pending hc_post of ``x`` onto ``residual``, collapse
     with ``pre_prev`` (copy 0 when None) and take the mixing statistics. Returns (new_residual, y,
@@ -458,7 +460,11 @@ def hc_boundary(
         layer.rms_norm_eps,
         layer.hc_eps,
     )
-    if not envs.SGLANG_OPT_HIP_FUSE_SINKHORN_INTO_NORM.get():
+    if stats_stream is not None:
+        stats_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stats_stream):
+            coefficients.materialize()
+    elif not envs.SGLANG_OPT_HIP_FUSE_SINKHORN_INTO_NORM.get():
         coefficients.materialize()
     if new_residual is None:
         new_residual = residual
@@ -477,6 +483,7 @@ def forward_hc_pre_from_prev_fused_boundary(
     prev_pre: Optional[torch.Tensor],
     pending_post: Optional[Tuple[torch.Tensor, ...]],
     defer_post: bool,
+    stats_stream: Optional[torch.cuda.Stream] = None,
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor, Optional[Tuple[torch.Tensor, ...]]]:
     """ROCm form of ``DeepseekV4DecoderLayer.forward_hc_pre_from_prev``: one fused launch per
     boundary. ``pending_post`` is the previous layer's unapplied FFN hc_post ``(x, residual, post,
@@ -489,6 +496,7 @@ def forward_hc_pre_from_prev_fused_boundary(
             layer.hc_attn_fn,
             layer.hc_attn_scale,
             layer.hc_attn_base,
+            stats_stream=stats_stream,
         )
     else:
         residual, x, attn_coefficients = hc_boundary(
@@ -501,8 +509,10 @@ def forward_hc_pre_from_prev_fused_boundary(
             layer.hc_attn_fn,
             layer.hc_attn_scale,
             layer.hc_attn_base,
+            stats_stream=stats_stream,
         )
-    # the boundary's reduce + sinkhorn rides in the norm launch
+    # Without a side stream, the boundary's reduce + sinkhorn rides in the
+    # norm launch. With one, the plain norm overlaps its standalone launch.
     x, x_quant = layer._input_norm(
         x, allow_aiter_quant=False, coefficients=attn_coefficients
     )
@@ -510,6 +520,8 @@ def forward_hc_pre_from_prev_fused_boundary(
         x = layer.self_attn(
             x=x, positions=positions, forward_batch=forward_batch, x_quant=x_quant
         )
+    if stats_stream is not None:
+        torch.cuda.current_stream().wait_stream(stats_stream)
     residual, x, ffn_coefficients = hc_boundary(
         layer,
         x,
@@ -520,12 +532,15 @@ def forward_hc_pre_from_prev_fused_boundary(
         layer.hc_ffn_fn,
         layer.hc_ffn_scale,
         layer.hc_ffn_base,
+        stats_stream=stats_stream,
     )
     x = _gfx95_dense_post_attention_norm(layer, x, ffn_coefficients)
     x = layer._run_moe_ffn_dp_sync(
         x, forward_batch, input_ids=input_ids, input_ids_global=input_ids_global
     )
     ffn_pre, ffn_post, ffn_comb = ffn_coefficients.tensors()
+    if stats_stream is not None:
+        torch.cuda.current_stream().wait_stream(stats_stream)
     if defer_post:
         return None, ffn_pre, (x, residual, ffn_post, ffn_comb)
     return layer.hc_post(x, residual, ffn_post, ffn_comb), ffn_pre, None

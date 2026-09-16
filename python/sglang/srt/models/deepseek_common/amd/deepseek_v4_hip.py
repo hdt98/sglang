@@ -175,6 +175,10 @@ def forward_layer_fused_boundary(
         and model.layers[nxt].engram is None
         and not (capture_dspark and nxt in model.dspark_layers_to_capture)
     )
+    stats_stream = model.layers[i]._get_hc_stats_stream(
+        hidden_states if hidden_states is not None else pending_post[0],
+        forward_batch,
+    )
     return forward_hc_pre_from_prev_fused_boundary(
         model.layers[i],
         positions=positions,
@@ -185,4 +189,5 @@ def forward_layer_fused_boundary(
         prev_pre=prev_pre,
         pending_post=pending_post,
         defer_post=defer_post,
+        stats_stream=stats_stream,
     )

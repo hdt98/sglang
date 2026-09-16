@@ -2602,10 +2602,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         compress_ratio_override: Optional[int] = None,
         engram_layout: Optional[EngramLayout] = None,
         hc_stats_stream: Optional[torch.cuda.Stream] = None,
+        hc_stats_stream_hip: Optional[torch.cuda.Stream] = None,
         moe_routed_quant_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.hc_stats_stream = hc_stats_stream
+        self.hc_stats_stream_hip = hc_stats_stream_hip
         self.config = config
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
@@ -3389,16 +3391,19 @@ class DeepseekV4DecoderLayer(nn.Module):
     def _get_hc_stats_stream(self, hidden_states, forward_batch):
         # Verify batches can also compute coefficients beside the
         # sublayer; each branch joins before hc_post reads those coefficients.
+        if not (
+            forward_batch.forward_mode.is_decode()
+            or (
+                forward_batch.forward_mode.is_target_verify()
+                and hidden_states.shape[0] > 0
+            )
+        ):
+            return None
+        if _is_hip:
+            return self.hc_stats_stream_hip
         return (
             self.hc_stats_stream
-            if (
-                forward_batch.forward_mode.is_decode()
-                or (
-                    forward_batch.forward_mode.is_target_verify()
-                    and hidden_states.shape[0] > 0
-                )
-            )
-            and (not get_platform().is_sm90 or hidden_states.shape[0] == 1)
+            if (not get_platform().is_sm90 or hidden_states.shape[0] == 1)
             else None
         )
 
@@ -4068,6 +4073,13 @@ class DeepseekV4Model(nn.Module):
             and config.hc_pre_from_prev_sublayer
             else None
         )
+        self.hc_stats_stream_hip = (
+            device_module.Stream()
+            if _is_hip
+            and envs.SGLANG_HIP_HC_STATS_STREAM.get()
+            and config.hc_pre_from_prev_sublayer
+            else None
+        )
         self.engram_layout = build_engram_layout(config)
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
@@ -4079,6 +4091,7 @@ class DeepseekV4Model(nn.Module):
                 alt_streams=self.alt_streams,
                 engram_layout=self.engram_layout,
                 hc_stats_stream=self.hc_stats_stream,
+                hc_stats_stream_hip=self.hc_stats_stream_hip,
                 moe_routed_quant_stream=self.moe_routed_quant_stream,
             ),
             pp_rank=self.pp_group.rank_in_group,

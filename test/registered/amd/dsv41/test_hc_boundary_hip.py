@@ -236,6 +236,20 @@ class TestRmsnormWithSinkhorn(CustomTestCase):
                 else:
                     self.assertTrue(torch.equal(quant.x, quant2.x))
 
+    def test_standalone_sinkhorn_matches_on_side_stream(self):
+        _, _, reference = self._boundary(self.deferred, 48, 48)
+        reference.materialize()
+
+        _, _, overlapped = self._boundary(self.deferred, 48, 48)
+        main_stream = torch.cuda.current_stream()
+        stats_stream = torch.cuda.Stream()
+        stats_stream.wait_stream(main_stream)
+        with torch.cuda.stream(stats_stream):
+            overlapped.materialize()
+        main_stream.wait_stream(stats_stream)
+
+        self.assertTrue(_all_equal(reference.tensors(), overlapped.tensors()))
+
 
 def _prefill_available():
     if not is_hip() or not torch.cuda.is_available():

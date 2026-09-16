@@ -942,6 +942,10 @@ class Envs:
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
     # gfx950 mHC: the boundary reduce + sinkhorn rides in the layer's next RMSNorm launch (0: alone)
     SGLANG_OPT_HIP_FUSE_SINKHORN_INTO_NORM = EnvBool(True)
+    # gfx950 mHC: overlap the boundary reduce + sinkhorn with the following
+    # sublayer on a dedicated stream for decode and target-verify batches.
+    # Disabled by default so the existing hosted-norm path is unchanged.
+    SGLANG_HIP_HC_STATS_STREAM = EnvBool(False)
     # aiter MoE: the FlyDSL top-k reduction adds the shared expert in the same launch (0: separate add)
     SGLANG_OPT_HIP_FUSED_MOE_REDUCE_ADD = EnvBool(True)
     # HIP: fused decode glue launches (page table, index widening, image select); 0: torch
