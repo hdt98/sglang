@@ -32,6 +32,7 @@ class TestMlxLaunchBookkeeping(unittest.TestCase):
     def _make_scheduler(self):
         scheduler = MagicMock()
         scheduler.forward_ct = 0
+        scheduler._sched_idled = False
         result = MagicMock()
         result.next_token_ids = None
         scheduler.tp_worker.finalize_mlx_result.return_value = result
@@ -111,6 +112,7 @@ class TestOverlapLoopStampsLaunchTs(unittest.TestCase):
 
         scheduler = MagicMock()
         scheduler.forward_ct = 0
+        scheduler._sched_idled = False
         scheduler._prepare_mlx_launch.side_effect = lambda batch: (
             SchedulerMlxOverlapMixin._prepare_mlx_launch(scheduler, batch)
         )
@@ -269,13 +271,16 @@ class TestOverlapLoopGracefulExit(unittest.TestCase):
         scheduler._engine_paused = False
         scheduler.waiting_queue = []
         scheduler.result_queue = deque()
-        scheduler.ingest_requests.side_effect = recv_side_effect
-        # Model handle_shutdown: processing a non-empty recv batch (the
-        # ShutdownReq) flips the flag; the loop must notice at the top of the
-        # next iteration instead of polling forever.
-        scheduler.process_input_requests.side_effect = lambda reqs: (
-            setattr(scheduler, "gracefully_exit", True) if reqs else None
-        )
+        recv_requests = MagicMock(side_effect=recv_side_effect)
+
+        def ingest_requests():
+            reqs = recv_requests()
+            # Ingestion dispatches the shutdown request before the loop resumes.
+            if reqs:
+                scheduler.gracefully_exit = True
+            return reqs
+
+        scheduler.ingest_requests.side_effect = ingest_requests
         plan = MagicMock()
         plan.batch_to_run = None
         scheduler.get_next_batch_to_run.return_value = plan
@@ -286,9 +291,8 @@ class TestOverlapLoopGracefulExit(unittest.TestCase):
             SchedulerMlxOverlapMixin,
         )
 
-        # Iteration 1: recv the ShutdownReq stand-in (flag flips inside
-        # process_input_requests).  Iteration 2 must break before polling
-        # again; the sentinel raising instead means the loop never exits.
+        # Ingest shutdown once. A second poll raises instead of hanging if
+        # the loop fails to exit.
         scheduler = self._make_scheduler(recv_side_effect=[[MagicMock()], _StopLoop()])
 
         with patch(
