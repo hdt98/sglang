@@ -43,6 +43,11 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 
+_GFX950_FUSED_HEADS = 16
+_GFX950_FUSED_HEAD_DIM = 128
+_GFX950_FUSED_DRAFT_TOKEN_NUMS = (6, 8)
+_GFX950_FUSED_MAX_BATCH = 16
+
 
 class KDAKernelDispatcher:
     """Dispatches KDA kernel calls to the appropriate backend per mode."""
@@ -1287,8 +1292,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         seq_len, dim = mixed_qkv.shape
         batch_size = seq_len // draft_token_num
+        hip_gfx95 = is_hip() and is_gfx95_supported()
         if replayssm_on and (
-            batch_size != 1 or not (get_platform().is_sm90 or get_platform().is_sm100)
+            batch_size != 1
+            or not (hip_gfx95 or get_platform().is_sm90 or get_platform().is_sm100)
         ):
             # The runtime still uses BV=4, not the benchmark's best-BV sweep:
             # fused+ring wins at B=1 but regresses from B=4 (B=2 at T=8) on
@@ -1297,19 +1304,19 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # path and the separate CuTe path are unchanged.
             return False
         if is_hip() and not (
-            is_gfx95_supported()
-            and 1 <= batch_size <= 16
-            and draft_token_num in (6, 8)
-            and layer.num_q_heads == layer.num_v_heads == 16
-            and layer.head_k_dim == layer.head_v_dim == 128
+            hip_gfx95
+            and 1 <= batch_size <= _GFX950_FUSED_MAX_BATCH
+            and draft_token_num in _GFX950_FUSED_DRAFT_TOKEN_NUMS
+            and layer.num_q_heads == layer.num_v_heads == _GFX950_FUSED_HEADS
+            and layer.head_k_dim == layer.head_v_dim == _GFX950_FUSED_HEAD_DIM
             and mixed_qkv.dtype == torch.bfloat16
             and layer.conv_weights.dtype == torch.float32
             and layer.bias is None
-            and layer.lower_bound == -5.0
         ):
             # Measured GLM TP4 wins only: larger gfx950 batches lose the
-            # launch saving to duplicated convolution work. Keep the
-            # reference path for them and for unmeasured ROCm shapes.
+            # launch saving to duplicated convolution work. Keep the reference
+            # path for unmeasured ROCm shapes; `lower_bound` is model data, not
+            # a launch constraint, so it must not be fingerprinted here.
             return False
         expected_dim = (
             2 * layer.num_q_heads * layer.head_k_dim

@@ -19,6 +19,13 @@ _FLASHINFER_TIE_BREAK_VALUES = {
     "large": 2,
 }
 
+# Keep an unfused top-k call's temporary score/index work bounded on very wide
+# HIP ragged batches. The bound is deliberately HIP-only so this AMD-focused
+# fix does not change CUDA launch behavior.
+_TOPK_UNFUSED_MAX_ROWS_PER_CALL = 4096
+# Equal to the threshold so the recursive call reaches the no-recursion base.
+_TOPK_UNFUSED_CHUNK_SIZE = _TOPK_UNFUSED_MAX_ROWS_PER_CALL
+
 
 class TopkTransformMethod(IntEnum):
     # Transform topk indices to indices to the page table (page_size = 1)
@@ -282,11 +289,11 @@ def _topk_unfused(
     if batch_size == 0 or topk == 0 or max_score_len == 0:
         return topk_indices
 
-    # Keep torch.topk's temporary score/index work bounded on very wide ragged
-    # batches. Without this, a 32K-row prefill can ask for several GiB of scratch
-    # even when only a few hundred MiB of final output is needed.
-    if batch_size > 4096:
-        chunk_size = 4096
+    # Keep torch.topk's temporary score/index work bounded on very wide HIP
+    # ragged batches. Without this, a 32K-row prefill can ask for several GiB of
+    # scratch even when only a few hundred MiB of final output is needed.
+    if _is_hip and batch_size > _TOPK_UNFUSED_MAX_ROWS_PER_CALL:
+        chunk_size = _TOPK_UNFUSED_CHUNK_SIZE
         for start in range(0, batch_size, chunk_size):
             end = min(start + chunk_size, batch_size)
             topk_indices[start:end] = _topk_unfused(

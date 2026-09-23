@@ -78,11 +78,16 @@ def _mhc_pre_oracle(
     )
 
 
-def test_mhc_hip_tilelang_fallback_keeps_existing_unfused_kernels(monkeypatch):
-    """AITER-off HIP keeps TileLang, but leaves RMSNorm to the caller."""
+def test_mhc_hip_tilelang_flags_do_not_override_aiter_precedence(monkeypatch):
+    """AITER owns gfx950; with AITER off, HIP falls back to Torch.
+
+    The TileLang flags are CUDA-only. Enabling them on HIP must not select the
+    TileLang kernels or change the caller-applied RMSNorm contract.
+    """
     monkeypatch.setattr(mhc.envs.SGLANG_USE_AITER, "get", lambda: False)
     monkeypatch.setattr(mhc.envs.SGLANG_OPT_USE_TILELANG_MHC_PRE, "get", lambda: True)
     monkeypatch.setattr(mhc.envs.SGLANG_OPT_USE_TILELANG_MHC_POST, "get", lambda: True)
+    monkeypatch.setattr(mhc, "is_hip", lambda: True)
     monkeypatch.setattr(mhc, "is_gfx95_supported", lambda: True)
 
     residual = torch.empty(1, 4, 8)
@@ -92,23 +97,23 @@ def test_mhc_hip_tilelang_fallback_keeps_existing_unfused_kernels(monkeypatch):
     norm_weight = torch.empty(8)
     calls = {"pre": 0, "post": 0}
 
-    def native_pre(**kwargs):
+    def torch_pre(**kwargs):
         calls["pre"] += 1
-        assert kwargs["norm_weight"] is None
-        assert kwargs["norm_eps"] is None
+        assert kwargs.get("norm_weight") is None
+        assert kwargs.get("norm_eps") is None
         return post_mix, comb_mix, layer_input
 
-    def native_post(*args):
+    def torch_post(*args):
         calls["post"] += 1
         return residual
 
-    def unexpected_torch(*args, **kwargs):
-        pytest.fail("enabled TileLang fallback was replaced by Torch")
+    def unexpected_tilelang(*args, **kwargs):
+        pytest.fail("TileLang must not be selected on HIP")
 
-    monkeypatch.setattr(mhc, "mhc_pre", native_pre)
-    monkeypatch.setattr(mhc, "mhc_post", native_post)
-    monkeypatch.setattr(mhc, "_mhc_pre_torch", unexpected_torch)
-    monkeypatch.setattr(mhc, "_mhc_post_torch", unexpected_torch)
+    monkeypatch.setattr(mhc, "mhc_pre", unexpected_tilelang)
+    monkeypatch.setattr(mhc, "mhc_post", unexpected_tilelang)
+    monkeypatch.setattr(mhc, "_mhc_pre_torch", torch_pre)
+    monkeypatch.setattr(mhc, "_mhc_post_torch", torch_post)
 
     pre = mhc._mhc_pre_dispatch(
         residual=residual,
@@ -156,7 +161,6 @@ def test_mhc_hip_pre_and_post_match_torch_oracles(monkeypatch, shape):
     monkeypatch.setattr(mhc.envs.SGLANG_USE_AITER, "get", lambda: True)
     monkeypatch.setattr(mhc, "use_symmetric_memory", lambda *a, **kw: nullcontext())
     monkeypatch.setattr(mhc, "is_allocation_symmetric", lambda: False)
-    monkeypatch.setattr(mhc, "get_tp_group", lambda: None)
     monkeypatch.setattr(mhc, "is_dsa_prefill_cp_interleave", lambda: False)
 
     calls = {"pre": 0, "post": 0}

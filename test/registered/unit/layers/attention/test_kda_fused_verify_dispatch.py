@@ -103,6 +103,16 @@ def test_hip_unmeasured_architecture_falls_back(monkeypatch):
     assert not gate(backend, **_inputs(4))
 
 
+@pytest.mark.parametrize("lower_bound", [None, -5.0, -7.25, 0.125])
+def test_hip_lower_bound_is_not_a_dispatch_constraint(monkeypatch, lower_bound):
+    gate = _load_gate(monkeypatch)
+    backend = SimpleNamespace(_fused_chain_verify_fn=object())
+    kwargs = _inputs(4)
+    kwargs["layer"].lower_bound = lower_bound
+
+    assert gate(backend, **kwargs)
+
+
 def test_cuda_keeps_existing_shape_coverage(monkeypatch):
     gate = _load_gate(monkeypatch, hip=False)
     backend = SimpleNamespace(_fused_chain_verify_fn=object())

@@ -20,6 +20,7 @@ from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import override_platform
+from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -33,9 +34,18 @@ _SNAPSHOT_ORACLE_TOL = dict(rtol=0, atol=1e-5)
 
 
 class TestKDAFusedVerifyBackend(CustomTestCase):
-    def _make_case(self, batch_size=1, heads=2, v_heads=4, lower_bound=-5.0):
+    def _make_case(
+        self,
+        batch_size=1,
+        heads=2,
+        v_heads=4,
+        lower_bound=-5.0,
+        steps=4,
+        weight_dtype=torch.bfloat16,
+        has_bias=True,
+    ):
         torch.manual_seed(36821)
-        steps, head_dim, num_layers = 4, 128, 2
+        head_dim, num_layers = 128, 2
         num_slots = batch_size + 3
         dim = (2 * heads + v_heads) * head_dim
 
@@ -54,8 +64,8 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
                 q_dim=heads * head_dim,
                 k_dim=heads * head_dim,
                 v_dim=v_heads * head_dim,
-                conv_weights=randn(dim, 4),
-                bias=randn(dim),
+                conv_weights=randn(dim, 4, dtype=weight_dtype),
+                bias=randn(dim) if has_bias else None,
                 A_log=randn(v_heads, dtype=torch.float32),
                 dt_bias=randn(v_heads * head_dim, dtype=torch.float32),
                 lower_bound=lower_bound,
@@ -169,6 +179,11 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
             for layer, (mixed, a, b) in zip(layers, inputs)
         ]
 
+    @unittest.skipIf(
+        is_hip(),
+        "generic fused-shape coverage is CUDA dispatch coverage; "
+        "HIP uses the measured-shape test",
+    )
     def test_verify_commit_verify(self):
         # B=1 exercises the enabled path. Platform override makes the dispatch
         # testable on any CUDA CI runner; it does not replace a GPU kernel.
@@ -211,6 +226,11 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
                 for state in (fused_state, ref_state):
                     torch.testing.assert_close(
                         state.temporal, initial.temporal, rtol=0, atol=0
+                    )
+                    # Verify is speculative: both production paths must leave
+                    # the committed conv window untouched until commit scatter.
+                    torch.testing.assert_close(
+                        state.conv[0], initial.conv[0], rtol=0, atol=0
                     )
 
                 last_steps = torch.full_like(slots, num_accept_tokens - 1)
@@ -297,6 +317,11 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
                         getattr(state, name), getattr(ref_state, name), rtol=0, atol=0
                     )
 
+    @unittest.skipIf(
+        is_hip(),
+        "generic fused-shape coverage is CUDA dispatch coverage; "
+        "HIP uses the measured-shape test",
+    )
     def test_snapshot_dispatch_is_unchanged(self):
         for platform in (
             {"is_sm90": True, "is_sm100": False},
@@ -320,9 +345,7 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
     def test_unfused_target_verify_is_graph_capturable(self):
         """The unfused verify scratch copy must not sync during graph capture."""
         layers, initial, slots, batch, rounds = self._make_case(batch_size=2)
-        backend, _, _ = self._make_backend(
-            initial, slots, 4, fused=False, ring=False
-        )
+        backend, _, _ = self._make_backend(initial, slots, 4, fused=False, ring=False)
         layer = layers[0]
         mixed, a, b = rounds[0][0]
 
@@ -337,6 +360,56 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
         graph.replay()
         torch.cuda.synchronize()
         self.assertEqual(out.shape, (1, 8, 4, 128))
+
+    def test_hip_verify_commit_verify(self):
+        """Exercise the production backend with gfx950 fused-enable shapes."""
+        if not is_hip():
+            self.skipTest("HIP-specific backend shape coverage")
+
+        layers, initial, slots, batch, rounds = self._make_case(
+            heads=16,
+            v_heads=16,
+            steps=6,
+            weight_dtype=torch.float32,
+            has_bias=False,
+        )
+        fused, fused_hybrid, fused_state = self._make_backend(
+            initial, slots, 6, fused=True
+        )
+        reference, ref_hybrid, ref_state = self._make_backend(
+            initial, slots, 6, fused=False
+        )
+
+        out_fused = self._verify(fused, layers, batch, rounds[0])
+        out_ref = self._verify(reference, layers, batch, rounds[0])
+        for actual, expected in zip(out_fused, out_ref):
+            torch.testing.assert_close(actual, expected, **_OUTPUT_TOL)
+        for state in (fused_state, ref_state):
+            torch.testing.assert_close(state.temporal, initial.temporal, rtol=0, atol=0)
+            # Verify is speculative: both production paths must leave the
+            # committed conv window untouched until commit scatter.
+            torch.testing.assert_close(state.conv[0], initial.conv[0], rtol=0, atol=0)
+
+        last_steps = torch.full_like(slots, 1)
+        for hybrid in (fused_hybrid, ref_hybrid):
+            hybrid.update_mamba_state_after_mtp_verify(
+                last_correct_step_indices=last_steps,
+                mamba_track_indices=None,
+                mamba_steps_to_track=None,
+                model=None,
+            )
+        torch.testing.assert_close(
+            fused_state.temporal, ref_state.temporal, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            fused_state.conv[0], ref_state.conv[0], rtol=0, atol=0
+        )
+
+        out_fused = self._verify(fused, layers, batch, rounds[1])
+        out_ref = self._verify(reference, layers, batch, rounds[1])
+        for actual, expected in zip(out_fused, out_ref):
+            torch.testing.assert_close(actual, expected, **_OUTPUT_TOL)
+        self.assertEqual(fused._fused_chain_verify_fn.call_count, 4)
 
 
 if __name__ == "__main__":
