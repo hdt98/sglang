@@ -928,7 +928,7 @@ class DeepseekV2MoE(nn.Module):
             num_token_non_padded = None
         else:
             num_token_non_padded = (
-                forward_batch.num_token_non_padded
+                forward_batch.moe_num_token_non_padded()
                 if forward_batch is not None
                 else None
             )
@@ -1462,7 +1462,7 @@ class DeepseekV2MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
+                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
                 expert_location_dispatch_info=(
                     ExpertLocationDispatchInfo.init_new(
                         layer_id=self.layer_id,
@@ -1856,7 +1856,7 @@ class DeepseekV2MoE(nn.Module):
                 state.topk_output = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
-                    num_token_non_padded=state.forward_batch.num_token_non_padded,
+                    num_token_non_padded=state.forward_batch.moe_num_token_non_padded(),
                     expert_location_dispatch_info=(
                         ExpertLocationDispatchInfo.init_new(
                             layer_id=self.layer_id,
