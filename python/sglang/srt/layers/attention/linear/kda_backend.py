@@ -1133,13 +1133,29 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # causal_conv1d_update expects [.., dim, width]. KDA keeps dense conv-window
         # scratch because the deduplicated overlapping layout cannot be transposed.
         mixed_qkv_reshaped = mixed_qkv_dense.transpose(1, 2)
+        # Verify must not advance the committed conv window. The accepted step is
+        # rolled back by fused_conv_window_scatter_with_mask after the verify round,
+        # so the unfused fallback uses a per-call scratch copy to keep the same
+        # read-only contract as the fused kernel. Invalid pad rows stay at -1.
+        verify_cache_indices = cache_indices[:batch_size]
+        valid_verify_rows = verify_cache_indices >= 0
+        verify_conv_state = conv_states.new_zeros((batch_size, *conv_states.shape[1:]))
+        verify_conv_state[valid_verify_rows] = conv_states[
+            verify_cache_indices[valid_verify_rows]
+        ]
+        verify_conv_state_indices = torch.arange(
+            batch_size,
+            device=conv_states.device,
+            dtype=verify_cache_indices.dtype,
+        )
+        verify_conv_state_indices[~valid_verify_rows] = -1
         mixed_qkv_processed = causal_conv1d_update(
             mixed_qkv_reshaped,
-            conv_states.transpose(-1, -2),
+            verify_conv_state.transpose(-1, -2),
             layer.conv_weights,
             layer.bias,
             activation="silu",
-            conv_state_indices=cache_indices[:batch_size],
+            conv_state_indices=verify_conv_state_indices,
             intermediate_conv_window=intermediate_conv_window_cache.transpose(-1, -2),
             intermediate_state_indices=intermediate_state_indices[:batch_size],
             retrieve_next_token=retrieve_next_token,
