@@ -1139,16 +1139,30 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # read-only contract as the fused kernel. Invalid pad rows stay at -1.
         verify_cache_indices = cache_indices[:batch_size]
         valid_verify_rows = verify_cache_indices >= 0
-        verify_conv_state = conv_states.new_zeros((batch_size, *conv_states.shape[1:]))
-        verify_conv_state[valid_verify_rows] = conv_states[
-            verify_cache_indices[valid_verify_rows]
-        ]
-        verify_conv_state_indices = torch.arange(
-            batch_size,
-            device=conv_states.device,
-            dtype=verify_cache_indices.dtype,
+        # Boolean indexing lowers to a nonzero/sync and is rejected during HIP
+        # stream capture. Gather every row with a clamped index, then mask invalid
+        # rows without changing the output shape.
+        safe_verify_cache_indices = verify_cache_indices.clamp(min=0)
+        gathered_conv_state = conv_states.index_select(
+            0, safe_verify_cache_indices.to(torch.int64)
         )
-        verify_conv_state_indices[~valid_verify_rows] = -1
+        valid_row_view = valid_verify_rows.view(
+            -1, *([1] * (gathered_conv_state.ndim - 1))
+        )
+        verify_conv_state = torch.where(
+            valid_row_view,
+            gathered_conv_state,
+            torch.zeros_like(gathered_conv_state),
+        )
+        verify_conv_state_indices = torch.where(
+            valid_verify_rows,
+            torch.arange(
+                batch_size,
+                device=conv_states.device,
+                dtype=verify_cache_indices.dtype,
+            ),
+            torch.full_like(verify_cache_indices, -1),
+        )
         mixed_qkv_processed = causal_conv1d_update(
             mixed_qkv_reshaped,
             verify_conv_state.transpose(-1, -2),

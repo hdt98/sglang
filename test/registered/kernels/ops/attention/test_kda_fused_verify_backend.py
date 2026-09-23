@@ -317,6 +317,27 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
                 for actual, expected in zip(out, ref):
                     torch.testing.assert_close(actual, expected, **_OUTPUT_TOL)
 
+    def test_unfused_target_verify_is_graph_capturable(self):
+        """The unfused verify scratch copy must not sync during graph capture."""
+        layers, initial, slots, batch, rounds = self._make_case(batch_size=2)
+        backend, _, _ = self._make_backend(
+            initial, slots, 4, fused=False, ring=False
+        )
+        layer = layers[0]
+        mixed, a, b = rounds[0][0]
+
+        def run():
+            return backend._forward_target_verify(layer, batch, mixed, a, b)
+
+        run()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = run()
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertEqual(out.shape, (1, 8, 4, 128))
+
 
 if __name__ == "__main__":
     unittest.main()
