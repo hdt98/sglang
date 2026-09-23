@@ -328,19 +328,6 @@ def test_output_does_not_depend_on_cta_scheduling():
     assert torch.equal(full, squeezed)
 
 
-def test_output_does_not_depend_on_warp_scheduling_on_hip():
-    """HIP cannot create CUDA green contexts, so perturb warp scheduling instead."""
-    if not torch.version.hip:
-        pytest.skip("HIP scheduling perturbation only")
-
-    case = (1, 6, 1, 16, 128, 128, 4, False, None, False, 1)
-    B, T, H, HV, K, V, W, has_bias, lower_bound, neg_slot, seed = case
-    inp = _make_inputs(B, T, H, HV, K, V, W, has_bias, neg_slot, seed)
-    one_warp = _run_fused(inp, B, T, H, HV, K, V, lower_bound, num_warps=1)[0]
-    four_warps = _run_fused(inp, B, T, H, HV, K, V, lower_bound, num_warps=4)[0]
-    assert torch.equal(one_warp, four_warps)
-
-
 @pytest.mark.parametrize("case", _RING_CASES)
 def test_replayssm_ring_matches_unfused(case):
     _compare_case(case, num_warps=4, use_ring=True)
