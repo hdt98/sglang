@@ -11,7 +11,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
@@ -36,7 +35,16 @@ def mock_cpu_env(kv_size=2, tp_size=1, swa_eviction_interval=4):
 
     with (
         patch("torch._utils._element_size", return_value=kv_size),
-        get_parallel().override(attn_tp_size=tp_size),
+        get_parallel().override(
+            tp_size=tp_size,
+            attn_tp_size=tp_size,
+            attn_dp_size=1,
+            attn_cp_size=1,
+            moe_ep_size=1,
+            moe_ep_group=None,
+            moe_dp_size=1,
+            moe_tp_size=tp_size,
+        ),
         envs.SGLANG_SWA_EVICTION_INTERVAL.override(swa_eviction_interval),
     ):
         yield
@@ -167,10 +175,17 @@ def _make_model_runner(
     spec.is_none.return_value = True
     mr.spec_algorithm = spec
 
+    # Single stage: the runner's local hybrid-SWA view is the whole model's split.
     mr.layer_info = SimpleNamespace(
-        start_layer=0, end_layer=num_layers, num_effective_layers=num_layers
+        start_layer=0,
+        end_layer=num_layers,
+        num_effective_layers=num_layers,
+        swa_attention_layer_ids=list(mc.swa_attention_layer_ids),
+        full_attention_layer_ids=list(mc.full_attention_layer_ids),
+        is_hybrid_swa_mtp_draft=False,
     )
-    mr.ps = ParallelState.trivial()
+    mr.attn_dp_size = 1
+    mr.pp_size = 1
     mr.pp_group = SimpleNamespace(rank_in_group=0)
     mr.spec_aux_config = SimpleNamespace(
         eagle_draft_num_layers=None,
@@ -1148,7 +1163,7 @@ class TestSWAPoolFloor(CustomTestCase):
         cfg = object.__new__(DSV4PoolConfigurator)
         cfg.swa_ratio = 0.1
         cfg.sliding_window_size = 128
-        cfg.swa_page_size = 128
+        cfg.swa_page_size = page_size
         cfg.c4_ring_size = 8
         cfg.c4_shrink_factor = 1
         cfg._unified = unified
@@ -1168,8 +1183,9 @@ class TestSWAPoolFloor(CustomTestCase):
         sizes = self._dsv4_sizes(max_tokens=32768, page_size=256)
         self.assertEqual(sizes.full_max_total_num_tokens, 32768)
         self.assertEqual(sizes.swa_max_total_num_tokens, 3072)
-        # Non-unified: the c4 state pool scales with the paged SWA pool.
-        self.assertEqual(sizes.c4_state_pool_size, 3072 // 128 * 8)
+        # Non-unified: the c4 state pool scales with the paged SWA pool, and
+        # is sized by the page the ring is addressed by (not the window).
+        self.assertEqual(sizes.c4_state_pool_size, 3072 // 256 * 8)
 
     def test_dsv4_token_cap_never_grows_total_footprint(self):
         """Regression: the token-cap path subtracts no fixed-pool bias, so
@@ -1267,7 +1283,8 @@ class TestSWAPoolFloor(CustomTestCase):
             kv_cache_dtype_str="fp8_e4m3",
             model_config=cfg,
             layer_info=SimpleNamespace(start_layer=0, end_layer=40),
-            ps=SimpleNamespace(pp_size=1, attn_dp_size=1),
+            pp_size=1,
+            attn_dp_size=1,
             sliding_window_size=128,
             page_size=256,
             spec_algorithm=spec,

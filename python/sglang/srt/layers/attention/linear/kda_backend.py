@@ -43,6 +43,11 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 
+_GFX950_FUSED_HEADS = 16
+_GFX950_FUSED_HEAD_DIM = 128
+_GFX950_FUSED_DRAFT_TOKEN_NUMS = (6, 8)
+_GFX950_FUSED_MAX_BATCH = 16
+
 
 class KDAKernelDispatcher:
     """Dispatches KDA kernel calls to the appropriate backend per mode."""
@@ -1133,13 +1138,43 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # causal_conv1d_update expects [.., dim, width]. KDA keeps dense conv-window
         # scratch because the deduplicated overlapping layout cannot be transposed.
         mixed_qkv_reshaped = mixed_qkv_dense.transpose(1, 2)
+        # Verify must not advance the committed conv window. The accepted step is
+        # rolled back by fused_conv_window_scatter_with_mask after the verify round,
+        # so the unfused fallback uses a per-call scratch copy to keep the same
+        # read-only contract as the fused kernel. Invalid pad rows stay at -1.
+        verify_cache_indices = cache_indices[:batch_size]
+        valid_verify_rows = verify_cache_indices >= 0
+        # Boolean indexing lowers to a nonzero/sync and is rejected during HIP
+        # stream capture. Gather every row with a clamped index, then mask invalid
+        # rows without changing the output shape.
+        safe_verify_cache_indices = verify_cache_indices.clamp(min=0)
+        gathered_conv_state = conv_states.index_select(
+            0, safe_verify_cache_indices.to(torch.int64)
+        )
+        valid_row_view = valid_verify_rows.view(
+            -1, *([1] * (gathered_conv_state.ndim - 1))
+        )
+        verify_conv_state = torch.where(
+            valid_row_view,
+            gathered_conv_state,
+            torch.zeros_like(gathered_conv_state),
+        )
+        verify_conv_state_indices = torch.where(
+            valid_verify_rows,
+            torch.arange(
+                batch_size,
+                device=conv_states.device,
+                dtype=verify_cache_indices.dtype,
+            ),
+            torch.full_like(verify_cache_indices, -1),
+        )
         mixed_qkv_processed = causal_conv1d_update(
             mixed_qkv_reshaped,
-            conv_states.transpose(-1, -2),
+            verify_conv_state.transpose(-1, -2),
             layer.conv_weights,
             layer.bias,
             activation="silu",
-            conv_state_indices=cache_indices[:batch_size],
+            conv_state_indices=verify_conv_state_indices,
             intermediate_conv_window=intermediate_conv_window_cache.transpose(-1, -2),
             intermediate_state_indices=intermediate_state_indices[:batch_size],
             retrieve_next_token=retrieve_next_token,
@@ -1257,8 +1292,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         seq_len, dim = mixed_qkv.shape
         batch_size = seq_len // draft_token_num
+        hip_gfx95 = is_hip() and is_gfx95_supported()
         if replayssm_on and (
-            batch_size != 1 or not (get_platform().is_sm90 or get_platform().is_sm100)
+            batch_size != 1
+            or not (hip_gfx95 or get_platform().is_sm90 or get_platform().is_sm100)
         ):
             # The runtime still uses BV=4, not the benchmark's best-BV sweep:
             # fused+ring wins at B=1 but regresses from B=4 (B=2 at T=8) on
@@ -1267,19 +1304,19 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # path and the separate CuTe path are unchanged.
             return False
         if is_hip() and not (
-            is_gfx95_supported()
-            and 1 <= batch_size <= 16
-            and draft_token_num in (6, 8)
-            and layer.num_q_heads == layer.num_v_heads == 16
-            and layer.head_k_dim == layer.head_v_dim == 128
+            hip_gfx95
+            and 1 <= batch_size <= _GFX950_FUSED_MAX_BATCH
+            and draft_token_num in _GFX950_FUSED_DRAFT_TOKEN_NUMS
+            and layer.num_q_heads == layer.num_v_heads == _GFX950_FUSED_HEADS
+            and layer.head_k_dim == layer.head_v_dim == _GFX950_FUSED_HEAD_DIM
             and mixed_qkv.dtype == torch.bfloat16
             and layer.conv_weights.dtype == torch.float32
             and layer.bias is None
-            and layer.lower_bound == -5.0
         ):
             # Measured GLM TP4 wins only: larger gfx950 batches lose the
-            # launch saving to duplicated convolution work. Keep the
-            # reference path for them and for unmeasured ROCm shapes.
+            # launch saving to duplicated convolution work. Keep the reference
+            # path for unmeasured ROCm shapes; `lower_bound` is model data, not
+            # a launch constraint, so it must not be fingerprinted here.
             return False
         expected_dim = (
             2 * layer.num_q_heads * layer.head_k_dim
@@ -1598,6 +1635,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             onorm_eps = None
             onorm_gate = None
 
+        a = a.reshape(1, seq_len, h, layer.head_k_dim)
         out = fused_kda_decode_mtp_dspark(
             x_q=x_q,
             x_k=x_k,

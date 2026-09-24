@@ -64,18 +64,6 @@ class NixlTransferEngineBase(PDDisaggregationServerBase):
 
         super().setUpClass()
 
-        # The shared fixture pins UCX to a pair of RDMA devices. On the MI35X
-        # fabric runner those devices have no reachable active-message path,
-        # while UCX automatic device selection passed before the pin was added.
-        # Preserve an explicit user override and undo only the fixture-owned one.
-        if getattr(cls, "_ucx_net_devices_set", False):
-            fixture_ucx_net_devices = os.environ.pop("UCX_NET_DEVICES", None)
-            cls._ucx_net_devices_set = False
-            print(
-                "Using UCX automatic device selection instead of fixture pin: "
-                f"{fixture_ucx_net_devices}"
-            )
-
         cls._old_use_aiter = os.environ.get("SGLANG_USE_AITER")
         os.environ["SGLANG_USE_AITER"] = "1"
 
@@ -210,7 +198,7 @@ class TestNixlTransferEngineAccuracy(NixlTransferEngineBase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
-            host=f"http://{self.base_host}",
+            host=self.base_host,
             port=int(self.lb_port),
         )
         metrics = run_eval_few_shot_gsm8k(args)

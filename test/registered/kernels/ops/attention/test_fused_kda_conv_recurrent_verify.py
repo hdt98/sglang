@@ -134,6 +134,8 @@ def _make_inputs(
 def _run_reference(inp, B, T, H, HV, K, V, lower_bound, rings=None):
     dim = 2 * H * K + HV * V
     seq_len = B * T
+    # Keep the committed conv window read-only, matching the fused verify path.
+    # The accepted step is committed later by the speculative scatter.
     conv = inp["conv_pool"].clone()
     ssm = inp["ssm"].clone()
     win = inp["win_pool"].clone()
@@ -185,7 +187,7 @@ def _run_reference(inp, B, T, H, HV, K, V, lower_bound, rings=None):
         replayssm_g=rings["g"] if rings is not None else None,
         replayssm_beta=rings["beta"] if rings is not None else None,
     )
-    return o, conv, win, ic
+    return o, inp["conv_pool"], win, ic
 
 
 def _run_fused(inp, B, T, H, HV, K, V, lower_bound, num_warps, rings=None):
@@ -248,6 +250,7 @@ def _compare_case(case, num_warps=None, use_ring=False, weight_dtype=torch.bfloa
     o_fus_v = o_fus.reshape(B, T, HV, V)[valid_rows]
     _assert_output_matches_reference(o_fus_v, o_ref_v)
     # conv_state is read-only in verify; the commit scatter advances it.
+    assert torch.equal(inp["conv_pool"], conv_ref)
     assert torch.equal(inp["conv_pool"], conv_fus)
     assert torch.equal(win_ref[valid_rows], win_fus[valid_rows])
     if use_ring:

@@ -166,7 +166,7 @@ jobs:
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 60
+        timeout-minutes: 45
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-1-gpu-small-amd --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
 
@@ -243,7 +243,14 @@ jobs:
         extra-a-test-1-gpu-large-amd,
         extra-a-test-2-gpu-large-amd,
       ]
-    if: always()
+    # Same `labeled` guard as call-gate: an unrelated label would otherwise finish
+    # green with nothing executed, over the real run's result.
+    if: |
+      always() &&
+      (github.event_name != 'pull_request' ||
+       github.event.action != 'labeled' ||
+       github.event.label.name == 'run-ci' ||
+       github.event.label.name == 'run-ci-extra')
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses
