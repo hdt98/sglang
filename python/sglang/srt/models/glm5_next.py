@@ -30,8 +30,11 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
+    layer_input_buffer,
+    reduce_output,
 )
 from sglang.srt.layers.communicator_mhc import MHCLayerCommunicator
+from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
@@ -106,7 +109,6 @@ from sglang.srt.multimodal.mm_utils import (
     run_dp_sharded_mrope_vision_model,
 )
 from sglang.srt.runtime_context import (
-    get_forward,
     get_lora,
     get_mm,
     get_parallel,
@@ -313,11 +315,14 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
             swiglu_limit=vision_config.swiglu_limit,
         )
 
-        self.downsample = nn.Conv2d(
+        # These non-overlapping patches are equivalent to unfold + linear and
+        # avoid MIOpen's expensive per-shape convolution search on ROCm.
+        self.downsample = Conv2dLayer(
             in_channels=vision_config.hidden_size,
             out_channels=vision_config.out_hidden_size,
             kernel_size=vision_config.spatial_merge_size,
             stride=vision_config.spatial_merge_size,
+            disable_linear=False,
         )
         self.post_layernorm = GlmOcrRMSNorm(
             vision_config.hidden_size, eps=vision_config.rms_norm_eps
@@ -787,9 +792,6 @@ class Glm5NextDecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            is_last_layer=(
-                is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
-            ),
             qkv_latent_func=(
                 self.self_attn.prepare_qkv_latent if not self.is_linear_attn else None
             ),
@@ -922,7 +924,7 @@ class Glm5NextDecoderLayer(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
-        hidden_states_orig = hidden_states
+        hidden_states_orig = layer_input_buffer(hidden_states)
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
@@ -950,16 +952,6 @@ class Glm5NextDecoderLayer(nn.Module):
             forward_batch,
         )
 
-        should_allreduce_fusion = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-
         if isinstance(self.mlp, Glm5NextMLP):
             gemm_output_zero_allocator = None
 
@@ -974,26 +966,13 @@ class Glm5NextDecoderLayer(nn.Module):
         else:
             _mlp_ctx = nullcontext()
 
-        with get_forward().scoped(
-            fuse_mlp_allreduce=should_allreduce_fusion,
-            mlp_reduce_scatter=use_reduce_scatter,
-        ):
-            with _mlp_ctx:
-                hidden_states = self.mlp(
-                    hidden_states,
-                    forward_batch,
-                    gemm_output_zero_allocator,
-                )
-
-        if should_allreduce_fusion:
-            hidden_states._sglang_needs_allreduce_fusion = True
-
-        if not should_allreduce_fusion:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit, _mlp_ctx:
+            hidden_states = self.mlp(
                 hidden_states,
-                residual,
                 forward_batch,
+                gemm_output_zero_allocator,
             )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
 
         return hidden_states, residual, topk_indices
 
@@ -1181,6 +1160,7 @@ class Glm5NextModel(nn.Module):
             )
             with ctx:
                 if i in self.layers_to_capture:
+                    hidden_states = reduce_output(hidden_states)
                     aux_hidden_state = self._prepare_aux_hidden_state(
                         hidden_states, residual
                     )
@@ -1214,6 +1194,10 @@ class Glm5NextModel(nn.Module):
                 zero_allocator=zero_allocator,
             )
 
+        last_layer = self.layers[self.end_layer - 1]
+        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
         if not self.pp_group.is_last_rank:
             if self.config.mhc:
                 return PPProxyTensors({"hidden_states": hidden_states})
@@ -1579,8 +1563,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
         params_dict = dict(self.named_parameters())
 
         def maybe_map_fp8_block_scale_name(name: str) -> str:
-            if name.endswith("weight_scale"):
-                candidate = name.removesuffix("weight_scale") + "weight_scale_inv"
+            # Quark stores dequantization scales without native block-FP8's
+            # "_inv" suffix, including fused w13/w2 expert parameters.
+            if name not in params_dict and name.endswith("weight_scale"):
+                candidate = name + "_inv"
                 if candidate in params_dict:
                     return candidate
             return name

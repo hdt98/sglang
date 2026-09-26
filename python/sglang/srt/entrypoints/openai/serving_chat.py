@@ -1014,6 +1014,16 @@ class OpenAIServingChat(OpenAIServingBase):
         if not request.messages:
             return "Messages cannot be empty."
 
+        if (
+            request.chat_template_kwargs
+            and "chat_template" in request.chat_template_kwargs
+            and not get_serving().trust_request_chat_template
+        ):
+            return (
+                "Request-supplied chat_template is not allowed. Start the server "
+                "with --trust-request-chat-template to permit it."
+            )
+
         if request.return_sampling_mask and not request.return_meta_info:
             return "return_sampling_mask requires return_meta_info=true."
 
@@ -1118,12 +1128,12 @@ class OpenAIServingChat(OpenAIServingBase):
         pre-rendered input_ids with single placeholder ids and leave the text
         empty; pass those through rather than re-tokenizing an empty prompt.
         """
-        # A lossy text round-trip makes the rendered prompt unusable, so send the
-        # ids instead. Only when nothing needs placeholder expansion: with media
-        # attached the MM processor still has to tokenize the text itself.
+        # Send the ids already encoded while rendering: re-tokenizing long text
+        # prompts is costly, and a lossy text round-trip makes the text unusable.
+        # Only when nothing needs placeholder expansion: with media attached the
+        # MM processor still has to tokenize the text itself.
         prefers_prompt_ids = (
-            self._prompt_text_round_trip_is_lossy
-            and isinstance(processed_messages.prompt_ids, list)
+            isinstance(processed_messages.prompt_ids, list)
             and processed_messages.prompt_ids
             and not (
                 processed_messages.image_data
@@ -1312,8 +1322,12 @@ class OpenAIServingChat(OpenAIServingBase):
         tool_call_constraint = None
 
         effective_tools = self._effective_tools(request)
-        glm_constraint = self.tool_call_parser == "glm47" and not any(
-            tool.function.strict for tool in effective_tools
+        # Only tool-bearing requests get the full-assistant EBNF: its terminal
+        # state finishes a request even under ignore_eos.
+        glm_constraint = (
+            self.tool_call_parser == "glm47"
+            and bool(effective_tools)
+            and not any(tool.function.strict for tool in effective_tools)
         )
         if glm_constraint:
             enable_thinking = (request.chat_template_kwargs or {}).get(
@@ -2445,7 +2459,7 @@ class OpenAIServingChat(OpenAIServingBase):
         output_token_logprobs = ret_item["meta_info"]["output_token_logprobs"]
         output_top_logprobs = ret_item["meta_info"].get("output_top_logprobs", None)
         token_logprobs = self._build_token_logprobs_from_raw(
-            output_token_logprobs, output_top_logprobs, use_token_index=True
+            output_token_logprobs, output_top_logprobs
         )
         return ChoiceLogprobs(content=token_logprobs)
 
@@ -2453,7 +2467,6 @@ class OpenAIServingChat(OpenAIServingBase):
         self,
         output_token_logprobs: list[Any],
         output_top_logprobs: list[Any] | None,
-        use_token_index: bool = False,
     ) -> list[ChatCompletionTokenLogprob]:
         """Build OpenAI ChatCompletionTokenLogprob from the engine's raw
         ``(logprob, token_id, token_text)`` triples.
@@ -2487,13 +2500,9 @@ class OpenAIServingChat(OpenAIServingBase):
 
             top_logprobs: list[TopLogprob] = []
             if output_top_logprobs:
-                # - Non-streaming (use_token_index=True): output_top_logprobs is
-                #   the full per-position list; take the row for this token.
-                # - Streaming (use_token_index=False): rows are pre-sliced so the
-                #   current chunk holds exactly one row at index 0.
-                top_row_idx = token_idx if use_token_index else 0
-                if top_row_idx < len(output_top_logprobs):
-                    top_row = output_top_logprobs[top_row_idx]
+                # Both callers pass rows aligned with output_token_logprobs.
+                if token_idx < len(output_top_logprobs):
+                    top_row = output_top_logprobs[token_idx]
                     if top_row is not None:
                         for top_logprob, top_id, top_text in top_row:
                             if is_byte_level:
@@ -2686,7 +2695,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 n_prev_token:total_output_logprobs
             ]
         token_logprobs = self._build_token_logprobs_from_raw(
-            output_token_logprobs, output_top_logprobs, use_token_index=False
+            output_token_logprobs, output_top_logprobs
         )
         return ChoiceLogprobs(content=token_logprobs)
 

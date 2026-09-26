@@ -19,7 +19,7 @@ from sglang.srt.layers.attention.linear.utils import (
     build_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.utils import is_cpu, is_cuda, is_npu
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
 from sglang.srt.utils.common import is_gfx95_supported, rank0_log
 
 # KDA always uses the triton causal_conv1d_fn (no CUDA override).
@@ -645,7 +645,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # The model deferred f_b only after publishing static fallback
             # weights. Materialize the original gate before entering the
             # unchanged conv + packed-KDA fallback chain.
-            from sglang.kernels.ops.kimi_k3 import kimi_k3_tiny_gemm
+            from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm
 
             if fused_static is None:
                 raise RuntimeError("K3 deferred f_b is missing fallback weights")
@@ -1266,6 +1266,20 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # other batch/architecture combinations are measured. The snapshot
             # path and the separate CuTe path are unchanged.
             return False
+        if is_hip() and not (
+            is_gfx95_supported()
+            and 1 <= batch_size <= 16
+            and draft_token_num in (6, 8)
+            and mixed_qkv.dtype == torch.bfloat16
+            and layer.conv_weights.dtype == torch.float32
+        ):
+            # Measured GLM TP4 wins only: larger gfx950 batches lose the launch
+            # saving to duplicated convolution work. Keyed on what the fused
+            # kernel actually needs — gfx950, an fp32 conv weight, a bf16 QKV,
+            # and a measured draft width — rather than on checkpoint-specific
+            # head counts or gate values, so a later GLM revision does not need
+            # an edit here. Keep the reference path for unmeasured ROCm shapes.
+            return False
         expected_dim = (
             2 * layer.num_q_heads * layer.head_k_dim
             + layer.num_v_heads * layer.head_v_dim
@@ -1544,7 +1558,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_g: Optional[torch.Tensor] = None,
         replayssm_beta: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        from sglang.kernels.ops.kimi_k3.kda_decode_mtp import (
+        from sglang.kernels.ops.attention.kda_decode_mtp import (
             fused_kda_decode_mtp_dspark,
         )
 
