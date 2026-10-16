@@ -553,6 +553,7 @@ class AiterAttnBackend(AttentionBackend):
         )
         self._kv_indices_scratch: Optional[torch.Tensor] = None
         self._arange_buf: Optional[torch.Tensor] = None
+        self._cprr_scalars: dict[float, torch.Tensor] = {}
 
         # Create prefill indices updater
         if not skip_prefill:
@@ -1413,6 +1414,23 @@ class AiterAttnBackend(AttentionBackend):
             )
         return self._arange_buf[:length]
 
+    def _cprr_scalar(self, value: float) -> torch.Tensor:
+        """A 0-dim fp32 device tensor for one scalar, built once per value.
+
+        The DCP verify path needs its kv_scale and q_scale as device tensors,
+        and rebuilt per call they are two kernel launches per MLA layer per
+        pass. The scales do not change between calls, so each distinct value
+        keeps its own buffer: one shared buffer overwritten in place would
+        hand the next layer the previous layer's scale.
+        """
+        scalar = self._cprr_scalars.get(value)
+        if scalar is None:
+            scalar = torch.full(
+                (), value, dtype=torch.float32, device=self.device
+            )
+            self._cprr_scalars[value] = scalar
+        return scalar
+
     def _asm_context_prefill_indices(
         self, forward_batch: ForwardBatch, bs: int, num_kv_slots: int
     ):
@@ -1816,19 +1834,16 @@ class AiterAttnBackend(AttentionBackend):
                 fm.max_q_len,
                 fm.reduce_partial_map.numel(),
             )
-        # torch.full, not torch.as_tensor: as_tensor copies from host memory,
-        # which a cuda graph capture cannot record.
-        kv_scale = torch.full(
-            (),
-            self._resolve_fp8_kv_scale_float(layer, k_descale),
-            dtype=torch.float32,
-            device=q.device,
+        # A persistent device buffer, not torch.as_tensor: as_tensor copies
+        # from host memory, which a cuda graph capture cannot record.
+        kv_scale = self._cprr_scalar(
+            self._resolve_fp8_kv_scale_float(layer, k_descale)
         )
         kv_indices, kv_indptr = fm.cprr_kv_indices, fm.cprr_kv_indptr
         q_in = (
             q.view(n_rows, -1).to(fp8_dtype).view(n_rows, num_heads, layer.qk_head_dim)
         )
-        q_scale = torch.ones((), dtype=torch.float32, device=q.device)
+        q_scale = self._cprr_scalar(1.0)
         if kernel_heads != num_heads:
             q_in = self.pad_heads(q_in, kernel_heads)
         out = q.new_empty(
