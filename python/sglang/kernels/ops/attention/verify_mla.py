@@ -30,7 +30,15 @@ _BLOCK_CONFIG = {
     # head_dim: (BLOCK_H, BLOCK_N, num_warps)
     256: (4, 64, 8),  # Qwen3.5 TP2 / TP4 / TP8
     576: (4, 64, 8),  # K3 MLA (kv_lora_rank 512 + qk_rope 64)
-    64: (4, 256, 4),  # K3 GQA (dspark draft attention)
+    64: (4, 128, 4),  # K3 GQA (dspark draft attention)
+}
+# head_dim: (MAX_N_SPLITS, TARGET_PROGRAMS) where the defaults leave the GPU
+# idle. The K3 dspark draft (h_q 8, h_kv 2 per TP rank) at batch 1 gets only
+# 64 stage-1 programs from the defaults; its stage 1 is latency bound
+# (dependency wait), so 4x the splits run its long-context prefix in about
+# 0.37x the time (MI355X, 346K context, 8 verify rows).
+_SPLIT_CONFIG = {
+    64: (128, 2048),
 }
 
 
@@ -42,6 +50,11 @@ def block_config(head_dim):
     return _BLOCK_CONFIG.get(
         head_dim, (DEFAULT_BLOCK_H, DEFAULT_BLOCK_N, DEFAULT_NUM_WARPS)
     )
+
+
+def split_config(head_dim):
+    """Return (max_n_splits, target_programs) for a head_dim."""
+    return _SPLIT_CONFIG.get(head_dim, (MAX_N_SPLITS, TARGET_PROGRAMS))
 
 
 @triton.jit
@@ -414,8 +427,12 @@ class VerifyMLA:
         block_n=DEFAULT_BLOCK_N,
         num_warps=DEFAULT_NUM_WARPS,
         kv_group_num=None,
+        max_n_splits=MAX_N_SPLITS,
+        target_programs=TARGET_PROGRAMS,
     ):
         self.h_q = h_q
+        self.max_n_splits = max_n_splits
+        self.target_programs = target_programs
         # MLA is the h_kv == 1 case (kv_group_num == h_q); a GQA draft passes a
         # smaller group. block_h must divide it so a head block maps to one KV
         # head -- can_handle enforces that before this is constructed.
@@ -442,12 +459,12 @@ class VerifyMLA:
         self.max_bs = max_bs
         # bf16 partials (halves scratch traffic vs fp32); lse stays fp32.
         self.att_out = torch.empty(
-            (max_bs, self.h_q, MAX_N_SPLITS, self.l_pad, self.v_head_dim),
+            (max_bs, self.h_q, self.max_n_splits, self.l_pad, self.v_head_dim),
             dtype=torch.bfloat16,
             device=self.device,
         )
         self.att_lse = torch.empty(
-            (max_bs, self.h_q, MAX_N_SPLITS, self.l_pad),
+            (max_bs, self.h_q, self.max_n_splits, self.l_pad),
             dtype=torch.float32,
             device=self.device,
         )
@@ -457,8 +474,8 @@ class VerifyMLA:
             self._alloc(max_bs)
 
     def _num_splits(self, bs):
-        budget = TARGET_PROGRAMS // max(1, bs * self.n_head_blocks)
-        return max(1, min(MAX_N_SPLITS, budget))
+        budget = self.target_programs // max(1, bs * self.n_head_blocks)
+        return max(1, min(self.max_n_splits, budget))
 
     def _run_prefix_kernel(
         self,
@@ -645,6 +662,7 @@ def _get_vmla(
     vk = _VMLA_CACHE.get(key)
     if vk is None:
         block_h, block_n, num_warps = vmla_cls.block_config(head_dim)
+        max_n_splits, target_programs = split_config(head_dim)
         if (
             kv_group_num is not None
             and kv_group_num < h_q  # i.e. h_kv > 1, so the offset is live
@@ -665,6 +683,8 @@ def _get_vmla(
             block_n=block_n,
             num_warps=num_warps,
             kv_group_num=kv_group_num,
+            max_n_splits=max_n_splits,
+            target_programs=target_programs,
         )
         _VMLA_CACHE[key] = vk
     else:

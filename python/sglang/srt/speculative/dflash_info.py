@@ -195,6 +195,10 @@ class DFlashVerifyInput(SpecInput):
             out=kv_indices,
             kv_start_idx=None if window is None else window.start,
             kind=kind,
+            # Tile the gather over token blocks on long contexts, sized from
+            # the host-int length sum (an upper bound on the longest row).
+            num_token_blocks=None,
+            kv_lens_sum=paged_kernel_lens_sum,
         )
         mask = self.custom_mask
         if mask is not None:
