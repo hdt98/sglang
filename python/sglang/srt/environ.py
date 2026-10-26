@@ -664,6 +664,11 @@ class Envs:
     SGLANG_AITER_PAGED_PREFILL_ASM = EnvBool(True)
     # Bucket aiter paged_attention_ragged decode partitions by sequence length.
     SGLANG_AITER_DECODE_PARTITION_BUCKETS = EnvBool(True)
+    # Attention (aiter, ROCm): zero MLA KV row 0 before each asm ps decode, so a
+    # NaN written there by graph padding cannot reach logits through 0 * NaN.
+    # Off skips the per-call fill where the read path is known not to
+    # propagate NaN from the fp8 KV. Default on.
+    SGLANG_AITER_MLA_ZERO_ROW0 = EnvBool(True)
     # size the KV pool after CUDA-graph capture
     SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
 

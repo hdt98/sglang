@@ -1579,6 +1579,7 @@ class AiterAttnBackend(AttentionBackend):
             _use_mla_ps_kernel
             and self.dcp_world_size <= 1
             and self._asm_ps_supports_qlen(kwargs.get("max_seqlen_q") or 1)
+            and envs.SGLANG_AITER_MLA_ZERO_ROW0.get()
         ):
             # The asm kernel reads KV row 0 for masked positions and weights it
             # by p = 0. A NaN there spreads to every request, because
