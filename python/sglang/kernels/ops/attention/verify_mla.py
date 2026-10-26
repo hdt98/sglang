@@ -40,6 +40,14 @@ _BLOCK_CONFIG = {
 _SPLIT_CONFIG = {
     64: (128, 2048),
 }
+# head_dim: (SPLIT_CHUNK, DV_CHUNK) for the combine. Its grid is (bs, H_Q, Dv
+# chunks) and it reads SPLIT_CHUNK splits per step. The defaults (1, whole Dv)
+# keep the one-split-at-a-time order. The K3 draft's 128 splits otherwise
+# leave 8 programs to walk 128 dependent steps at batch 1 (47 us at any
+# context on MI355X); tiled, the same work is a few wide loads per program.
+_COMBINE_CONFIG = {
+    64: (32, 16),
+}
 
 
 def block_config(head_dim):
@@ -55,6 +63,13 @@ def block_config(head_dim):
 def split_config(head_dim):
     """Return (max_n_splits, target_programs) for a head_dim."""
     return _SPLIT_CONFIG.get(head_dim, (MAX_N_SPLITS, TARGET_PROGRAMS))
+
+
+def combine_config(head_dim, v_head_dim):
+    """Return (split_chunk, dv_chunk) for the combine of a head_dim."""
+    return _COMBINE_CONFIG.get(
+        head_dim, (1, triton.next_power_of_2(v_head_dim))
+    )
 
 
 @triton.jit
@@ -294,9 +309,11 @@ def _verify_mla_combine_stage2(
     KV_GROUP_NUM: tl.constexpr,
     HAS_KV_HEADS: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
+    SPLIT_CHUNK: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
+    dv_start = tl.program_id(2) * BLOCK_DV
     if HAS_KV_HEADS:
         kv_head_off_ke = (cur_head // KV_GROUP_NUM) * stride_keh
         kv_head_off_ve = (cur_head // KV_GROUP_NUM) * stride_veh
@@ -305,7 +322,7 @@ def _verify_mla_combine_stage2(
         kv_head_off_ve = 0
 
     offs_d = tl.arange(0, BLOCK_DMODEL)
-    offs_dv = tl.arange(0, BLOCK_DV)
+    offs_dv = dv_start + tl.arange(0, BLOCK_DV)
     offs_l = tl.arange(0, L_EXT)
 
     cur_q_start = tl.load(qo_indptr + cur_batch)
@@ -316,34 +333,38 @@ def _verify_mla_combine_stage2(
     seqlen = tl.load(kv_indptr + cur_batch + 1) - tl.load(kv_indptr + cur_batch)
     active = _active_splits(seqlen, num_splits, BLOCK_N)
 
+    # SPLIT_CHUNK splits per step: lse [S, L], partial outputs [S, L, Dv].
     m = tl.zeros([L_EXT], dtype=tl.float32) - float("inf")
     l_acc = tl.zeros([L_EXT], dtype=tl.float32)
     acc = tl.zeros([L_EXT, BLOCK_DV], dtype=tl.float32)
-    for s in range(active):
+    offs_c = tl.arange(0, SPLIT_CHUNK)
+    for c in range(tl.cdiv(active, SPLIT_CHUNK)):
+        offs_s = c * SPLIT_CHUNK + offs_c
+        mask_sl = (offs_s < active)[:, None] & mask_l[None, :]
         lse_s = tl.load(
             Att_Lse
             + cur_batch * stride_lb
             + cur_head * stride_lh
-            + s * stride_ls
-            + offs_l,
-            mask=mask_l,
+            + offs_s[:, None] * stride_ls
+            + offs_l[None, :],
+            mask=mask_sl,
             other=float("-inf"),
         )
         o_s = tl.load(
             Att_Out
             + cur_batch * stride_ob
             + cur_head * stride_oh
-            + s * stride_os
-            + offs_l[:, None] * stride_ol
-            + offs_dv[None, :],
-            mask=mask_l[:, None] & (offs_dv[None, :] < V_HEAD_DIM),
+            + offs_s[:, None, None] * stride_os
+            + offs_l[None, :, None] * stride_ol
+            + offs_dv[None, None, :],
+            mask=mask_sl[:, :, None] & (offs_dv[None, None, :] < V_HEAD_DIM),
             other=0.0,
         ).to(tl.float32)
-        new_m = tl.maximum(m, lse_s)
+        new_m = tl.maximum(m, tl.max(lse_s, 0))
         alpha = tl.exp(m - new_m)
-        beta = tl.exp(lse_s - new_m)
-        acc = acc * alpha[:, None] + o_s * beta[:, None]
-        l_acc = l_acc * alpha + beta
+        beta = tl.exp(lse_s - new_m[None, :])
+        acc = acc * alpha[:, None] + tl.sum(o_s * beta[:, :, None], 0)
+        l_acc = l_acc * alpha + tl.sum(beta, 0)
         m = new_m
     o_prefix = acc / l_acc[:, None]
     lse_prefix = m + tl.log(l_acc)
@@ -453,6 +474,7 @@ class VerifyMLA:
         self.block_n = block_n
         self.num_warps = num_warps
         self.n_head_blocks = triton.cdiv(h_q, block_h)
+        self.split_chunk, self.dv_chunk = combine_config(head_dim, v_head_dim)
         self._alloc(max_bs)
 
     def _alloc(self, max_bs):
@@ -550,7 +572,8 @@ class VerifyMLA:
         sm_scale,
         is_causal=True,
     ):
-        grid = (bs, self.h_q)
+        block_dv = triton.next_power_of_2(self.v_head_dim)
+        grid = (bs, self.h_q, triton.cdiv(block_dv, self.dv_chunk))
         _verify_mla_combine_stage2[grid](
             self.att_out,
             self.att_lse,
@@ -581,11 +604,12 @@ class VerifyMLA:
             HEAD_DIM=self.head_dim,
             V_HEAD_DIM=self.v_head_dim,
             BLOCK_DMODEL=triton.next_power_of_2(self.head_dim),
-            BLOCK_DV=triton.next_power_of_2(self.v_head_dim),
+            BLOCK_DV=min(block_dv, self.dv_chunk),
             BLOCK_N=self.block_n,
             KV_GROUP_NUM=self.kv_group_num,
             HAS_KV_HEADS=self.has_kv_heads,
             IS_CAUSAL=is_causal,
+            SPLIT_CHUNK=self.split_chunk,
             num_warps=4,
             num_stages=1,
         )
