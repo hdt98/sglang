@@ -1071,10 +1071,13 @@ def build_kv_layer_ids(
     pairing.
     """
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
-    if not isinstance(token_to_kv_pool, HybridLinearKVPool):
+    if not isinstance(token_to_kv_pool, (HybridLinearKVPool, DeepSeekV4TokenToKVPool)):
         return []
     layer_ids = token_to_kv_pool.get_kv_layer_ids()
+    if not layer_ids:
+        return []
     if draft_token_to_kv_pool is None:
         return layer_ids
 
@@ -1091,8 +1094,9 @@ def _remap_draft_layer_ids(layer_ids: List[int], num_hidden_layers: int) -> List
 
 def _draft_entry_layer_ids(*, pool, num_entries: int) -> List[int]:
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
-    if isinstance(pool, HybridLinearKVPool):
+    if isinstance(pool, (HybridLinearKVPool, DeepSeekV4TokenToKVPool)):
         ids = pool.get_kv_layer_ids()
     else:
         # Pools register k0..k(L-1) then v0..v(L-1), so ids repeat once per
@@ -1203,6 +1207,42 @@ def append_state_component(
     kv_args.state_conv_shard_groups.append(conv_shard_groups or [])
     kv_args.state_slice_outer_counts.append(slice_outer_counts or [])
     kv_args.state_layer_ids.append(layer_ids or [])
+
+
+def pack_state_component_types(state_types) -> bytes:
+    return ",".join(state_type.value for state_type in state_types).encode("ascii")
+
+
+def unpack_state_component_types(data: bytes):
+    from sglang.srt.disaggregation.base.conn import StateType
+
+    if not data:
+        return []
+    return [StateType(value) for value in data.decode("ascii").split(",")]
+
+
+def resolve_state_component_dst_index_by_type(
+    src_state_types, dst_state_types, src_index: int
+) -> int:
+    """Decode component index for a prefill component: the n-th component of a
+    state type pairs with the decode peer's n-th component of that type.
+
+    PP prefill stages register different component lists (only some stages
+    hold request state or the draft), so position alone can pair unrelated
+    state. Identical lists pair positionally. Peers that publish no types keep
+    positional pairing.
+    """
+    if not dst_state_types:
+        return src_index
+    state_type = src_state_types[src_index]
+    occurrence = src_state_types[:src_index].count(state_type)
+    dst_indices = [j for j, st in enumerate(dst_state_types) if st == state_type]
+    if occurrence >= len(dst_indices):
+        raise RuntimeError(
+            f"Decode peer registers {len(dst_indices)} {state_type} state "
+            f"component(s); prefill sends at least {occurrence + 1}"
+        )
+    return dst_indices[occurrence]
 
 
 def get_dsa_tail_state_indices(pool, req_pool_idx: int, seq_len: int) -> List[int]:
@@ -1476,8 +1516,29 @@ def setup_state_kv_args(
         # DeepSeekV4TokenToKVPool inherits BaseSWAKVPool; its heterogeneous
         # state list is described per-entry via get_state_buf_infos.
         if isinstance(token_to_kv_pool, BaseSWAKVPool):
+            # DSv4 PP stages register only their own layers; ids let PD pair
+            # each entry with the decode entry of the same model layer.
+            # A pool without a stage range has no layer ids to publish.
+            is_dsv4_paged = (
+                isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                and not getattr(token_to_kv_pool, "_unified_kv", False)
+                and hasattr(token_to_kv_pool, "_stage_start")
+            )
+            state_layer_ids = (
+                token_to_kv_pool.get_state_layer_ids() if is_dsv4_paged else None
+            )
+            if state_layer_ids is not None and len(state_layer_ids) != len(data_ptrs):
+                raise RuntimeError(
+                    f"DSv4 state layer ids ({len(state_layer_ids)}) do not match "
+                    f"state entries ({len(data_ptrs)})"
+                )
             append_state_component(
-                kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
+                kv_args,
+                StateType.SWA,
+                data_ptrs,
+                data_lens,
+                item_lens,
+                layer_ids=state_layer_ids,
             )
             if isinstance(token_to_kv_pool, SWAKVPool) and isinstance(
                 token_to_kv_pool.swa_kv_pool, MHATokenToKVPool
@@ -1526,6 +1587,11 @@ def setup_state_kv_args(
                         c128_ptrs,
                         c128_lens,
                         c128_item_lens,
+                        layer_ids=(
+                            token_to_kv_pool.get_request_state_layer_ids()
+                            if is_dsv4_paged
+                            else None
+                        ),
                     )
         elif isinstance(token_to_kv_pool, HybridLinearKVPool):
             dim = (
@@ -1823,25 +1889,24 @@ def setup_state_kv_args(
 
 
 def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
-    """Describe the positional transfer layout without pool capacities or pointers."""
+    """The model-wide DSpark transfer contract both PD roles must share.
+
+    Per-entry layouts differ across PP prefill stages; entries pair by layer
+    id and components by state type, so only stage-invariant fields go here.
+    """
     ratios = getattr(kv_args, "mla_compression_ratios", None) or []
     if 2 not in ratios or str(get_spec().speculative_algorithm).upper() != "DSPARK":
         return None
 
     from sglang.srt.disaggregation.base.conn import StateType
 
-    if kv_args.state_types.count(StateType.SWA) != 2:
-        raise RuntimeError(
-            "DeepSeek-V4.1 DSpark PD requires target and draft SWA state"
-        )
+    if StateType.SWA not in kv_args.state_types:
+        raise RuntimeError("DeepSeek-V4.1 DSpark PD requires SWA state")
 
     return {
+        "protocol_version": 2,
         "num_draft_tokens": get_spec().speculative_num_draft_tokens,
         "compression_ratios": list(ratios),
-        "kv_layer_ids": list(kv_args.kv_layer_ids),
-        "kv_item_lens": list(kv_args.kv_item_lens),
-        "state_types": [state_type.value for state_type in kv_args.state_types],
-        "state_item_lens": [list(items) for items in kv_args.state_item_lens],
     }
 
 
