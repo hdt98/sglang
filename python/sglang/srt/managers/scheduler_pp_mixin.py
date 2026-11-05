@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -317,6 +319,9 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                    self.maybe_send_final_prefill_kv_early(
+                        cur_batch, self.launch_event
+                    )
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -607,6 +612,11 @@ class SchedulerPPMixin:
             logger.info(
                 "PP tensor communication overlap enabled on a dedicated CUDA stream"
             )
+
+        # Diagnostic: SGLANG_PP_STAGE_TIMING=1 logs each microbatch's device time on this
+        # stage, read from timing events once they complete, so the loop never blocks.
+        self._pp_stage_timing = os.environ.get("SGLANG_PP_STAGE_TIMING") == "1"
+        self._pp_stage_timing_pending: deque = deque()
 
         self._pp_tensor_dict_inbox: Dict[
             str, deque[Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]]
@@ -1664,6 +1674,10 @@ class SchedulerPPMixin:
         with torch.profiler.record_function("run_batch"):
             with self.forward_stream_ctx:
                 self._pp_wait_forward_dependencies()
+                if self._pp_stage_timing:
+                    self._pp_log_completed_stage_timings()
+                    timing_start = self.device_module.Event(enable_timing=True)
+                    timing_start.record(self.device_module.current_stream())
                 set_time_batch(
                     cur_batch.reqs,
                     "set_run_batch_cpu_start_time",
@@ -1690,6 +1704,19 @@ class SchedulerPPMixin:
                 )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())
+                if self._pp_stage_timing:
+                    timing_end = self.device_module.Event(enable_timing=True)
+                    timing_end.record(self.device_module.current_stream())
+                    self._pp_stage_timing_pending.append(
+                        (
+                            timing_start,
+                            timing_end,
+                            mb_id,
+                            cur_batch.extend_num_tokens or 0,
+                            len(cur_batch.reqs),
+                            time.time(),
+                        )
+                    )
                 if self.pp_group.is_last_rank:
                     # (last rank) buffer the outputs for async batch depth
                     last_rank_comm_queue.append(
@@ -1701,6 +1728,16 @@ class SchedulerPPMixin:
                         )
                     )
         return result, event
+
+    def _pp_log_completed_stage_timings(self: Scheduler) -> None:
+        pending = self._pp_stage_timing_pending
+        while pending and pending[0][1].query():
+            start, end, mb_id, tokens, reqs, launched = pending.popleft()
+            logger.info(
+                f"[PP-stage] rank={get_parallel().pp_rank} mb={mb_id} "
+                f"tokens={tokens} reqs={reqs} launch_t={launched:.6f} "
+                f"gpu_ms={start.elapsed_time(end):.3f}"
+            )
 
     def get_rids(
         self: Scheduler, req_queue: List[Req], is_send: bool, *poll_statuses_group
