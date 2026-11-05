@@ -381,11 +381,35 @@ def pre_permute_standard_to_aiter(
         hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
         topk_weights = torch.ones_like(topk_weights)
 
+    from sglang.srt.models.deepseek_common.dp_gather_stage import take_moe_output
+
+    # SGLANG_DP_GATHER_MXFP8: gathered rows arrive MX-quantized with their e8m0 scales staged;
+    # stage 1 takes them as already quantized and the output stays bf16.
+    a1_scale = output_dtype = None
+    if hidden_states.dtype == torch.float8_e4m3fn:
+        from sglang.srt.models.deepseek_common.mxfp8_wire import take_scale
+
+        a1_scale = take_scale()
+        if a1_scale is None or a1_scale.shape[0] != hidden_states.shape[0]:
+            raise RuntimeError("fp8 MoE input without its MXFP8 wire scale")
+        output_dtype = torch.bfloat16
+    out_dtype = output_dtype or hidden_states.dtype
+
+    # Lever F-RS: the DP transport may stage the registered pool as this call's destination.
+    output = take_moe_output()
+    if output is not None and (
+        output.shape != hidden_states.shape or output.dtype != out_dtype
+    ):
+        output = None
+
     return AiterRunnerInput(
         hidden_states=hidden_states,
         topk_ids=topk_ids.to(torch.int32),
         topk_weights=topk_weights,
         quant_type=quant_info.quant_type,
+        a1_scale=a1_scale,
+        output_dtype=output_dtype,
+        output=output,
     )
 
 
