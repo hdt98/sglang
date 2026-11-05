@@ -9,6 +9,12 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
+from sglang.kernels.ops.sampling.temperature_softmax import (
+    _combine_kernel,
+    _normalize_kernel,
+    _partial_max_sumexp_kernel,
+    _split_geometry,
+)
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
@@ -385,6 +391,9 @@ def _softmax_temp_kernel(
         tl.store(out_base + offs, e / sum_exp, mask=vmask)
 
 
+_SPLIT_SOFTMAX_LOGGED = False
+
+
 def softmax_temp_triton(
     *,
     logits: torch.Tensor,
@@ -398,15 +407,31 @@ def softmax_temp_triton(
     )
     temperatures = temperatures.reshape(bs).to(torch.float32).contiguous()
     out = torch.empty((num_rows, vocab), dtype=torch.float32, device=logits.device)
-    BLOCK_V = 4096
-    _softmax_temp_kernel[(num_rows,)](
-        logits,
-        temperatures,
-        out,
-        vocab,
-        rows_per_request,
-        logits.stride(0),
-        BLOCK_V=BLOCK_V,
+    # Split each row across CTAs: one CTA per row leaves most CUs idle at a few rows.
+    global _SPLIT_SOFTMAX_LOGGED
+    if not _SPLIT_SOFTMAX_LOGGED:
+        _SPLIT_SOFTMAX_LOGGED = True
+        # Served-path activation evidence for the recipe's activation_patterns.
+        print("m31-overlay-active: dspark split-row softmax", flush=True)
+    temp_per_row = torch.repeat_interleave(temperatures, rows_per_request)
+    block, num_splits = _split_geometry(num_rows, vocab)
+    partial_max = torch.empty(
+        (num_rows, num_splits), dtype=torch.float32, device=logits.device
+    )
+    partial_sum = torch.empty_like(partial_max)
+    row_max = torch.empty((num_rows,), dtype=torch.float32, device=logits.device)
+    row_sum = torch.empty_like(row_max)
+    _partial_max_sumexp_kernel[(num_rows, num_splits)](
+        logits, temp_per_row, partial_max, partial_sum,
+        logits.stride(0), vocab, num_splits, BLOCK=block, num_warps=8,
+    )
+    _combine_kernel[(num_rows,)](
+        partial_max, partial_sum, row_max, row_sum, num_splits,
+        BLOCK=triton.next_power_of_2(num_splits), num_warps=1,
+    )
+    _normalize_kernel[(num_rows, num_splits)](
+        logits, temp_per_row, row_max, row_sum, out,
+        logits.stride(0), out.stride(0), vocab, BLOCK=block, num_warps=8,
     )
     return out
 
