@@ -7,7 +7,11 @@ import torch
 from sglang.kernels.ops.memory.adler32 import adler32_strided_checksum
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
+    HybridLinearKVPool,
+    MiniMaxSparseKVPool,
+)
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
 NestedInts = Sequence[int] | Sequence[Sequence[int]]
@@ -70,7 +74,7 @@ def state_indices_for_request(
             )
         )
         return _to_page_indices_gpu(window_swa, page_size)
-    if isinstance(pool, DSATokenToKVPool):
+    if isinstance(pool, (DSATokenToKVPool, MiniMaxSparseKVPool)):
         device_page_size = pool.page_size
         kv_full = scheduler.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, :seq_len
@@ -89,13 +93,13 @@ class KvChecksumComputer:
         state_item_lens: NestedInts = (),
     ):
         assert len(kv_data_ptrs) == len(kv_item_lens)
-        assert len(kv_data_ptrs) > 0
         self._device = torch.device(device)
         self._kv_data_ptrs = [int(ptr) for ptr in kv_data_ptrs]
         self._kv_item_lens = [int(item_len) for item_len in kv_item_lens]
         self._state_data_ptrs = _flatten_ints(state_data_ptrs)
         self._state_item_lens = _flatten_ints(state_item_lens)
         assert len(self._state_data_ptrs) == len(self._state_item_lens)
+        assert self._kv_data_ptrs or self._state_data_ptrs
 
     def compute(
         self,

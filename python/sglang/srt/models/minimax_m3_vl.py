@@ -10,15 +10,15 @@ import torch.nn as nn
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
-    is_shared_experts_fusion_disabled,
+    get_num_fused_shared_experts,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.utils.common import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
@@ -28,6 +28,11 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
+)
+from sglang.srt.models.minimax_common.minimax_weight_loader import (
+    mxfp8_linear_scale_alias,
+    quark_shared_experts_fusion_disable_reason,
+    remap_llm_compressor_nvfp4_expert,
 )
 from sglang.srt.models.minimax_m3 import (
     MiniMaxM3Model,
@@ -44,6 +49,7 @@ from sglang.srt.models.minimax_vl_common import (
     merge_vit_qkv_weights,
 )
 from sglang.srt.models.utils import WeightsMapper
+from sglang.srt.multimodal.encoder_preprocessing import EncoderMediaProcessorConfig
 from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import (
     add_prefix,
@@ -74,6 +80,9 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         "index_qkv_proj": ["index_q_proj", "index_k_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
+    encoder_media_processor_config = EncoderMediaProcessorConfig(
+        preserve_media_metadata=True, preprocess_off_event_loop=True
+    )
 
     def __init__(
         self,
@@ -88,8 +97,10 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
 
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
 
-        self.num_fused_shared_experts = 0
-        self._determine_num_fused_shared_experts()
+        # The weight loader reads this after the build.
+        self.num_fused_shared_experts = get_num_fused_shared_experts()
+        if self.num_fused_shared_experts:
+            log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
         vision_config_raw = config.vision_config
         assert vision_config_raw is not None, "vision_config is required"
@@ -117,6 +128,16 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             ),
             patch_merge_bias=getattr(config, "patch_merge_bias", True),
         )
+
+        self.encoder_processor = None
+        if config.encoder_only:
+            from sglang.srt.managers.tokenizer_manager import get_processor_wrapper
+
+            self.encoder_processor = get_processor_wrapper()
+            self.model = None
+            self.lm_head = None
+            self.logits_processor = None
+            return
 
         text_config = config.text_config
         self.model = MiniMaxM3Model(
@@ -154,11 +175,17 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         text_config = getattr(hf_config, "text_config", hf_config)
         if not getattr(text_config, "n_shared_experts", None):
             return "No shared experts are defined in the config."
-        if quant_config is not None and quant_config.get_name() == "modelopt_mixed":
+        if quant_config is not None and quant_config.get_name() in (
+            "modelopt_mixed",
+            "minimax_m3_nvfp4",
+        ):
             return (
                 "Shared and routed experts may use different quantization formats "
-                "in ModelOpt mixed-precision checkpoints."
+                "in mixed-precision checkpoints."
             )
+        quark_reason = quark_shared_experts_fusion_disable_reason(quant_config)
+        if quark_reason is not None:
+            return quark_reason
         if not (_is_cuda or _is_hip):
             return "Shared experts fusion currently requires CUDA or ROCm devices."
         if _is_cuda and (_device_sm is not None) and (_device_sm < 80):
@@ -177,15 +204,12 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             )
         return None
 
-    def _determine_num_fused_shared_experts(self) -> None:
-        # The decision was installed by the loader; this only reads it.
-        if is_shared_experts_fusion_disabled():
-            return
-        self.num_fused_shared_experts = self.config.text_config.n_shared_experts
-        assert self.num_fused_shared_experts == 1, (
-            "Only 1 fused shared expert is supported"
-        )
-        log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
+    @classmethod
+    def num_fusable_shared_experts(cls, hf_config) -> int:
+        """Return the model's fusable shared-expert count."""
+        num_shared_experts = hf_config.text_config.n_shared_experts
+        assert num_shared_experts == 1, "Only 1 fused shared expert is supported"
+        return num_shared_experts
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -196,9 +220,22 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             text_config
         )
 
+    def precompile_kernels_after_loading(self) -> None:
+        MiniMaxM3SparseForCausalLM.precompile_kernels_after_loading(self)
+
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
-        return MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
-            input_ids, mm_inputs
+        return pad_mm_tokens(input_ids, mm_inputs)
+
+    def preprocess_mm_for_encoder(self, mm_data, modality, config):
+        from sglang.srt.multimodal.processors.minimax_m3_vl import (
+            preprocess_for_encoder,
+        )
+
+        return preprocess_for_encoder(
+            mm_data,
+            modality,
+            processor=self.encoder_processor,
+            mm_process_config=get_mm().mm_process_config,
         )
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
@@ -239,6 +276,22 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         for layer_id in self.model.layers_to_capture:
             if 0 <= layer_id < len(self.model.layers):
                 setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
+
+    def set_dspark_layers_to_capture(self, layer_ids: list[int]):
+        if not self.pp_group.is_last_rank:
+            return
+        depth = len(self.model.layers)
+        if not layer_ids or any(i < 0 or i >= depth for i in layer_ids):
+            raise ValueError("DSpark capture IDs must select existing target layers")
+        self.capture_aux_hidden_states = True
+        self.model.layers_to_capture = [i + 1 for i in layer_ids]
+        for i, layer in enumerate(self.model.layers):
+            layer._is_layer_to_capture = i in self.model.layers_to_capture
+
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]):
+        if list(layer_ids) != sorted(set(layer_ids)):
+            raise ValueError("MiniMax DFlash capture taps must be unique and sorted")
+        self.set_dspark_layers_to_capture(layer_ids)
 
     def forward(
         self,
@@ -329,6 +382,8 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
                 continue
 
             if name.startswith("language_model."):
+                if self.config.encoder_only:
+                    continue
                 self._load_llm_weight(
                     name[len("language_model.") :],
                     loaded_weight,
@@ -378,6 +433,14 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         ):
             return
 
+        # minimax_m3_nvfp4 reads weight_global_scale itself; remapping it inverts the scale twice
+        if (
+            self.quant_config is not None
+            and self.quant_config.get_name() == "quark"
+            and "mlp.experts." in name
+        ):
+            name, loaded_weight = remap_llm_compressor_nvfp4_expert(name, loaded_weight)
+
         for param_name, weight_name, shard_id in llm_stacked_params_mapping:
             if weight_name not in name:
                 continue
@@ -386,6 +449,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             new_name = name.replace(weight_name, param_name)
             if new_name.endswith(".bias") and new_name not in params_dict:
                 continue
+            new_name = mxfp8_linear_scale_alias(new_name, params_dict)
             if new_name not in params_dict:
                 continue
             param = params_dict[new_name]
@@ -418,6 +482,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         remapped = maybe_remap_kv_scale_name(name, params_dict)
         if remapped is None:
             return
+        remapped = mxfp8_linear_scale_alias(remapped, params_dict)
         if remapped not in params_dict:
             logger.warning(f"Parameter {remapped} not found in params_dict")
             return
@@ -429,4 +494,11 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             logger.warning(f"Error loading weight {remapped}: {e}")
 
 
-EntryClass = [MiniMaxM3SparseForConditionalGeneration]
+class MiniMaxM3TinyForConditionalGeneration(MiniMaxM3SparseForConditionalGeneration):
+    pass
+
+
+EntryClass = [
+    MiniMaxM3SparseForConditionalGeneration,
+    MiniMaxM3TinyForConditionalGeneration,
+]

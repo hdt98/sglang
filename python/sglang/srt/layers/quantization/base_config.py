@@ -148,6 +148,9 @@ class QuantizationConfig(ABC):
     """Base class for quantization configs."""
 
     weight_block_size: Optional[List[int]] = None
+    # None means the global default applies; a config sets it to decide for
+    # itself whether its MXFP8 weights are converted to block-FP8 at load.
+    convert_mxfp8_to_block_fp8: Optional[bool] = None
 
     def __init__(self):
         super().__init__()
@@ -266,6 +269,20 @@ class QuantizationConfig(ABC):
             method.
         """
         raise NotImplementedError()
+
+    def is_linear_unquantized(self, prefix: str) -> bool:
+        """Whether a linear layer at ``prefix`` keeps its checkpoint precision.
+
+        A query for deciding module layouts before layers are built, so an
+        override must not register ``prefix`` as a quantized layer.
+        """
+        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        return isinstance(
+            self.get_quant_method(LinearBase(1, 1), prefix=prefix),
+            UnquantizedLinearMethod,
+        )
 
     @abstractmethod
     def get_scaled_act_names(self) -> List[str]:
