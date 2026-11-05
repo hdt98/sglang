@@ -66,8 +66,7 @@ def process_dense_weights(method, layer: torch.nn.Module, scale_u8) -> None:
             copy_or_rebind_param(
                 layer, "weight", shuffle_weight(layer.weight.data, (16, 16))
             )
-            # mxfp8_flydsl_gfx95 reads the plain [N, K] weight
-            layer.weight_scale_mx_flydsl = None
+            # mxfp8_flydsl_gfx95 takes this layout too (b_shuffled), so prefill keeps FlyDSL
         return
     assert backend.is_gfx95_mxfp8_native()
     n, k = layer.weight.shape
@@ -195,7 +194,11 @@ def _apply_flydsl_mxfp8(
     xq, xs = mxfp8_operand(x, input_scale)
     flydsl = _flydsl_mxfp8_module()
     out = flydsl.mxfp8_gemm(
-        xq, flydsl.mxfp8_scale_layout(xs), layer.weight, layer.weight_scale_mx_flydsl
+        xq,
+        flydsl.mxfp8_scale_layout(xs),
+        layer.weight,
+        layer.weight_scale_mx_flydsl,
+        b_shuffled=getattr(layer, "mxfp8_aiter_preshuffled", False),
     )
     if bias is not None:
         out = out + bias
