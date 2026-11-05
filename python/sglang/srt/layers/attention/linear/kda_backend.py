@@ -54,6 +54,10 @@ from sglang.srt.runtime_context import (
 )
 
 
+def _kda_fused_verify_t4_batch_enabled(batch_size: int) -> bool:
+    return 1 <= batch_size <= envs.SGLANG_KDA_FUSED_VERIFY_T4_MAX_BS.get()
+
+
 def _validate_flashinfer_kda_prefill(
     *,
     chunk_size: int,
@@ -1595,7 +1599,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             )
             measured_kimi_t4 = (
                 is_gfx95_supported()
-                and 1 <= batch_size <= 4
+                and _kda_fused_verify_t4_batch_enabled(batch_size)
                 and draft_token_num == 4
                 and layer.num_q_heads == layer.num_k_heads == layer.num_v_heads == 12
                 and layer.head_q_dim == layer.head_k_dim == layer.head_v_dim == 128

@@ -1746,6 +1746,9 @@ class Envs:
     SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
     SGLANG_OPT_FLASHINFER_VERIFY_HOST_PLAN = EnvBool(False)
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
+    # Largest batch the fused KDA chain-verify kernel takes at T=4 on the
+    # 12-head gfx950 shape; above it the unfused pair runs.
+    SGLANG_KDA_FUSED_VERIFY_T4_MAX_BS = EnvInt(4)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
