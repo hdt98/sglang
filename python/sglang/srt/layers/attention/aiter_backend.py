@@ -116,6 +116,9 @@ _use_fp8_prefill_attn = (
 
 # Max qlen limitation of the asm ps kernels to handle q with bf16 dtype
 _MLA_ASM_PS_MAX_QLEN = 4
+# Off by default: cast the decode query to fp8 at q_len <= 4 so the asm PS
+# dispatch picks the a8w8 kernel instead of a16w8 (local A/B overlay).
+_MLA_FP8_Q_DECODE = os.environ.get("SGLANG_K3_MLA_FP8_Q_DECODE", "0") == "1"
 
 # (query head count -> query lengths) at which aiter's scheduler treats the
 # count as native, on gfx950 with an fp8 query and KV. None means any length.
@@ -1591,7 +1594,10 @@ class AiterAttnBackend(AttentionBackend):
             self.kv_cache_dtype == fp8_dtype
             and self.mla_kernel_num_head_padded == 16
             and is_gfx95_supported()
-            and (kwargs.get("max_seqlen_q") or 1) > _MLA_ASM_PS_MAX_QLEN
+            and (
+                (kwargs.get("max_seqlen_q") or 1) > _MLA_ASM_PS_MAX_QLEN
+                or _MLA_FP8_Q_DECODE
+            )
             and q.dtype != fp8_dtype
         ):
             q_flat = q.reshape(q.shape[0], -1).to(fp8_dtype)
