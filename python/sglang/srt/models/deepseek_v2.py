@@ -121,6 +121,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.topk import (
     BypassedTopKOutput,
+    StandardTopKOutput,
     TopK,
     TopKOutputFormat,
     fused_shared_expert_weight,
@@ -630,6 +631,20 @@ class MergedMoEOutput(MoEOutput):
 
     def get_merged(self) -> torch.Tensor:
         return self.routed
+
+
+def _take_wire_route(hidden_states: torch.Tensor):
+    """The route the MXFP8 DP wire staged for these gathered fp8 rows, else None.
+
+    Only the wire hands this MoE fp8 rows; any other input leaves a staged route alone."""
+    if not _is_hip or hidden_states.dtype != torch.float8_e4m3fn:
+        return None
+    from sglang.srt.models.deepseek_common.mxfp8_wire import take_route
+
+    route = take_route()
+    if route is None or route.q.data_ptr() != hidden_states.data_ptr():
+        raise RuntimeError("fp8 MoE input without its MXFP8 wire route")
+    return route
 
 
 def _scale_routed_and_add_shared(
@@ -1337,7 +1352,17 @@ class DeepseekV2MoE(nn.Module):
         # hidden in the decoder layer (before the dp gather) and added after the
         # reduce_scatterv. When set, never compute/add it here (on the global buffer).
         shared_output = None
-        if hidden_states.shape[0] > 0:
+        wire_route = _take_wire_route(hidden_states)
+        if wire_route is not None:
+            # SGLANG_DP_GATHER_MXFP8: each DP rank routed its own rows before the gather;
+            # the fused shared expert rides in the routed slots, so nothing else runs here.
+            pre_quant_input = None
+            topk_output = StandardTopKOutput(
+                wire_route.topk_weights,
+                wire_route.topk_ids,
+                wire_route.topk_weights.new_empty((0, 0)),
+            )
+        elif hidden_states.shape[0] > 0:
             # Quantize-once (SGLANG_OPT_MOE_QUANT_ONCE): only worthwhile when
             # the shared expert also runs here on the same tensor.
             pre_quant_input = (

@@ -34,6 +34,17 @@ from sglang.srt.utils import get_bool_env_var, is_hip
 
 _is_hip = is_hip()
 SHARED_EXPERT_LOCAL = get_bool_env_var("SGLANG_DP_SHARED_EXPERT_LOCAL")
+# MXFP8 passthrough wire for the decode DP MoE gather (mxfp8_wire.py); off by default.
+MXFP8_WIRE = get_bool_env_var("SGLANG_DP_GATHER_MXFP8")
+_wire_seen = False
+_wire_declined = set()
+
+
+def _wire_decline(reason: str) -> None:
+    """Log each distinct reason the wire falls back to bf16 once per process, then decline."""
+    if reason not in _wire_declined:
+        _wire_declined.add(reason)
+        print(f"[MXFP8-wire] decline reason={reason}", flush=True)
 
 
 def shared_expert_runs_locally(moe):
@@ -73,6 +84,226 @@ def _mask_dp_pad_rows(local_hidden_states, forward_batch) -> None:
     local_hidden_states.masked_fill_(
         pad.view(-1, *([1] * (local_hidden_states.dim() - 1))), 0
     )
+
+
+def _staged_dp_gather(global_hidden_states, local_hidden_states, forward_batch) -> bool:
+    """Masked DP gather staged into AITER's registered input pool; False -> served path.
+
+    Applies only where the served gather is the captured AITER all-gather with copy-in
+    (MAX_LEN padding, attention TP 1, no CP/world gather): one kernel replaces the pad
+    mask and the copy-in, and allgather_vec reads the same registered pool as before."""
+    from sglang.srt.distributed import parallel_state as ps
+    from sglang.srt.layers.dp_attention import (
+        _note_dp_gather_in_prefill_graph,
+        world_dp_gather_enabled,
+    )
+    from sglang.srt.models.deepseek_common.dp_gather_stage import (
+        pool_view,
+        stage_masked_rows,
+    )
+
+    parallel = get_parallel()
+    group = parallel.tp_group
+    ca_comm = group.ca_comm
+    n_real = forward_batch.num_token_non_padded
+    if not (
+        ps._AITER_CAPTURE_COPY_IN
+        and n_real is not None
+        and forward_batch.dp_padding_mode is not None
+        and forward_batch.dp_padding_mode.is_max_len()
+        and parallel.attn_tp_size == 1
+        and parallel.attn_cp_size == 1
+        and not world_dp_gather_enabled()
+        and envs.SGLANG_USE_AITER_AG.get()
+        and group._has_aiter_custom_all_gather()
+        and local_hidden_states.dim() == 2
+        and local_hidden_states.is_contiguous()
+        and global_hidden_states.is_contiguous()
+        and local_hidden_states.dtype == torch.bfloat16
+        and ca_comm.should_custom_ag(local_hidden_states)
+        and global_hidden_states.shape[0]
+        == local_hidden_states.shape[0] * group.world_size
+    ):
+        return False
+    staged = pool_view(ca_comm, local_hidden_states)
+    if staged is None:
+        return False
+    _note_dp_gather_in_prefill_graph()
+    stage_masked_rows(local_hidden_states, n_real, staged)
+    if (
+        getattr(ca_comm, "_IS_CAPTURING", False)
+        and not torch.cuda.is_current_stream_capturing()
+        and not ps.is_in_tc_piecewise_cuda_graph()
+    ):
+        # graph warmup: the served path zero-fills here instead of a host collective
+        global_hidden_states.zero_()
+        return True
+    # the pool base is registered at init, so the kernel finds it without a copy
+    ca_comm.all_gather_reg(staged, out=global_hidden_states, dim=0)
+    return True
+
+
+def _wire_dp_gather(moe, global_hidden_states, local_hidden_states, forward_batch):
+    """MXFP8 passthrough wire: route and MX-quantize the local rows, gather one packed row
+    (values, e8m0 scales, top-k ids and weights) per token, and return the gathered fp8
+    values with the route and scale staged for the MoE; None -> bf16 path.
+
+    Same gates as _staged_dp_gather (captured AITER all-gather with copy-in, MAX_LEN,
+    attention TP 1), plus a routing that is a pure per-row function of the local rows:
+    no hash routing, waterfill, EPLB or piecewise graph, and the packed top-k width."""
+    global _wire_seen
+    from sglang.srt.distributed import parallel_state as ps
+    from sglang.srt.layers.dp_attention import (
+        _note_dp_gather_in_prefill_graph,
+        world_dp_gather_enabled,
+    )
+    from sglang.srt.models.deepseek_common import mxfp8_wire as wire
+    from sglang.srt.models.deepseek_common.amd import deepseek_v2_hip_moe as hip_moe
+    from sglang.srt.models.deepseek_common.dp_gather_stage import pool_view
+    from sglang.srt.runtime_context import get_exec
+
+    parallel = get_parallel()
+    group = parallel.tp_group
+    ca_comm = group.ca_comm
+    n_real = forward_batch.num_token_non_padded
+    rows = local_hidden_states.shape[0]
+    checks = (
+        ("copy_in_off", lambda: ps._AITER_CAPTURE_COPY_IN),
+        ("no_n_real", lambda: n_real is not None),
+        ("empty_rows", lambda: rows > 0),
+        (
+            "not_max_len",
+            lambda: forward_batch.dp_padding_mode is not None
+            and forward_batch.dp_padding_mode.is_max_len(),
+        ),
+        ("attn_tp_or_cp", lambda: parallel.attn_tp_size == 1 and parallel.attn_cp_size == 1),
+        ("world_dp_gather", lambda: not world_dp_gather_enabled()),
+        ("piecewise_graph", lambda: not ps.is_in_tc_piecewise_cuda_graph()),
+        (
+            "no_aiter_ag",
+            lambda: envs.SGLANG_USE_AITER_AG.get() and group._has_aiter_custom_all_gather(),
+        ),
+        (
+            "hidden_layout",
+            lambda: local_hidden_states.dim() == 2
+            and local_hidden_states.shape[1] == wire.HIDDEN
+            and local_hidden_states.dtype == torch.bfloat16,
+        ),
+        ("global_rows", lambda: global_hidden_states.shape[0] == rows * group.world_size),
+        # forward_normal is the consumer: fused shared expert, no a2a, no mega MoE
+        ("unfused_shared", lambda: moe.num_fused_shared_experts > 0),
+        (
+            "a2a_or_sbo",
+            lambda: not moe._enable_a2a_moe and not moe._fuse_shared_experts_inside_sbo,
+        ),
+        ("mega_moe", lambda: not envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()),
+        ("hash_layer", lambda: not getattr(moe, "is_hash", False)),
+        # V4.1 checkpoints carry a vision bias on every gate; the engine routes with it
+        # only for extend batches that carry images (forward(): use_vision_topk).
+        (
+            "vision_topk",
+            lambda: moe.gate.e_score_correction_bias_vl is None
+            or not hip_moe.batch_has_images(forward_batch),
+        ),
+        ("topk_width", lambda: moe.topk.topk_config.top_k == wire.TOPK),
+        ("waterfill", lambda: not moe.topk.enable_waterfill),
+        ("eplb", lambda: not get_exec().moe.enable_eplb),
+    )
+    for reason, ok in checks:
+        if not ok():
+            return _wire_decline(reason)
+    template = torch.empty(wire.packed_shape(rows), dtype=torch.bfloat16, device="meta")
+    packed = pool_view(ca_comm, template)
+    if packed is None:
+        return _wire_decline("no_pool_view")
+    if not ca_comm.should_custom_ag(packed):
+        return _wire_decline("custom_ag_refused")
+    logits, partials = hip_moe.forward_gate(moe, local_hidden_states, None, fused_gate=True)
+    topk_kwargs = {} if partials is None else {"router_logits_partials": partials}
+    topk = moe.topk(local_hidden_states, logits, num_token_non_padded=n_real, **topk_kwargs)
+    ids, weights = topk.topk_ids, topk.topk_weights
+    if not (
+        ids.shape == (rows, wire.TOPK)
+        and ids.dtype == torch.int32
+        and weights.dtype == torch.float32
+    ):
+        return _wire_decline("topk_layout")
+    _note_dp_gather_in_prefill_graph()
+    wire.pack_rows(local_hidden_states, n_real, ids, weights, packed.view(torch.uint8))
+    gathered = torch.empty(
+        (rows * group.world_size, packed.shape[1]),
+        dtype=torch.bfloat16,
+        device=local_hidden_states.device,
+    )
+    if (
+        getattr(ca_comm, "_IS_CAPTURING", False)
+        and not torch.cuda.is_current_stream_capturing()
+        and not ps.is_in_tc_piecewise_cuda_graph()
+    ):
+        # graph warmup: the served path zero-fills here instead of a host collective
+        gathered.zero_()
+    else:
+        ca_comm.all_gather_reg(packed, out=gathered, dim=0)
+    route = wire.unpack_rows(gathered.view(torch.uint8))
+    wire.stage_route(route)
+    wire.stage_scale(route.scale)
+    if not _wire_seen:  # activation evidence in the server log, once
+        _wire_seen = True
+        print(f"[MXFP8-wire] first gather rows={tuple(gathered.shape)}", flush=True)
+    return route.q
+
+
+def _stage_moe_output_in_pool(global_hidden_states) -> None:
+    """Make the pool base the next fused_moe destination so the RS can read it in place.
+
+    Called only after _staged_dp_gather succeeded under the equal-chunk reduce-scatter, so
+    the captured AITER collectives with copy-in, MAX_LEN and attention TP 1 already hold."""
+    from sglang.srt.models.deepseek_common.dp_gather_stage import (
+        pool_view,
+        stage_moe_output,
+    )
+
+    stage_moe_output(pool_view(get_parallel().tp_group.ca_comm, global_hidden_states))
+
+
+def _pool_reduce_scatter(local_out, global_out) -> bool:
+    """Registered reduce-scatter straight from the pool when the MoE output lives at its base;
+    False -> served copy-in path. Mirrors the gates of _maybe_aiter_reduce_scatter."""
+    from sglang.srt.distributed import parallel_state as ps
+    from sglang.srt.models.deepseek_common.dp_gather_stage import rs_route
+
+    group = get_parallel().tp_group
+    ca_comm = group.ca_comm
+    buf = ca_comm._pool["input"]
+    pooled = (
+        ps._AITER_CAPTURE_COPY_IN
+        and getattr(buf, "_buffer", None) is not None
+        and global_out.data_ptr() == buf.tensor.data_ptr()
+        and global_out.numel() * global_out.element_size() <= buf.max_size
+        and global_out.is_contiguous()
+        and local_out.is_contiguous()
+        and global_out.dtype == torch.bfloat16
+        and envs.SGLANG_DP_USE_REDUCE_SCATTER.get()
+        and group._has_aiter_custom_reduce_scatter()
+        and ca_comm.should_custom_ar(global_out)
+        and global_out.shape[0] == local_out.shape[0] * group.world_size
+    )
+    route = "pool" if pooled else "served"
+    rs_route[route] += 1
+    if rs_route[route] == 1:  # route evidence in the server log, once per route
+        print(f"[F-RS] first {route} reduce-scatter rows={tuple(global_out.shape)}", flush=True)
+    if not pooled:
+        return False
+    if (
+        getattr(ca_comm, "_IS_CAPTURING", False)
+        and not torch.cuda.is_current_stream_capturing()
+        and not ps.is_in_tc_piecewise_cuda_graph()
+    ):
+        # graph warmup: the served path zero-fills here instead of a host collective
+        local_out.zero_()
+        return True
+    ca_comm.reduce_scatter(global_out, local_out, 0, registered=True)
+    return True
 
 
 def _attn_tp_all_gather_chunks(
@@ -179,13 +410,28 @@ class MoeRowTransport(ComputeTransport):
             )
             if do_shared_local and local_hidden_states.shape[0] > 0:
                 _shared_local = moe._forward_shared_experts(local_hidden_states)
+            wire_q = (
+                _wire_dp_gather(moe, hidden_states, local_hidden_states, forward_batch)
+                if _is_hip and MXFP8_WIRE
+                else None
+            )
+            if wire_q is not None:
+                if _use_reduce_scatter:
+                    _stage_moe_output_in_pool(hidden_states)  # bf16 output template
+                hidden_states = wire_q
             # Pad rows are not refreshed during graph replay. Stale bf16-max
             # values can overflow the MoE and contaminate the combine output.
-            if _is_hip:
-                _mask_dp_pad_rows(local_hidden_states, forward_batch)
-            # self_attn has already reduced across attention TP, so these hidden
-            # states are replicated and must not be summed by a partial gather.
-            dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
+            elif not (
+                _is_hip
+                and _staged_dp_gather(hidden_states, local_hidden_states, forward_batch)
+            ):
+                if _is_hip:
+                    _mask_dp_pad_rows(local_hidden_states, forward_batch)
+                # self_attn has already reduced across attention TP, so these hidden
+                # states are replicated and must not be summed by a partial gather.
+                dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
+            elif _use_reduce_scatter:
+                _stage_moe_output_in_pool(hidden_states)
         _a2a_scatter_chunks = None
         if _use_tp_attn_a2a_scatter:
             s, r = get_parallel().attn_tp_size, get_parallel().attn_tp_rank
@@ -247,7 +493,8 @@ class MoeRowTransport(ComputeTransport):
                     sizes=get_dp_global_num_tokens(),
                 )
             elif _use_reduce_scatter:
-                dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
+                if not (_is_hip and _pool_reduce_scatter(hidden_states, global_hidden_states)):
+                    dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
             else:
                 dp_scatter(hidden_states, global_hidden_states, forward_batch)
             if _shared_local is not None:
@@ -276,6 +523,17 @@ class MoeRowTransport(ComputeTransport):
             yield
 
     def release(self):
+        if self._use_tp_moe_gather:
+            from sglang.srt.models.deepseek_common.dp_gather_stage import (
+                stage_moe_output,
+            )
+
+            stage_moe_output(None)  # never let a later MoE write the pool unasked
+            if MXFP8_WIRE:
+                from sglang.srt.models.deepseek_common import mxfp8_wire
+
+                mxfp8_wire.stage_route(None)
+                mxfp8_wire.stage_scale(None)
         self.input = self._shared_local = self._a2a_scatter_chunks = None
 
 
