@@ -1400,6 +1400,11 @@ class SchedulerDisaggregationPrefillMixin:
                     len(req.origin_input_ids),
                 )
             else:
+                if get_parallel().pp_size > 1:
+                    # Under PP this chunk's forward may still be running here and
+                    # nothing orders the KV read after it (e.g. with
+                    # SGLANG_PP_COMM_OVERLAP), so make the transfer wait for it.
+                    self._set_kv_send_wait_event(req)
                 self.send_kv_chunk(req)
 
             if self.chunked_req is not None:
@@ -1443,21 +1448,87 @@ class SchedulerDisaggregationPrefillMixin:
             # the full range; only skip this optional early-send optimization.
             return
         # Early-send issues the KV read before this step's forward is enqueued,
-        # but under overlap scheduling the PRIOR step's prefill forward may still
-        # be writing these prefix pages on forward_stream. Record a completion
-        # event now so the transfer worker can wait on those writes before the
-        # RDMA read, instead of racing them.
-        if self.enable_overlap:
-            ev = torch.cuda.Event()
-            ev.record(self.forward_stream)
-            req.disagg_kv_sender._early_send_wait_event = ev
+        # but under overlap scheduling or pipeline parallelism an earlier prefill
+        # forward may still be writing these prefix pages on forward_stream.
+        # Record a completion event now so the transfer worker can wait on those
+        # writes before the RDMA read, instead of racing them.
+        if self.enable_overlap or get_parallel().pp_size > 1:
+            self._set_kv_send_wait_event(req)
         self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
+
+    def _set_kv_send_wait_event(self: Scheduler, req: Req) -> None:
+        """Make the next KV send of ``req`` wait for the work already enqueued
+        on forward_stream. The transfer worker synchronizes on the event before
+        reading the pages, so the scheduler thread is never blocked."""
+        ev = self.device_module.Event()
+        ev.record(self.forward_stream)
+        req.disagg_kv_sender._early_send_wait_event = ev
+
+    def maybe_send_final_prefill_kv_early(
+        self: Scheduler, batch: ScheduleBatch, launch_event: object
+    ) -> None:
+        """Send completed final-prefill pages behind this PP rank's launch.
+
+        The final page, state/metadata buffers, completion, future-map
+        publication and decode-ready signal stay on the existing result path.
+        This preserves PP batch membership while moving the bulk data send
+        ahead of the downstream pipeline stage.
+        """
+        if (
+            not envs.SGLANG_DISAGG_PREFILL_OVERLAP_FINAL_PP_KV.get()
+            or not batch.forward_mode.is_extend()
+            or not batch.contains_last_prefill_chunk
+            or launch_event is None
+            or get_parallel().pp_size < 2
+        ):
+            return
+
+        page_size = self.token_to_kv_pool_allocator.page_size
+        sent_requests = 0
+        sent_tokens = 0
+        for req in batch.reqs:
+            if (
+                req.pending_bootstrap
+                or req.disagg_kv_sender is None
+                or req.extend_end is None
+                or is_aborted(req)
+            ):
+                continue
+
+            request_end = min(req.extend_end, len(req.origin_input_ids))
+            if request_end < len(req.origin_input_ids):
+                continue
+
+            early_end = request_end - request_end % page_size
+            if early_end == request_end:
+                early_end -= page_size
+            if early_end <= req.start_send_idx:
+                continue
+
+            self.send_kv_chunk(
+                req,
+                last_chunk=False,
+                end_idx=early_end,
+                wait_event=launch_event,
+            )
+            sent_requests += 1
+            sent_tokens += early_end - req.start_send_idx
+
+        if sent_requests:
+            logger.info_once(
+                "[PD-PP-FINAL-KV-OVERLAP] ACTIVE pp_rank=%s requests=%d "
+                "tokens=%d",
+                get_parallel().pp_rank,
+                sent_requests,
+                sent_tokens,
+            )
 
     def send_kv_chunk(
         self,
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
+        wait_event: Optional[object] = None,
     ) -> None:
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
         if last_chunk and computer is not None:
@@ -1470,13 +1541,19 @@ class SchedulerDisaggregationPrefillMixin:
                 state_indices = state_indices_for_request(self, req, end_idx)
                 value = computer.compute(page_indices_gpu, state_indices)
             self.disagg_metadata_buffers.set_kv_checksum(req, value)
-        self._send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
+        self._send_kv_chunk(
+            req,
+            last_chunk=last_chunk,
+            end_idx=end_idx,
+            wait_event=wait_event,
+        )
 
     def _send_kv_chunk(
         self: Scheduler,
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
+        wait_event: Optional[object] = None,
     ) -> None:
         """
         Send a prefilled chunk to the decode server
@@ -1687,6 +1764,10 @@ class SchedulerDisaggregationPrefillMixin:
                 len(page_indices), segment_is_last
             ):
                 continue
+            if wait_event is not None:
+                req.disagg_kv_sender._early_send_wait_event = wait_event
+            elif get_parallel().pp_size > 1:
+                self._set_kv_send_wait_event(req)
             send_state_indices = state_indices if segment_is_last else None
             req.disagg_kv_sender.send(
                 page_indices,

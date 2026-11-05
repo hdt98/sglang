@@ -730,6 +730,10 @@ class Envs:
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
+    # Send complete final-prefill pages behind the current PP rank's launch
+    # event. The final page, state, completion and decode-ready publication
+    # remain on the existing result path.
+    SGLANG_DISAGG_PREFILL_OVERLAP_FINAL_PP_KV = EnvBool(False)
     SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS = EnvInt(16384)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
@@ -1737,6 +1741,9 @@ class Envs:
     # down_proj, the wo_a GEMM for wo_b, and the FFN norm for the shared expert's gate_up.
     SGLANG_HIP_SHARED_ACT_MXFP8 = EnvBool(_default_hip)
     SGLANG_HIP_WO_A_MXFP8 = EnvBool(_default_hip)
+    # gfx950 aiter MXFP8 dense route: keep the weight (16, 16)-preshuffled and run aiter's FlyDSL MXFP8
+    # GEMM (needs aiter with ROCm/aiter#5896) instead of the Triton group32 GEMM on the plain weight.
+    SGLANG_ROCM_MXFP8_AITER_PRESHUFFLE = EnvBool(False)
     SGLANG_HIP_FFN_NORM_MXFP8 = EnvBool(_default_hip)
     # V4.1 low-ratio decode / target-verify indexer: score with aiter's schedule-free row-group
     # FP4 MQA logits kernel, a request's verify rows sharing each key load.
