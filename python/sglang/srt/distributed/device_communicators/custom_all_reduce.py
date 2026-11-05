@@ -4,6 +4,7 @@
 
 import ctypes
 import logging
+import os
 from contextlib import contextmanager
 from functools import partial
 from typing import Any, List, Optional, Union
@@ -397,9 +398,13 @@ def dispatch_custom_allreduce(
 
             logger.info("[AR] Using AiterCustomAllreduce (AMD default)")
             tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+            # Port of sglang#44731: same contract as the all-gather / reduce-scatter copy-in in parallel_state.
+            capture_copy_in = os.environ.get("SGLANG_AITER_CAPTURE_COPY_IN", "0") == "1"
+            if capture_copy_in:
+                logger.info("[AR-COPYIN-44731] aiter all-reduce off graph registration")
             return partial(
                 AiterCustomAllreduce,
-                enable_register_for_capturing=not tms_cudagraph,
+                enable_register_for_capturing=not (tms_cudagraph or capture_copy_in),
             )
         except ImportError as e:
             logger.warning(
