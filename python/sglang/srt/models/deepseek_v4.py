@@ -454,6 +454,36 @@ if _is_hip:
             _wo_a_fp8_mxscale_fused_invrope = apply_wo_a_fp8_mxscale_fused_invrope
         _wo_a_fp8_mxscale_prequant = apply_wo_a_fp8_mxscale_prequant
 
+# V4.1 ships wo_a as fp8 with 32x32 ue8m0 block scales, which the 128x128 fp8 absorb
+# GEMM above rejects. On gfx950 aiter's FlyDSL mxscale BMM reads that layout as is
+# (weight preshuffled at load), so wo_a stays fp8 instead of widening to bf16.
+_wo_a_mx32_bmm = None
+_wo_a_mx32_shuffle = None
+if _is_hip and _is_gfx95_supported:
+    try:
+        from aiter.ops.batched_gemm_op_a8w8 import (
+            batched_gemm_a8w8_mxscale_bpreshuffle as _wo_a_mx32_bmm,
+        )
+        from aiter.ops.shuffle import shuffle_weight as _wo_a_mx32_shuffle
+    except ImportError:
+        _wo_a_mx32_bmm = None
+    from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+        Fp8GridActivation as _Fp8GridActivation,
+        Mxfp8Activation as _Mxfp8Activation,
+        fake_quant_fp8_activation as _fake_quant_fp8_activation,
+        fp8_grid_quantize as _fp8_grid_quantize,
+    )
+
+
+def wo_a_fp8_mx32_enabled(quant_config: Optional[QuantizationConfig]) -> bool:
+    """gfx950 fp8 wo_a for 32x32 ue8m0 checkpoints through the FlyDSL mxscale BMM."""
+    return (
+        _wo_a_mx32_bmm is not None
+        and isinstance(quant_config, Fp8Config)
+        and quant_config.weight_block_size == [32, 32]
+        and getattr(quant_config, "scale_fmt", None) == "ue8m0"
+    )
+
 
 @functools.lru_cache(maxsize=1)
 def _fused_wo_a_arch_supported() -> bool:
@@ -843,6 +873,51 @@ bcg_deepseek_v4_low_ratio_sources = eager_on_graph(
 )
 
 
+def check_pp_stage_locality(
+    config, start_layer: int, end_layer: int, is_last_rank: bool
+) -> None:
+    """Raise if a PP stage reads compressed KV, index keys or candidates from a
+    layer on another stage, or hosts a DSpark capture layer off the last stage.
+    No cross-stage transfer exists for any of them."""
+    ratios = config.compress_ratios
+
+    def nearest_source(sources, layer_id, ratio=None):
+        found = [
+            s
+            for s in sources
+            if s <= layer_id and (ratio is None or ratios[s] == ratio)
+        ]
+        return max(found) if found else None
+
+    for layer_id in range(start_layer, end_layer):
+        ratio = ratios[layer_id]
+        if ratio not in (1, 2):
+            continue
+        needs = [
+            ("kv", nearest_source(config.kv_source_layer_ids, layer_id, ratio)),
+            ("index", nearest_source(config.index_source_layer_ids, layer_id)),
+        ]
+        if 0 <= config.candidate_source_layer_id < layer_id:
+            needs.append(("candidate", config.candidate_source_layer_id))
+        for kind, source in needs:
+            if source is not None and not start_layer <= source < end_layer:
+                raise ValueError(
+                    f"layer {layer_id} reads its {kind} source layer {source}, "
+                    f"outside PP stage [{start_layer}, {end_layer}); choose "
+                    "SGLANG_PP_LAYER_PARTITION so each source starts its stage"
+                )
+    capture = getattr(config, "dspark_target_layer_ids", None) or []
+    misplaced = [
+        layer_id
+        for layer_id in capture
+        if (start_layer <= layer_id < end_layer) != is_last_rank
+    ]
+    if misplaced:
+        raise ValueError(
+            f"DSpark capture layers {misplaced} must all be on the last PP stage"
+        )
+
+
 def deepseek_v4_engram_hash_ids(hasher, input_ids: torch.Tensor) -> torch.Tensor:
     # The hasher reads per-request rows, so it cannot run inside the CUDA graph.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
@@ -939,6 +1014,8 @@ class MqaAttentionBase(nn.Module):
         fp8: bool = (
             wo_a_fp8_gemm_enabled(quant_config) if wo_a_fp8 is None else wo_a_fp8
         )
+        # an explicit wo_a_fp8 (the DSpark draft passes False) keeps the caller's choice
+        mx32: bool = wo_a_fp8 is None and not fp8 and wo_a_fp8_mx32_enabled(quant_config)
         reduce_results: bool = (
             (self.attn_tp_size == get_parallel().tp_size and self.attn_tp_size > 1)
             if wo_b_reduce_results is None
@@ -947,7 +1024,7 @@ class MqaAttentionBase(nn.Module):
         # NPU arch35 runs wo_a as a batched MXFP8 GEMM instead of deep_gemm's FP8 one,
         # but it needs the same quantized weights.
         self.use_npu_arch35_mxfp8_wo_a = use_npu_arch35_mxfp8_wo_a(quant_config)
-        quantize_wo_a = fp8 or self.use_npu_arch35_mxfp8_wo_a
+        quantize_wo_a = fp8 or mx32 or self.use_npu_arch35_mxfp8_wo_a
         if wo_a_keeps_quant_config is None:
             keep_source_quant = (
                 quant_config is not None and quant_config.get_name() == "expert_pack"
@@ -962,6 +1039,7 @@ class MqaAttentionBase(nn.Module):
 
         self.fuse_wqa_wkv = fuse
         self.wo_a_fp8 = fp8
+        self.wo_a_fp8_mx32 = mx32
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
         self._attn_sink_local: Optional[torch.Tensor] = None
@@ -1017,7 +1095,7 @@ class MqaAttentionBase(nn.Module):
             self.wo_a._dsv4_npu_arch35_mxfp8_wo_a = True
             self.wo_a._dsv4_num_groups = self.n_local_groups
             self.wo_a._dsv4_o_lora_rank = self.o_lora_rank
-        elif fp8:
+        elif fp8 or mx32:
             self.wo_a.weight_scale_inv.format_ue8m0 = _FP8_WO_A_UE8M0
             # wo_a is quantized but never *applied* through its quant method:
             # the absorb GEMM in forward() reads .weight / .weight_scale_inv and
@@ -2862,6 +2940,8 @@ class MQALayer(MqaAttentionBase):
                     self.wo_a.weight_scale_inv.data,
                     recipe=recipe,
                 )
+            elif self.wo_a_fp8_mx32:
+                o = self._apply_wo_a_fp8_mx32(o, forward_batch)
             else:
                 wo_a_weight = getattr(self.wo_a, "weight", None)
                 if wo_a_weight is not None:
@@ -2900,6 +2980,42 @@ class MQALayer(MqaAttentionBase):
                     )
 
         return self._project_wo_b(o, defer_all_reduce)
+
+    def _apply_wo_a_fp8_mx32(self, o: torch.Tensor, forward_batch: ForwardBatch):
+        """o [T, G, D] bf16 @ fp8 wo_a through the FlyDSL 32x32 mxscale BMM; hands wo_b
+        the operand the bf16 route would hand it in this mode. Prefill keeps the served
+        bf16 route on the load-time bf16 copy (wo_a_bf16), so extend pays no debit."""
+        T, G, D = o.shape
+        R = self.o_lora_rank
+        mode = forward_batch.forward_mode
+        if mode.is_extend_without_speculative():
+            return _apply_wo_a_bf16_matmul(
+                o,
+                self.wo_a_bf16,
+                is_decode=False,
+                is_target_verify=False,
+                is_prefill=True,
+                fast_path=self.is_dsv41,
+                fp8_grid=_hip.wo_a_emits_fp8_grid(self),
+                emit_fp8=_hip.wo_b_emits_mxfp8(self, T),
+            )
+        if T == 0:
+            y = o.new_empty((0, G, R))
+        else:
+            o_q, o_s = _fp8_grid_quantize(o.reshape(T * G, D))
+            y = _wo_a_mx32_bmm(
+                o_q.view(T, G, D),
+                self.wo_a.weight.view(G, R, D),
+                o_s.view(T, G, D // 32),
+                self.wo_a.weight_scale_inv.data,
+                dtype=torch.bfloat16,
+            )
+        if mode.is_decode() or mode.is_target_verify():
+            if _hip.wo_b_emits_mxfp8(self, T):
+                return _Mxfp8Activation(*_fp8_grid_quantize(y.view(T, G * R)))
+            if _hip.wo_a_emits_fp8_grid(self):
+                return _Fp8GridActivation(_fake_quant_fp8_activation(y.view(T, G * R)))
+        return y
 
     def _project_wo_b(self, o, defer_all_reduce: bool = False):
         from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
@@ -3668,6 +3784,10 @@ class DeepseekV4Model(nn.Module):
             if _is_cuda
             else None,
         )
+        if self.pp_group.world_size > 1:
+            check_pp_stage_locality(
+                config, self.start_layer, self.end_layer, self.pp_group.is_last_rank
+            )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
@@ -3827,8 +3947,15 @@ class DeepseekV4Model(nn.Module):
         input_ids_global: torch.Tensor,
         capture_dspark: bool,
         dspark_aux_hidden_states: List[torch.Tensor],
+        prev_pre: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[LateLayerTail]]:
-        assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
+        # PP hands off (streams, pre) between stages; the late-layer tail is not wired.
+        assert self.pp_group.world_size == 1 or self.late_layer_start is None, (
+            "decoder SWA bounded replay does not run across PP stages"
+        )
+        assert (prev_pre is None) == self.pp_group.is_first_rank, (
+            "only a non-first PP stage receives the previous stage's pre-mix"
+        )
         hash_ids = None
         cp_extend = (
             is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
@@ -3900,7 +4027,7 @@ class DeepseekV4Model(nn.Module):
         # its producer update explicitly before these readers below.
         # mHC assumes full token rows per rank; LayerNorm SP needs its own path.
         assert not get_forward().sp_active
-        state = mhc.HcState(hidden_states)
+        state = mhc.HcState(hidden_states, prev_pre)
         if _is_cuda:
             residual_batch.start(forward_batch)
             hidden_states = residual_batch.set_written(state, forward_batch)
@@ -4244,6 +4371,7 @@ class DeepseekV4Model(nn.Module):
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        prev_pre = None
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -4260,6 +4388,12 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = hidden_states.view(
                     hidden_states.shape[0], self.hc_mult, self.hidden_size
                 )
+            if self.hc_pre_from_prev_sublayer:
+                # Static PP proxy buffers (graph runners, chunk sizer) carry no pre.
+                assert "prev_pre" in pp_proxy_tensors.tensors, (
+                    "PP proxy lacks prev_pre; run the non-first stage eagerly"
+                )
+                prev_pre = pp_proxy_tensors["prev_pre"]
 
         if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
@@ -4322,6 +4456,7 @@ class DeepseekV4Model(nn.Module):
                 input_ids_global,
                 capture_dspark,
                 dspark_aux_hidden_states,
+                prev_pre,
             )
         elif run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
@@ -4388,7 +4523,11 @@ class DeepseekV4Model(nn.Module):
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
-            return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
+            tensors = {"hidden_states": hidden_states.flatten(1)}
+            if self.hc_pre_from_prev_sublayer:
+                # The next stage's first combine weights the streams with this pre.
+                tensors["prev_pre"] = last_pre
+            return PPProxyTensors(tensors)
 
         pre_hc_head = hidden_states.flatten(1)
 
@@ -4860,9 +4999,54 @@ class DeepseekV4ForCausalLM(nn.Module):
                 attn.wo_a.weight_scale_inv.data = raw_scale.contiguous()
                 attn.wo_a.weight_scale_inv.format_ue8m0 = False
 
+    def _setup_fp8_mx32_wo_a(self, is_nextn: bool) -> None:
+        """Put each 32x32 fp8 wo_a in the FlyDSL mxscale BMM layout: weight [G*R, D]
+        16x16-preshuffled in place, scale as e8m0 exponent bytes [G, R/32, D/32]. Also
+        keeps the served bf16 dequant [G, R, D] as wo_a_bf16 for the prefill route."""
+        if is_nextn:
+            layers = [self.model.decoder]
+        else:
+            layers = [
+                self.model.layers[layer_id]
+                for layer_id in range(self.model.start_layer, self.model.end_layer)
+            ]
+        for layer in layers:
+            attn = layer.self_attn
+            if not getattr(attn, "wo_a_fp8_mx32", False):
+                continue
+            G, R = attn.n_local_groups, attn.o_lora_rank
+            D = attn.wo_a.weight.shape[1]
+            scale = attn.wo_a.weight_scale_inv.data
+            if scale.dtype == torch.uint8:
+                exponent = scale
+            else:
+                mantissa, exp = torch.frexp(scale.float())
+                assert bool((mantissa == 0.5).all()), (
+                    "DSV4 wo_a 32x32 scales must be powers of two for the e8m0 BMM"
+                )
+                exponent = (exp - 1 + 127).to(torch.uint8)
+            assert exponent.shape == (G * R // 32, D // 32), exponent.shape
+            block_scale = torch.exp2(exponent.float() - 127.0)
+            attn.wo_a_bf16 = (
+                (
+                    attn.wo_a.weight.data.float().view(G * R // 32, 32, D // 32, 32)
+                    * block_scale[:, None, :, None]
+                )
+                .to(torch.bfloat16)
+                .view(G, R, D)
+            )
+            attn.wo_a.weight.data = _wo_a_mx32_shuffle(
+                attn.wo_a.weight.data.view(G, R, D), layout=(16, 16)
+            ).view(G * R, D)
+            attn.wo_a.weight_scale_inv.data = exponent.contiguous().view(
+                G, R // 32, D // 32
+            )
+
     def post_load_weights(self, is_nextn=False, weight_names=None):
         if self.wo_a_fp8:
             self._setup_fp8_wo_a_scales(is_nextn)
+        elif wo_a_fp8_mx32_enabled(self.quant_config):
+            self._setup_fp8_mx32_wo_a(is_nextn)
 
         for module in self.modules():
             if isinstance(module, MQALayer):
@@ -5071,7 +5255,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         # Must mirror MQALayer.__init__'s `quantize_wo_a`: dequantizing wo_a here
         # while the layer allocated an FP8 parameter (or vice versa) fails the
         # weight loader's dtype check.
-        if not (self.wo_a_fp8 or use_npu_arch35_mxfp8_wo_a(self.quant_config)):
+        if not (
+            self.wo_a_fp8
+            or wo_a_fp8_mx32_enabled(self.quant_config)
+            or use_npu_arch35_mxfp8_wo_a(self.quant_config)
+        ):
             weights = _prepare_deepseek_v4_weights(weights, self.quant_config)
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
