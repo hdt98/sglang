@@ -1165,6 +1165,10 @@ class Envs:
     SGLANG_AITER_MLA_VERIFY_BACKEND = EnvStr("asm")
     # Let aiter plan the KV splits for the asm persistent MLA decode.
     SGLANG_AITER_MLA_AUTO_KV_SPLITS = EnvBool(False)
+    # KV split caps for the DCP cp verify kernel, as JSON
+    # {"<verify tokens per request>": {"<batch>": <cap>}}. Shapes not
+    # listed keep the planned count.
+    SGLANG_AITER_MLA_CPRR_VERIFY_SPLIT_CAPS = EnvJSON(None)
     # Run gfx942 block-FP8 linears with the AITER CK blockscale GEMM instead of Triton.
     SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK = EnvBool(True)
 

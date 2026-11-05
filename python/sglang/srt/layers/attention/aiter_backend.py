@@ -408,6 +408,17 @@ def _unified_extend_q(q: torch.Tensor, num_heads: int, head_dim: int) -> torch.T
     return q.contiguous().view(-1, num_heads, head_dim)
 
 
+def _parse_cprr_verify_split_caps(
+    split_caps: Optional[dict], num_draft_tokens: Optional[int]
+) -> dict[int, int]:
+    if split_caps is None or num_draft_tokens is None:
+        return {}
+    return {
+        int(batch): int(cap)
+        for batch, cap in split_caps.get(str(num_draft_tokens), {}).items()
+    }
+
+
 class AiterAttnBackend(AttentionBackend):
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.
@@ -481,6 +492,10 @@ class AiterAttnBackend(AttentionBackend):
         # buffer.
         self.cprr_fast_mode = True
         self.cprr_intra_batch_mode = False
+        self.cprr_verify_split_caps = _parse_cprr_verify_split_caps(
+            envs.SGLANG_AITER_MLA_CPRR_VERIFY_SPLIT_CAPS.get(),
+            self.num_draft_tokens,
+        )
         gathered_heads = self.num_head * self.dcp_world_size
         self.cprr_kernel_heads = _asm_cprr_kernel_heads(
             gathered_heads, self.num_draft_tokens or 1
@@ -1669,6 +1684,17 @@ class AiterAttnBackend(AttentionBackend):
             return 1
         return int(seq_lens.max().item())
 
+    def _cprr_verify_split_cap(self, bs: int) -> Optional[int]:
+        """The metadata split cap for a cp verify batch of bs requests."""
+        return self.cprr_verify_split_caps.get(bs, self.max_split_per_batch)
+
+    def _cprr_verify_num_kv_splits(
+        self, bs: int, *, use_asm_cprr_verify: bool
+    ) -> Optional[int]:
+        if use_asm_cprr_verify:
+            return self._cprr_verify_split_cap(bs)
+        return self.max_split_per_batch
+
     def _kernel_num_kv_splits(self) -> Optional[int]:
         """The split count for a decode kernel call, None to let aiter pick.
 
@@ -2572,7 +2598,10 @@ class AiterAttnBackend(AttentionBackend):
                         ),
                     )
 
-                    num_kv_splits = self.max_split_per_batch
+                    num_kv_splits = self._cprr_verify_num_kv_splits(
+                        bs,
+                        use_asm_cprr_verify=use_asm_cprr_verify,
+                    )
 
                     self.make_mla_meta_data(
                         qo_indptr,
@@ -3397,7 +3426,10 @@ class AiterAttnBackend(AttentionBackend):
                 if _use_mla_ps_kernel and (
                     self.dcp_world_size <= 1 or use_asm_cprr_verify
                 ):
-                    num_kv_splits = self.max_split_per_batch
+                    num_kv_splits = self._cprr_verify_num_kv_splits(
+                        bs,
+                        use_asm_cprr_verify=use_asm_cprr_verify,
+                    )
                     is_cp_round_robin = self.dcp_world_size > 1
 
                     self.make_mla_meta_data(
