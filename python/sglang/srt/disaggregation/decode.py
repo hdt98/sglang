@@ -3224,6 +3224,13 @@ class SchedulerDisaggregationDecodeMixin:
             page_indices_gpu = page_indices_for_request(self, req, seq_len)
             state_indices = state_indices_for_request(self, req, seq_len)
             actual = computer.compute(page_indices_gpu, state_indices)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "PD KV checksum decode req=%s expected=%#x actual=%#x",
+                    req.rid,
+                    expected,
+                    actual,
+                )
             if actual == expected:
                 verified.append(i)
                 continue

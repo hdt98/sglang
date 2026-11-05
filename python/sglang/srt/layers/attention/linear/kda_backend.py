@@ -1510,16 +1510,28 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # other batch/architecture combinations are measured. The snapshot
             # path and the separate CuTe path are unchanged.
             return False
-        if is_hip() and not (
-            is_gfx95_supported()
-            and 1 <= batch_size <= 16
-            and draft_token_num in (6, 8)
-            and mixed_qkv.dtype == torch.bfloat16
-            and layer.conv_weights.dtype == torch.float32
-        ):
-            # measured gfx950 wins only: larger batches lose the launch saving to
-            # duplicated convolution work
-            return False
+        if is_hip():
+            measured_gfx950_t6_t8 = (
+                is_gfx95_supported()
+                and 1 <= batch_size <= 16
+                and draft_token_num in (6, 8)
+                and mixed_qkv.dtype == torch.bfloat16
+                and layer.conv_weights.dtype == torch.float32
+            )
+            measured_kimi_t4 = (
+                is_gfx95_supported()
+                and 1 <= batch_size <= 4
+                and draft_token_num == 4
+                and layer.num_q_heads == layer.num_k_heads == layer.num_v_heads == 12
+                and layer.head_q_dim == layer.head_k_dim == layer.head_v_dim == 128
+                and mixed_qkv.dtype == torch.bfloat16
+                and layer.conv_weights.dtype == torch.float32
+                and ssm_states.dtype == torch.float32
+            )
+            if not (measured_gfx950_t6_t8 or measured_kimi_t4):
+                # Larger batches lose the launch saving to duplicated
+                # convolution work. T4 is limited to the measured Kimi shape.
+                return False
         expected_dim = (
             2 * layer.num_q_heads * layer.head_k_dim
             + layer.num_v_heads * layer.head_v_dim

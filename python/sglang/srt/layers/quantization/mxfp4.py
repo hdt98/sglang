@@ -147,11 +147,23 @@ _flashinfer_mxfp4_permute_indices_device_cache: dict[
 ] = {}
 
 
+def _aiter_situ_layout_contract() -> tuple[bool, str]:
+    """Return SiTUv2 weight interleaving and the GateMode member name."""
+    a8w4 = os.environ.get("AITER_SITUV2_A8W4", "0") == "1"
+    a4w4 = os.environ.get("AITER_SITUV2_A4W4", "0") == "1"
+    weight_interleave = a8w4 or not a4w4
+    gate_mode_name = "INTERLEAVE" if a8w4 else "SEPARATED"
+    return weight_interleave, gate_mode_name
+
+
 def _aiter_situ_uses_gu_interleaved_weights() -> bool:
-    """Match AITER's SiTU activation-mode precedence when choosing weight layout."""
-    a8w4 = get_bool_env_var("AITER_SITUV2_A8W4", "false")
-    a4w4 = get_bool_env_var("AITER_SITUV2_A4W4", "false")
-    return a8w4 or not a4w4
+    return _aiter_situ_layout_contract()[0]
+
+
+def _aiter_situ_uses_a8w4() -> bool:
+    """Match AITER's SiTU activation-mode precedence: A8W4 wins over A4W4, and
+    gfx1250 overrides it with fp4 activations."""
+    return is_gfx95_supported() and get_bool_env_var("AITER_SITUV2_A8W4", "false")
 
 
 def _get_flashinfer_mxfp4_device_permute_indices(
@@ -1777,6 +1789,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             x_padded = torch.nn.functional.pad(
                 x, (0, self.hidden_pad), mode="constant", value=0.0
             )
+        fused_moe_kwargs = None
+        if self.moe_runner_config.activation == "situ":
+            from aiter.ops.flydsl.moe_common import GateMode
+
+            gate_mode_name = _aiter_situ_layout_contract()[1]
+            fused_moe_kwargs = {"gate_mode": getattr(GateMode, gate_mode_name).value}
         quant_info = AiterMoeQuantInfo(
             w13_weight=w13_weight,
             w2_weight=w2_weight,
@@ -1801,6 +1819,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     or 0.0
                 )
             ),
+            fused_moe_kwargs=fused_moe_kwargs,
         )
         return self.runner.run(
             dispatch_output._replace(hidden_states=x_padded), quant_info

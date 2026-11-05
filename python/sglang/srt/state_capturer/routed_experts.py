@@ -161,6 +161,20 @@ def extract_routed_experts_from_meta_info(data):
     return routed_experts
 
 
+def resolve_routed_experts_start_len(start_len: int, prompt_tokens: int) -> int:
+    """Resolve the requested routed-expert start position.
+
+    ``-1`` requests the generated-token tail: the prompt length. This avoids
+    returning the full prompt's routes when a caller only needs decode routes.
+    Other values pass through unchanged; the scheduler validates their bounds.
+    """
+    if start_len != -1:
+        return start_len
+    if prompt_tokens < 0:
+        raise ValueError("prompt_tokens must be nonnegative")
+    return prompt_tokens
+
+
 def disable_routed_experts_capture_for_draft(model: Any) -> None:
     """Opt every draft MoE ``TopK`` out of routed-experts (R3) capture.
 

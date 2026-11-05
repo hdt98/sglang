@@ -1469,6 +1469,12 @@ class SchedulerDisaggregationPrefillMixin:
                 page_indices_gpu = page_indices_for_request(self, req, end_idx)
                 state_indices = state_indices_for_request(self, req, end_idx)
                 value = computer.compute(page_indices_gpu, state_indices)
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "PD KV checksum prefill req=%s digest=%#x",
+                        req.rid,
+                        value,
+                    )
             self.disagg_metadata_buffers.set_kv_checksum(req, value)
         self._send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
 

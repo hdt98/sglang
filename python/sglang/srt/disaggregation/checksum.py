@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import List, Optional, Sequence
 
 import torch
@@ -11,6 +12,8 @@ from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPoo
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
 NestedInts = Sequence[int] | Sequence[Sequence[int]]
+
+logger = logging.getLogger(__name__)
 
 
 def _flatten_ints(values: NestedInts) -> list[int]:
@@ -48,7 +51,7 @@ def state_indices_for_request(
 ) -> Optional[torch.Tensor]:
     pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
     if isinstance(pool, HybridLinearKVPool):
-        return (
+        indices = (
             scheduler.req_to_token_pool.req_index_to_mamba_index_mapping[
                 req.kv.req_pool_idx
             ]
@@ -56,6 +59,14 @@ def state_indices_for_request(
             .contiguous()
             .reshape(-1)
         )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Mamba state indices req=%s room=%s indices=%s",
+                req.rid,
+                req.bootstrap_room,
+                indices.tolist(),
+            )
+        return indices
     if isinstance(pool, SWAKVPool):
         page_size = scheduler.token_to_kv_pool_allocator.page_size
         window_size = scheduler.sliding_window_size

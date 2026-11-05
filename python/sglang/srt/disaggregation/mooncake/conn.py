@@ -2258,6 +2258,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_addr = dst_state_ptr + length * int(dst_mamba_index[0])
             transfer_blocks.append((src_addr, dst_addr, length))
 
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Mamba state transfer session=%s room=%s src_slot=%s dst_slot=%s "
+                "blocks=%d bytes=%d",
+                req.mooncake_session_id,
+                getattr(req, "room", None),
+                prefill_mamba_index[0],
+                dst_mamba_index[0],
+                len(transfer_blocks),
+                sum(block[2] for block in transfer_blocks),
+            )
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
     def _send_mamba_state_slice(
