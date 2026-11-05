@@ -45,6 +45,32 @@ KDA_VERIFY_BLOCK_V = 4
 # gfx950 V-tile width for the measured GLM TP4 shapes: wider tiles share the q/k
 # convolution across more lanes
 KDA_VERIFY_BLOCK_V_HIP = 16
+# gfx950 V-tile width for the 12-head Kimi rank shape at T=4 above batch 4:
+# BV 16 at num_warps 1 is bit-exact with BV 4 and 29% faster at batch 16.
+KDA_VERIFY_BLOCK_V_HIP_T4 = 16
+
+
+def _kda_verify_t4_hip_tile_applies(
+    *,
+    B: int,
+    T: int,
+    H: int,
+    HV: int,
+    K: int,
+    V: int,
+    conv_weight_dtype: torch.dtype,
+    num_warps: int,
+    is_hip: bool,
+) -> bool:
+    return (
+        is_hip
+        and num_warps == 1
+        and T == 4
+        and H == HV == 12
+        and K == V == 128
+        and conv_weight_dtype == torch.float32
+        and 5 <= B <= 16
+    )
 
 
 @triton.jit
@@ -503,6 +529,18 @@ def fused_kda_conv_gating_verify(
         and 3 <= B <= 16
     ):
         BV = KDA_VERIFY_BLOCK_V_HIP
+    if _kda_verify_t4_hip_tile_applies(
+        B=B,
+        T=T,
+        H=H,
+        HV=HV,
+        K=K,
+        V=V,
+        conv_weight_dtype=conv_weight.dtype,
+        num_warps=num_warps,
+        is_hip=is_hip_runtime(),
+    ):
+        BV = KDA_VERIFY_BLOCK_V_HIP_T4
     NV = triton.cdiv(V, BV)
 
     a2 = a.reshape(seq_len, HV * K)
