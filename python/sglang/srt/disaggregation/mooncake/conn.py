@@ -57,9 +57,12 @@ from sglang.srt.disaggregation.utils import (
     compute_mamba_state_slice_byte_blocks,
     filter_kv_indices_for_shard_rank,
     is_elided_entry,
+    pack_state_component_types,
     resolve_dcp_dst_entry_indices,
+    resolve_state_component_dst_index_by_type,
     should_send_replicated_state,
     slice_dsa_tail_dst_ptrs_for_pp,
+    unpack_state_component_types,
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
@@ -82,7 +85,54 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import is_hip
 from sglang.srt.utils.network import NetworkAddress
+
+
+def hip_allocation_range(ptr: int) -> Optional[Tuple[int, int]]:
+    """(base, size) of the HIP allocation containing ``ptr``, or None for
+    non-device memory. Mooncake's HIP IPC transport maps a peer buffer at its
+    allocation base but addresses it from the registered pointer, so a
+    suballocated pointer receives writes (ptr - base) bytes low."""
+    import ctypes
+
+    lib = ctypes.CDLL("libamdhip64.so")
+    fn = lib.hipMemGetAddressRange
+    fn.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_void_p,
+    ]
+    fn.restype = ctypes.c_int
+    base, size = ctypes.c_void_p(), ctypes.c_size_t()
+    if fn(ctypes.byref(base), ctypes.byref(size), ctypes.c_void_p(ptr)) != 0:
+        lib.hipGetLastError()  # host memory: clear the latched error
+        return None
+    return base.value, size.value
+
+
+def to_hip_allocation_regions(
+    regions: List[Tuple[int, int]], allocation_range=hip_allocation_range
+) -> List[Tuple[int, int]]:
+    """Replace each device region by its whole allocation, deduped by base."""
+    out: List[Tuple[int, int]] = []
+    seen: Set[int] = set()
+    for ptr, length in regions:
+        found = allocation_range(ptr)
+        if found is None:
+            ptr_base, ptr_len = ptr, length
+        else:
+            ptr_base, ptr_len = found
+            if not (ptr_base <= ptr and ptr + length <= ptr_base + ptr_len):
+                raise RuntimeError(
+                    f"PD region {ptr:#x}+{length} outside its HIP allocation "
+                    f"{ptr_base:#x}+{ptr_len}"
+                )
+        if ptr_base not in seen:
+            seen.add(ptr_base)
+            out.append((ptr_base, ptr_len))
+    return out
+
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +219,9 @@ class KVArgsRegisterInfo:
     dst_state_dim_per_tensor: List[List[int]]
     dst_kv_layer_ids: List[int]
     dst_state_layer_ids: List[List[int]]
+    dst_state_component_types: List[StateType] = dataclasses.field(
+        default_factory=list
+    )
     dst_dcp_size: int = 1
     dst_dcp_rank: int = 0
     requires_dcp_relayout: bool = False
@@ -229,6 +282,9 @@ class KVArgsRegisterInfo:
                 list(struct.unpack(f"{len(msg[20]) // 8}Q", msg[20]))
                 if len(msg) > 20 and msg[20]
                 else []
+            ),
+            dst_state_component_types=(
+                unpack_state_component_types(msg[21]) if len(msg) > 21 else []
             ),
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 15, slot_ids_index=19),
@@ -434,6 +490,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
         ):
             add(ptrs, lens)
+        if is_hip():
+            regions = to_hip_allocation_regions(regions)
         return regions
 
     def register_buffer_to_engine(self):
@@ -980,14 +1038,22 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             if not self._is_generic_kvcache_state_type(st):
                 # Mamba, DSA tail and MiniMax send paths check their own layout.
                 continue
+            try:
+                j = resolve_state_component_dst_index_by_type(
+                    state_types,
+                    getattr(registration_info, "dst_state_component_types", []),
+                    i,
+                )
+            except RuntimeError as e:
+                return False, str(e)
             dst_data_ptrs = (
-                registration_info.dst_state_data_ptrs[i]
-                if i < len(registration_info.dst_state_data_ptrs)
+                registration_info.dst_state_data_ptrs[j]
+                if j < len(registration_info.dst_state_data_ptrs)
                 else []
             )
             dst_item_lens = (
-                registration_info.dst_state_item_lens[i]
-                if i < len(registration_info.dst_state_item_lens)
+                registration_info.dst_state_item_lens[j]
+                if j < len(registration_info.dst_state_item_lens)
                 else []
             )
             if not dst_data_ptrs or not dst_item_lens:
@@ -1011,8 +1077,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         else []
                     ),
                     dst_layer_ids=(
-                        registration_info.dst_state_layer_ids[i]
-                        if i < len(registration_info.dst_state_layer_ids)
+                        registration_info.dst_state_layer_ids[j]
+                        if j < len(registration_info.dst_state_layer_ids)
                         else []
                     ),
                 )
@@ -1995,32 +2061,41 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             src_state_layer_ids = (
                 src_state_layer_ids[i] if i < len(src_state_layer_ids) else []
             )
+            # PP prefill stages register different component lists; pair by type.
+            j = i
             if target_rank_registration_info is not None:
+                j = resolve_state_component_dst_index_by_type(
+                    state_types,
+                    getattr(
+                        target_rank_registration_info, "dst_state_component_types", []
+                    ),
+                    i,
+                )
                 dst_data_ptrs = (
-                    target_rank_registration_info.dst_state_data_ptrs[i]
-                    if i < len(target_rank_registration_info.dst_state_data_ptrs)
+                    target_rank_registration_info.dst_state_data_ptrs[j]
+                    if j < len(target_rank_registration_info.dst_state_data_ptrs)
                     else []
                 )
                 dst_item_lens = (
-                    target_rank_registration_info.dst_state_item_lens[i]
-                    if i < len(target_rank_registration_info.dst_state_item_lens)
+                    target_rank_registration_info.dst_state_item_lens[j]
+                    if j < len(target_rank_registration_info.dst_state_item_lens)
                     else []
                 )
                 dst_dim_per_tensor = (
-                    target_rank_registration_info.dst_state_dim_per_tensor[i]
-                    if i < len(target_rank_registration_info.dst_state_dim_per_tensor)
+                    target_rank_registration_info.dst_state_dim_per_tensor[j]
+                    if j < len(target_rank_registration_info.dst_state_dim_per_tensor)
                     else []
                 )
                 dst_state_layer_ids = (
-                    target_rank_registration_info.dst_state_layer_ids[i]
-                    if i < len(target_rank_registration_info.dst_state_layer_ids)
+                    target_rank_registration_info.dst_state_layer_ids[j]
+                    if j < len(target_rank_registration_info.dst_state_layer_ids)
                     else []
                 )
             else:
                 dst_data_ptrs, dst_item_lens, dst_dim_per_tensor = [], [], []
                 dst_state_layer_ids = []
             dst_indices = (
-                req.dst_state_indices[i] if i < len(req.dst_state_indices) else []
+                req.dst_state_indices[j] if j < len(req.dst_state_indices) else []
             )
 
             if st == StateType.MAMBA:
@@ -3317,6 +3392,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 f"{len(self.kv_args.kv_item_lens)}Q",
                 *self.kv_args.kv_item_lens,
             ),
+            pack_state_component_types(self.kv_args.state_types),
         ]
 
     def build_receiver_metadata_message(
