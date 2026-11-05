@@ -1,0 +1,101 @@
+{
+  "schema_version": "dsv41_lever_groups.v1",
+  "image_commit": "e262b44eef1f2bf83e34345276e2bb91a086587e",
+  "commits": [
+    {
+      "name": "fastokens",
+      "mount_indices": [0],
+      "result": "pd_c64_20261021/RESULT_pd1p1d_c192_r38_gamma_2367_20261105.md"
+    },
+    {
+      "name": "prefill-complete-nospec",
+      "mount_indices": [1, 23, 24],
+      "result": "pd_c64_20261021/RESULT_pd1p1d_pp2_c192_moecfg3.md"
+    },
+    {
+      "name": "pp2-prefill",
+      "mount_indices": [2, 4],
+      "result": "pd_c64_20261021/RESULT_pd1p1d_pp2_c128_spf_r2.md"
+    },
+    {
+      "name": "pd-acceptance-fix",
+      "mount_indices": [3, 5],
+      "result": "pd_c64_20261021/RESULT_fix_mooncake_alloc_base.md"
+    },
+    {
+      "name": "final-kv-overlap",
+      "mount_indices": [6, 7, 13],
+      "result": "pd_c64_20261021/pd_pp_final_kv_overlap_20261102/RESULT_pd1p1d_c192_pp_final_kv_overlap_r1_20261102.md"
+    },
+    {
+      "name": "opus-serve",
+      "mount_indices": [8],
+      "result": "pd_c64_20261021/RESULT_pp2_punit_opus.md"
+    },
+    {
+      "name": "mla4w-prefill",
+      "mount_indices": [9],
+      "result": "pd_c64_20261021/RESULT_mla4w_c96_20261102.md"
+    },
+    {
+      "name": "pp2-stackd-wo-a",
+      "mount_indices": [10],
+      "result": "l3_stack_20261024/RESULT_stack_r2.md"
+    },
+    {
+      "name": "stack-r2-mxfp8-preshuffle",
+      "mount_indices": [11, 12, 14],
+      "result": "l3_mxfp8_preshuffle_20261023/RESULT.md"
+    },
+    {
+      "name": "mxfp8-wire",
+      "mount_indices": [15, 17, 18, 19],
+      "result": "l3_mxfp8_wire_20261024/gang/RESULT_wire_gang_r2.md"
+    },
+    {
+      "name": "rs-hcpost",
+      "mount_indices": [16],
+      "result": "l3_rs_hcpost_20261024/RESULT_frs.md"
+    },
+    {
+      "name": "mega-mhc",
+      "mount_indices": [20, 21],
+      "result": "pd_c64_20261021/RESULT_pp2_punit_megamhc.md"
+    },
+    {
+      "name": "moe-config",
+      "mount_indices": [22],
+      "result": "pd_c64_20261021/RESULT_pd1p1d_pp2_c128_opus_stackwire_mega_moecfg3.md"
+    },
+    {
+      "name": "ar-copy-in",
+      "mount_indices": [25],
+      "result": "pd_c64_20261021/RESULT_pd1p1d_pp2_c160_moecfg3_r4_arguard_ready_beta_b257_r2.md"
+    }
+  ],
+  "composite_units": [
+    {
+      "name": "stack_r2 kernels",
+      "components": [
+        "pp2-stackd-wo-a",
+        "stack-r2-mxfp8-preshuffle",
+        "rs-hcpost"
+      ],
+      "reason": "The serving pair banked wo_a fp8, MXFP8 preshuffle, staged gather, F-RS and the engram layout as one composite unit. The source overlays remain separable for code ownership even though the bank was composite."
+    }
+  ],
+  "not_present_in_final_26": [
+    {
+      "name": "mega_mx",
+      "reason": "The served-form component was priced, but it is not mounted by either final c160/c192 r38 recipe. No code is silently attributed or imported."
+    }
+  ],
+  "primary_banked_runtime": {
+    "run_root": "/data/sonle5/dsv41_restage_20261019/pd_c64_20261021/pd1p1d_c192_r38_gamma_2367_20261105/runs/pd1p1d_c192_r38_gamma_2367_20261105_beta_unpinned_20261105T044606Z",
+    "result": "pd_c64_20261021/RESULT_pd1p1d_c192_r38_gamma_2367_20261105.md",
+    "result_sha256": "458a835cfd1076151f3e0a098a839a1aa2de6aca6e2111befaa3684c1b841670",
+    "seal": "pd_c64_20261021/pd1p1d_c192_r38_gamma_2367_20261105/SEAL_pd1p1d_c192_r38_gamma_2367_20261105.json",
+    "seal_sha256": "d8a7d8d4c87c9ebe1e86012725e9f75b309c66566bccfcd9c1b77779fe430a32",
+    "observed": "1813.3 plateau tok/s/GPU, 1774.8 ms mean TTFT, 10.292525 ms request-mean ITL, matched B300 ratio 0.69203"
+  }
+}
