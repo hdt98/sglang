@@ -379,7 +379,10 @@ from sglang.srt.speculative.spec_sampling_mask import (
 )
 from sglang.srt.speculative.uno_validation import validate_uno_request
 from sglang.srt.state_capturer.indexer_topk import destroy_global_indexer_capturer
-from sglang.srt.state_capturer.routed_experts import destroy_global_experts_capturer
+from sglang.srt.state_capturer.routed_experts import (
+    destroy_global_experts_capturer,
+    resolve_routed_experts_start_len,
+)
 from sglang.srt.utils import (
     DynamicGradMode,
     configure_gc_logger,
@@ -3144,6 +3147,11 @@ class Scheduler(
         *,
         mm_input_error: Optional[str] = None,
     ):
+        if recv_req.return_routed_experts:
+            recv_req.routed_experts_start_len = resolve_routed_experts_start_len(
+                recv_req.routed_experts_start_len,
+                len(recv_req.input_ids),
+            )
         # Route: normal request / session request / session-not-found
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
