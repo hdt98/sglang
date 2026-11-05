@@ -1354,6 +1354,42 @@ def append_state_component(
     kv_args.state_layer_ids.append(layer_ids or [])
 
 
+def pack_state_component_types(state_types) -> bytes:
+    return ",".join(state_type.value for state_type in state_types).encode("ascii")
+
+
+def unpack_state_component_types(data: bytes):
+    from sglang.srt.disaggregation.base.conn import StateType
+
+    if not data:
+        return []
+    return [StateType(value) for value in data.decode("ascii").split(",")]
+
+
+def resolve_state_component_dst_index_by_type(
+    src_state_types, dst_state_types, src_index: int
+) -> int:
+    """Decode component index for a prefill component: the n-th component of a
+    state type pairs with the decode peer's n-th component of that type.
+
+    PP prefill stages register different component lists (only some stages
+    hold request state or the draft), so position alone can pair unrelated
+    state. Identical lists pair positionally. Peers that publish no types keep
+    positional pairing.
+    """
+    if not dst_state_types:
+        return src_index
+    state_type = src_state_types[src_index]
+    occurrence = src_state_types[:src_index].count(state_type)
+    dst_indices = [j for j, st in enumerate(dst_state_types) if st == state_type]
+    if occurrence >= len(dst_indices):
+        raise RuntimeError(
+            f"Decode peer registers {len(dst_indices)} {state_type} state "
+            f"component(s); prefill sends at least {occurrence + 1}"
+        )
+    return dst_indices[occurrence]
+
+
 def get_dsa_tail_state_indices(pool, req_pool_idx: int, seq_len: int) -> List[int]:
     if getattr(pool, "use_dsa", False):
         pool = pool.full_kv_pool
@@ -1619,25 +1655,24 @@ def _token_kv_view(token_to_kv_pool):
 
 
 def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
-    """Describe the positional transfer layout without pool capacities or pointers."""
+    """The model-wide DSpark transfer contract both PD roles must share.
+
+    Per-entry layouts differ across PP prefill stages; entries pair by layer
+    id and components by state type, so only stage-invariant fields go here.
+    """
     ratios = getattr(kv_args, "mla_compression_ratios", None) or []
     if 2 not in ratios or str(get_spec().speculative_algorithm).upper() != "DSPARK":
         return None
 
     from sglang.srt.disaggregation.base.conn import StateType
 
-    if kv_args.state_types.count(StateType.SWA) != 2:
-        raise RuntimeError(
-            "DeepSeek-V4.1 DSpark PD requires target and draft SWA state"
-        )
+    if StateType.SWA not in kv_args.state_types:
+        raise RuntimeError("DeepSeek-V4.1 DSpark PD requires SWA state")
 
     return {
+        "protocol_version": 2,
         "num_draft_tokens": get_spec().speculative_num_draft_tokens,
         "compression_ratios": list(ratios),
-        "kv_layer_ids": list(kv_args.kv_layer_ids),
-        "kv_item_lens": list(kv_args.kv_item_lens),
-        "state_types": [state_type.value for state_type in kv_args.state_types],
-        "state_item_lens": [list(items) for items in kv_args.state_item_lens],
     }
 
 

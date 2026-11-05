@@ -426,7 +426,11 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             cfg.dsv4_attn_backend == "trtllm" and cfg.enable_encoder_swa_bounded_replay,
         ),
         ("two-batch overlap", cfg.enable_two_batch_overlap),
-        ("pipeline parallelism", cfg.pp_size > 1),
+        # PP carries the mHC pre-mix across stages only on a PD prefill unit.
+        (
+            "pipeline parallelism outside PD prefill",
+            cfg.pp_size > 1 and cfg.disaggregation_mode != "prefill",
+        ),
     )
     for feature, enabled in unsupported:
         if enabled:
@@ -485,6 +489,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 )
             ),
         ),
+        # The late-layer tail is not handed across PP stages.
+        ("pipeline parallelism", cfg.pp_size > 1),
     )
     if cfg.enable_decoder_swa_bounded_replay:
         for feature, unsupported in incompatible:
