@@ -89,6 +89,31 @@ def _renorm_from_pivots(probs_fp32: torch.Tensor, pivots: torch.Tensor) -> torch
     return out
 
 
+_ROW_CUMSUM_LOGGED = False
+
+
+def _row_cumsum(values: torch.Tensor) -> torch.Tensor:
+    """Inclusive per-row prefix sum computed as 1024-wide chunk scans.
+
+    ``torch.cumsum`` on a few rows of a 200K vocabulary runs as one long scan
+    per row and dominated the batch-1 verify step (442 us for 8 rows on MI355X,
+    m31 trace-r8). Chunk scans plus a scan of the chunk totals expose
+    rows x chunks parallelism; only the floating-point summation order differs.
+    """
+    global _ROW_CUMSUM_LOGGED
+    if not _ROW_CUMSUM_LOGGED:
+        _ROW_CUMSUM_LOGGED = True
+        # Served-path activation evidence for the recipe's activation_patterns.
+        print("m31-overlay-active: renorm_triton chunked cumsum", flush=True)
+    rows, vocab_size = values.shape
+    pad = (-vocab_size) % _BLOCK_SIZE
+    chunks = torch.nn.functional.pad(values, (0, pad)).view(rows, -1, _BLOCK_SIZE)
+    local = torch.cumsum(chunks, dim=-1)
+    totals = local[..., -1]
+    offsets = torch.cumsum(totals, dim=-1) - totals
+    return (local + offsets.unsqueeze(-1)).view(rows, -1)[:, :vocab_size].contiguous()
+
+
 def top_p_renorm_probs_triton(
     probs: torch.Tensor, top_p: Union[torch.Tensor, float]
 ) -> torch.Tensor:
@@ -122,7 +147,7 @@ def top_p_renorm_probs_triton(
     # Match FlashInfer's threshold semantics: sort ascending, discard the prefix
     # whose cumulative mass is below 1 - p, and retain all ties at the pivot.
     sorted_probs = torch.sort(probs_fp32, dim=-1).values
-    cdf = torch.cumsum(sorted_probs, dim=-1)
+    cdf = _row_cumsum(sorted_probs)
     cutoff = torch.searchsorted(cdf, (1.0 - top_ps).unsqueeze(1), right=False).squeeze(
         1
     )
