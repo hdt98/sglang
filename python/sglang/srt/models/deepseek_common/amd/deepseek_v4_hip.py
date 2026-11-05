@@ -183,7 +183,10 @@ def init_decoder_layer(layer, quant_config) -> None:
     layer._wqkv_a_native_consumer_checked = False
     layer._wqkv_a_native_consumer = False
     layer.hc_boundary_fused = (
-        _is_gfx95_supported and layer.hc_pre_from_prev_sublayer and layer.hc_mult == 4
+        _is_gfx95_supported
+        and layer.hc_pre_from_prev_sublayer
+        and layer.hc_mult == 4
+        and not envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.get()
     )
 
 
