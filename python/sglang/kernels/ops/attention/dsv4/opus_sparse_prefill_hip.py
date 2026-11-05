@@ -15,6 +15,31 @@ import triton.language as tl
 # (int32 indices, int32 indptr [T + 1])
 Csr = Tuple[torch.Tensor, torch.Tensor]
 
+# Activation evidence for the aiter PR #6927 module overlay: one line per process
+# on the first H>32 dispatch, naming the sha of the module file that serves it.
+_PR6927_MODULE = "/sgl-workspace/aiter/aiter/jit/module_mla_v4_prefill_opus.so"
+_PR6927_SHA = "648ee1d230313e9538de3c9d3c82da3d2700c30ebe5df7139c34c8d4df6eda74"
+_pr6927_reported = False
+
+
+def _report_pr6927_module(num_heads: int) -> None:
+    global _pr6927_reported
+    if _pr6927_reported or num_heads <= 32:
+        return
+    _pr6927_reported = True
+    import hashlib
+    import os
+    import sys
+
+    with open(_PR6927_MODULE, "rb") as f:
+        sha = hashlib.sha256(f.read()).hexdigest()
+    verdict = "ACTIVE" if sha == _PR6927_SHA else "REFUSE"
+    print(
+        f"[OPUS-PR6927] {verdict} H={num_heads} module_sha={sha} pid={os.getpid()}",
+        file=sys.stderr,
+        flush=True,
+    )
+
 
 @triton.jit
 def _combined_to_csr_kernel(
@@ -82,6 +107,7 @@ def opus_sparse_prefill(
     csr, then those of extend_kv named by extend_csr, with a per-head sink."""
     from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_opus
 
+    _report_pr6927_module(q.shape[1])
     indices, indptr = csr
     if extend_kv is None:
         # every query reads an empty row of the unused extend source
