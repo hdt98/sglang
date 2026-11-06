@@ -16,6 +16,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     mamba_cache_chunk_size,
+    mamba_checkpoint_grid,
 )
 from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
 
@@ -589,6 +590,10 @@ class _PrefillAdmission:
     max_new_tokens: int
     is_chunked: bool
     replay_len: int
+    # Tokens a truncated cut gave up to land on the mamba checkpoint grid.
+    # They stay charged to the compute budgets, so the slack cannot start a
+    # second unfinished prefill.
+    grid_slack: int = 0
 
 
 def mamba_prefill_chunk_grid() -> int:
@@ -634,11 +639,16 @@ class PrefillAdder:
         request_retirer: Optional[RequestRetirer] = None,
     ):
         self.page_size = page_size
-        # DCP donates a checkpoint only on the kernel chunk grid. A cut off
-        # that grid costs the request every later donation, so keep it there.
-        # Without DCP the prefix-relative depth rule already donates, and
-        # rounding would only shorten the chunk.
-        self.mamba_chunk_grid = mamba_prefill_chunk_grid()
+        # DCP donates a checkpoint only on the kernel chunk grid at a depth
+        # the radix tree can name. A cut off that grid costs the request
+        # every later donation, so keep it there. Without DCP the
+        # prefix-relative depth rule already donates, and rounding would only
+        # shorten the chunk.
+        self.mamba_chunk_grid = (
+            mamba_checkpoint_grid(tree_cache.page_size)
+            if mamba_prefill_chunk_grid() > 1
+            else 1
+        )
         self.prefill_tile_block_m = prefill_tile_block_m
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -846,16 +856,22 @@ class PrefillAdder:
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
-    def floor_chunked_tokens(self, trunc_len: int, remaining: int) -> int:
-        """Round a *truncated* chunk down to the mamba kernel chunk grid.
+    def floor_chunked_tokens(
+        self, trunc_len: int, remaining: int, prefix_len: int = 0
+    ) -> int:
+        """Round a *truncated* chunk down so it ends on the mamba checkpoint grid.
 
-        The chunk that finishes a request may stop anywhere, so only shorten
-        when `trunc_len` really is a cut. Leave the cut alone when rounding
-        would empty it: making no progress is worse than losing a donation.
+        The grid counts from token 0, so a request whose prefix sits off it
+        still gets a cut the radix tree can name. The chunk that finishes a
+        request may stop anywhere, so only shorten when `trunc_len` really is
+        a cut. Leave the cut alone when rounding would empty it: making no
+        progress is worse than losing a donation.
         """
-        if self.mamba_chunk_grid <= 1 or trunc_len >= remaining:
+        grid = self.mamba_chunk_grid
+        if grid <= 1 or trunc_len >= remaining:
             return trunc_len
-        return trunc_len // self.mamba_chunk_grid * self.mamba_chunk_grid or trunc_len
+        aligned = (prefix_len + trunc_len) // grid * grid - prefix_len
+        return aligned if aligned > 0 else trunc_len
 
     def budget_state(self):
         no_token = (
@@ -887,13 +903,15 @@ class PrefillAdder:
         request_slot_reserve: int = 0,
         is_chunked_continuation: bool = False,
         replay_len: int = 0,
+        grid_slack: int = 0,
     ):
         """Charge one admitted request against the prefill budgets.
 
         The compute budgets (`rem_chunk_tokens`, `rem_input_tokens`,
         `rem_dllm_tokens`) take the rows the step runs: the extend, plus
-        `replay_len` cached tokens that encoder replay recomputes. The KV
-        budgets take only the page-ceiled extend. Exact-chunk-fill bills the
+        `replay_len` cached tokens that encoder replay recomputes, plus the
+        `grid_slack` a truncated cut gave up to the mamba checkpoint grid.
+        The KV budgets take only the page-ceiled extend. Exact-chunk-fill bills the
         compute budgets the raw extend instead, all alike, so none runs out
         first with rounding slack unspent.
         """
@@ -902,7 +920,7 @@ class PrefillAdder:
         rounded_extend_input_len = self.ceil_paged_tokens(extend_input_len)
         compute_charge = (
             raw_extend_input_len if self.exact_chunk_fill else rounded_extend_input_len
-        ) + replay_len
+        ) + replay_len + grid_slack
         if is_cp_sharded_padded():
             extend_input_len = get_cp_sharded_padded_allocation_tokens(
                 raw_extend_input_len, prefix_tokens=prefix_len
@@ -1177,8 +1195,9 @@ class PrefillAdder:
         if _rem_tokens is None:
             return req
         truncated = cand_extend_input_len > _rem_tokens
+        cut_len = min(cand_extend_input_len, _rem_tokens)
         new_len = self.floor_chunked_tokens(
-            min(cand_extend_input_len, _rem_tokens), cand_extend_input_len
+            cut_len, cand_extend_input_len, prefix_len=req.prefix_len
         )
         request_slot_reserve = self._request_slot_reserve_for_req(
             req, extend_input_len=new_len
@@ -1217,6 +1236,7 @@ class PrefillAdder:
             state_slots=self._state_slots_for_req(req),
             request_slot_reserve=request_slot_reserve,
             is_chunked_continuation=True,
+            grid_slack=cut_len - new_len,
         )
 
         # Return if chunked prefill not finished
@@ -1361,6 +1381,7 @@ class PrefillAdder:
             trunc_len = self.floor_chunked_tokens(
                 self.rem_chunk_tokens, cand_extend_input_len
             )
+            grid_slack = self.rem_chunk_tokens - trunc_len
 
             if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:
                 return tile_stop
@@ -1382,6 +1403,7 @@ class PrefillAdder:
                 request_slot_reserve=self._request_slot_reserve_for_req(
                     req, extend_input_len=trunc_len
                 ),
+                grid_slack=grid_slack,
             )
 
         return self.budget_state()
@@ -1561,6 +1583,17 @@ class PrefillAdder:
                     is_chunked = admission.is_chunked and (
                         prefix_len + extend_len < len(req.full_untruncated_fill_ids)
                     )
+                    grid_slack = 0
+                    if is_chunked:
+                        # The shifted prefix moved the cut off the grid; the
+                        # approved compute budget still covers what it loses.
+                        approved = admission.extend_len + admission.grid_slack
+                        extend_len = self.floor_chunked_tokens(
+                            extend_len,
+                            len(req.full_untruncated_fill_ids) - prefix_len,
+                            prefix_len,
+                        )
+                        grid_slack = approved - extend_len
                     max_new_tokens = admission.max_new_tokens
                     if admission.is_chunked and not is_chunked:
                         max_new_tokens = min(
@@ -1572,6 +1605,7 @@ class PrefillAdder:
                         max_new_tokens,
                         is_chunked,
                         self._replay_len(req, prefix_len),
+                        grid_slack,
                     )
                 elif req.host_loaded_length < promised_host_hit:
                     # No FULL was loaded; recomputation may no longer fit.
@@ -1655,6 +1689,7 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         is_chunked = False
+        grid_slack = 0
         max_new_tokens = min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
         tile_tokens = input_tokens
         if self.dllm_config is not None:
@@ -1693,6 +1728,11 @@ class PrefillAdder:
                 extend_len = end - prefix_len
             if extend_len <= 0:
                 return AddReqResult.OTHER
+            cut_len = extend_len
+            extend_len = self.floor_chunked_tokens(
+                cut_len, len(req.full_untruncated_fill_ids) - prefix_len, prefix_len
+            )
+            grid_slack = cut_len - extend_len
             is_chunked = True
             max_new_tokens = 0
             tile_tokens = extend_len
@@ -1722,7 +1762,7 @@ class PrefillAdder:
             return verdict
 
         return _PrefillAdmission(
-            prefix_len, extend_len, max_new_tokens, is_chunked, replay_len
+            prefix_len, extend_len, max_new_tokens, is_chunked, replay_len, grid_slack
         )
 
     def _commit_prefill_admission(
@@ -1744,6 +1784,7 @@ class PrefillAdder:
                 req, extend_input_len=admission.extend_len
             ),
             replay_len=admission.replay_len,
+            grid_slack=admission.grid_slack,
         )
         self._account_prefill_cache_admission(req, admission.prefix_len)
 

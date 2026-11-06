@@ -419,6 +419,131 @@ class TestPrefillAdder(CustomTestCase):
                 self.assertEqual(adder.log_replay_tokens, min(prefix_len, 128))
                 self.assertEqual(adder.rem_chunk_tokens, 0)
 
+    def _build_dcp_mamba_grid_adder(self, *, available_tokens, tree_page=8):
+        # DCP with the mamba extra buffer: cuts land on lcm(chunk 64, tree page).
+        override = get_context().override_server_args(_mamba_cache_chunk_size=64)
+        override.install()
+        self.addCleanup(override.restore)
+        grid = patch.object(schedule_policy, "mamba_prefill_chunk_grid", return_value=64)
+        grid.start()
+        self.addCleanup(grid.stop)
+        self.mock_tree_cache.page_size = tree_page
+        self.mock_tree_cache.supports_mamba.return_value = True
+        self.mock_tree_cache.supports_prefix_sharing.return_value = True
+        self.mock_token_allocator.available_size.return_value = available_tokens
+        return self.create_adder(
+            self.create_running_batch(),
+            page_size=1,
+            rem_input_tokens=16384,
+            rem_chunk_tokens=16384,
+        )
+
+    def _create_mamba_grid_req(self, *, prefix_len, total_len, rid="mamba-grid"):
+        req = self.create_mock_req(rid, priority=0, max_new_tokens=1)
+        req.prefix_len = prefix_len
+        req.full_untruncated_fill_ids = list(range(total_len))
+        req.last_node = MagicMock()
+        return req
+
+    def test_dcp_first_mamba_chunk_ends_on_checkpoint_grid(self):
+        adder = self._build_dcp_mamba_grid_adder(available_tokens=13642)
+        req = self._create_mamba_grid_req(prefix_len=87808, total_len=337122)
+
+        with patch.object(
+            adder.memory_budget, "check_prefill", return_value=(True, 13642)
+        ):
+            adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+
+        self.assertEqual((req.prefix_len, req.extend_end), (87808, 101440))
+        self.assertIs(adder.new_chunked_req, req)
+
+    def test_dcp_continuation_ends_on_absolute_checkpoint_grid(self):
+        # The grid is lcm(64, 256) = 256 and counts from token 0, so a prefix
+        # off that grid still gets a cut the radix tree can name.
+        adder = self._build_dcp_mamba_grid_adder(available_tokens=13642, tree_page=256)
+        req = self._create_mamba_grid_req(prefix_len=87810, total_len=337122)
+
+        self.assertIs(adder.add_chunked_req(req), req)
+
+        self.assertEqual((req.prefix_len, req.extend_end), (87810, 101376))
+
+    def test_dcp_final_mamba_chunk_is_not_truncated_to_grid(self):
+        adder = self._build_dcp_mamba_grid_adder(available_tokens=10000)
+        req = self._create_mamba_grid_req(prefix_len=101440, total_len=101540)
+
+        self.assertIsNone(adder.add_chunked_req(req))
+
+        self.assertEqual((req.prefix_len, req.extend_end), (101440, 101540))
+
+    def test_dcp_short_mamba_continuation_makes_uncached_progress(self):
+        adder = self._build_dcp_mamba_grid_adder(available_tokens=8)
+        req = self._create_mamba_grid_req(prefix_len=87808, total_len=337122)
+
+        self.assertIs(adder.add_chunked_req(req), req)
+
+        self.assertEqual((req.prefix_len, req.extend_end), (87808, 87816))
+
+    def test_dcp_load_back_over_delivery_stays_on_checkpoint_grid(self):
+        adder = self._build_dcp_mamba_grid_adder(available_tokens=20000)
+        req = self._create_mamba_grid_req(prefix_len=87808, total_len=337122)
+        req.host_hit_length = 10
+        req.best_match_node = MagicMock()
+        req.needs_host_load_back.return_value = True
+        self.mock_tree_cache.init_load_back.return_value = (20, req.last_node)
+
+        with patch.object(
+            adder.memory_budget, "check_prefill", return_value=(True, 13642)
+        ):
+            adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+
+        self.assertEqual((req.prefix_len, req.extend_end), (87828, 101440))
+
+    def test_dcp_grid_slack_does_not_admit_another_unfinished_request(self):
+        """Rounding a cut onto the grid must not start a second unfinished prefill."""
+        for continuing in (False, True):
+            with self.subTest(continuing=continuing):
+                adder = self._build_dcp_mamba_grid_adder(
+                    available_tokens=1_000_000, tree_page=256
+                )
+                adder.rem_input_tokens = adder.rem_chunk_tokens = 16584
+                reqs = [
+                    self._create_mamba_grid_req(
+                        prefix_len=prefix, total_len=50000, rid=f"slack-{prefix}"
+                    )
+                    for prefix in (0, 100, 212)
+                ]
+                if continuing:
+                    self.assertIs(adder.add_chunked_req(reqs[0]), reqs[0])
+                for req in reqs[int(continuing) :]:
+                    verdict = adder.add_one_req(
+                        req, has_chunked_req=continuing, truncation_align_size=None
+                    )
+                    if verdict != AddReqResult.CONTINUE:
+                        break
+
+                self.assertEqual(adder.can_run_list, reqs[:1])
+                self.assertEqual(reqs[0].extend_end, 16384)
+                self.assertEqual(adder.rem_chunk_tokens, 0)
+                self.assertEqual(adder.log_input_tokens, 16384)
+
+    def test_non_dcp_mamba_continuation_keeps_memory_chunk_limit(self):
+        # Without DCP the prefix-relative snapshot donates (#40907); keep the cut.
+        self.mock_tree_cache.page_size = 8
+        self.mock_tree_cache.supports_mamba.return_value = True
+        self.mock_tree_cache.supports_prefix_sharing.return_value = True
+        self.mock_token_allocator.available_size.return_value = 13642
+        adder = self.create_adder(
+            self.create_running_batch(),
+            page_size=1,
+            rem_input_tokens=16384,
+            rem_chunk_tokens=16384,
+        )
+        req = self._create_mamba_grid_req(prefix_len=87808, total_len=337122)
+
+        self.assertIs(adder.add_chunked_req(req), req)
+
+        self.assertEqual((req.prefix_len, req.extend_end), (87808, 101450))
+
     def test_shared_admission_reserves_all_pending_requests(self):
         adder = self.create_shared_adder()
         first, second = (
