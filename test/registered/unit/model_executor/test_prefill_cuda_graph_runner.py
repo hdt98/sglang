@@ -726,6 +726,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         # Prefix hits in BCG/TC-piecewise and ordinary non-MLA FullCG use the
         # normal graph topology and must retain their existing eligibility.
         runner._capture_chunked_prefix = False
+        runner._capture_bcg_prefix = False
         for is_full_backend in (False, True):
             with self.subTest(is_full_backend=is_full_backend):
                 runner._is_full_backend = is_full_backend
@@ -750,6 +751,22 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         )
         forward_batch.extend_prefix_lens_cpu = [9, 1]
         self.assertFalse(runner.can_run_graph(forward_batch))
+
+    def test_bcg_prefix_hit_selects_prefix_graph_variant(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner._capture_chunked_prefix = False
+        runner._capture_bcg_prefix = True
+        forward_batch = SimpleNamespace(
+            extend_prefix_lens_cpu=[8],
+            dp_prefill_cuda_graph_max_prefix_len=0,
+        )
+
+        self.assertEqual(
+            runner._shape_key(4, forward_batch).variant_label,
+            "prefix_bcg",
+        )
+        forward_batch.extend_prefix_lens_cpu = [0]
+        self.assertIsNone(runner._shape_key(4, forward_batch).variant_label)
 
 
 class TestPrefillCudaGraphRunnerLayerLoads(CustomTestCase):

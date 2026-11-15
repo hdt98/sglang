@@ -208,6 +208,10 @@ def _chunked_prefix_variant(num_chunks: int) -> str:
     return f"chunked_prefix:{num_chunks}"
 
 
+def _bcg_prefix_variant() -> str:
+    return "prefix_bcg"
+
+
 def _ceil_div(a: int, b: int) -> int:
     return -(-a // b)
 
@@ -612,6 +616,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._prefix_capture_variants: tuple[int, ...] = ()
         self._prefix_capture_batches: Dict[ShapeKey, ForwardBatch] = {}
         self._prefix_capture_buffers: Optional[_ChunkedPrefixCaptureBuffers] = None
+        self._capture_bcg_prefix = (
+            isinstance(self.backend, BreakableCudaGraphBackend)
+            and self.has_mha_companion_layers
+            and self.prefix_bcg_capture_safe
+        )
         if self._capture_chunked_prefix:
             attn_backend = model_runner.attn_backend
             assert attn_backend.supports_full_cuda_graph_chunked_prefix, (
@@ -1165,21 +1174,23 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def _shape_key(self, num_tokens: int, forward_batch: ForwardBatch) -> ShapeKey:
         variant = None
+        prefix_lens = forward_batch.extend_prefix_lens_cpu
+        local_max_prefix_len = (
+            max(prefix_lens, default=0) if prefix_lens is not None else 0
+        )
+        max_prefix_len = max(
+            local_max_prefix_len,
+            forward_batch.dp_prefill_cuda_graph_max_prefix_len,
+        )
         if self._capture_chunked_prefix:
-            prefix_lens = forward_batch.extend_prefix_lens_cpu
-            local_max_prefix_len = (
-                max(prefix_lens, default=0) if prefix_lens is not None else 0
-            )
-            max_prefix_len = max(
-                local_max_prefix_len,
-                forward_batch.dp_prefill_cuda_graph_max_prefix_len,
-            )
             if max_prefix_len > 0:
                 captured_n = self._select_prefix_capture_chunks(max_prefix_len)
                 assert captured_n is not None, (
                     "prefix batch has no captured FullCG variant"
                 )
                 variant = _chunked_prefix_variant(captured_n)
+        elif getattr(self, "_capture_bcg_prefix", False) and max_prefix_len > 0:
+            variant = _bcg_prefix_variant()
         return ShapeKey(size=num_tokens, variant_label=variant)
 
     def _create_chunked_prefix_buffers(self) -> _ChunkedPrefixCaptureBuffers:
@@ -1495,7 +1506,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             and not is_cuda()
             and prefix_lens is not None
             and any(prefix_lens)
-            and not self.prefix_bcg_capture_safe
+            and not (
+                self.prefix_bcg_capture_safe
+                and getattr(self, "_capture_bcg_prefix", False)
+            )
             and not self._attn_backend_is_dsa
         ):
             return False
@@ -1850,8 +1864,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         num_tokens,
                         prefix_num_chunks=captured_n,
                     )
+            elif self._capture_bcg_prefix:
+                self.capture_one_shape(num_tokens, capture_bcg_prefix=True)
 
-    def capture_one_shape(self, size: int, *, prefix_num_chunks: int = 0) -> None:
+    def capture_one_shape(
+        self,
+        size: int,
+        *,
+        prefix_num_chunks: int = 0,
+        capture_bcg_prefix: bool = False,
+    ) -> None:
         """Per-shape capture: build dummy ForwardBatch + run_once,
         delegate to backend. size is the prefill token count.
         """
@@ -1884,6 +1906,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             variant_label=(
                 _chunked_prefix_variant(prefix_num_chunks)
                 if prefix_num_chunks
+                else _bcg_prefix_variant()
+                if capture_bcg_prefix
                 else None
             ),
         )
@@ -1902,6 +1926,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # this path incompatible with the OSS FlashAttention backend.
         else:
             self._init_forward_metadata_for_capture(forward_batch, shape_key)
+        if capture_bcg_prefix:
+            forward_batch.prefix_bcg_capture = True
 
         def run_once():
             if forward_batch.lora_ids is not None:
@@ -2493,8 +2519,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             static_num_tokens = len(static_forward_batch.input_ids)
             raw_num_tokens = self.raw_num_tokens
             shape_key = self._shape_key(static_num_tokens, forward_batch)
-            # The only variants this runner records are chunked-prefix ones.
-            if shape_key.variant_label is not None:
+            # FullCG chunked-prefix replay needs fixed-capacity prefix buffers.
+            # BCG keeps that work in its eager attention break instead.
+            if (
+                shape_key.variant_label is not None
+                and shape_key.variant_label != _bcg_prefix_variant()
+            ):
                 self._prepare_chunked_prefix_replay(shape_key, forward_batch)
             # Publish after replay prep, including the chunked-prefix gather
             # above, which also reads the shared tables.

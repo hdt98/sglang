@@ -162,6 +162,29 @@ class TestKimiK3PrefixBcgReplay(CustomTestCase):
 
         self.assertEqual(method, AttnForwardMethod.MHA)
 
+    def test_dcp1_aiter_bcg_prefix_capture_routes_chunked_mha(self):
+        with (
+            mock.patch.object(kimi_k3, "_is_hip", True),
+            envs.SGLANG_ENABLE_K3_PREFIX_BCG_REPLAY.override(True),
+        ):
+            attention = _attention(dcp_size=1)
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_decode=lambda: False),
+            extend_prefix_lens_cpu=[0],
+            prefix_bcg_capture=True,
+        )
+
+        with (
+            mock.patch.object(abh, "_is_hip", True),
+            mock.patch.object(
+                abh, "is_in_tc_piecewise_cuda_graph", return_value=False
+            ),
+            mock.patch.object(abh, "is_in_breakable_cuda_graph", return_value=True),
+        ):
+            method = abh.handle_attention_aiter(attention, batch)
+
+        self.assertEqual(method, AttnForwardMethod.MHA_CHUNKED_KV)
+
     def test_default_aiter_bcg_stays_on_normal_mha(self):
         batch = SimpleNamespace(forward_mode=SimpleNamespace(is_decode=lambda: False))
         attention = SimpleNamespace(prefix_bcg_capture_safe=False)

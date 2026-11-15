@@ -68,6 +68,7 @@ class TestDispatchMLASubtype(CustomTestCase):
 class TestAiterBreakableDispatch(CustomTestCase):
     def test_k3_capture_safe_route_uses_chunked_mha(self):
         batch = _fake_forward_batch(is_decode=False)
+        batch.extend_prefix_lens_cpu = [1]
         attn = SimpleNamespace(prefix_bcg_capture_safe=True)
 
         with (

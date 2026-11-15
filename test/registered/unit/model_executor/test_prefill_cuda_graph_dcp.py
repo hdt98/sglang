@@ -105,6 +105,7 @@ class TestDcpMhaCompanionAdmission(CustomTestCase):
         runner.prefix_bcg_capture_safe = prefix_bcg_capture_safe
         runner._is_full_backend = False
         runner._capture_chunked_prefix = False
+        runner._capture_bcg_prefix = prefix_bcg_capture_safe
         runner.use_captured_attn_metadata = False
         runner._dcp_extend_active = True
         runner.model_runner = SimpleNamespace(attn_backend=object())

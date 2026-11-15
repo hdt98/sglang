@@ -90,9 +90,10 @@ def handle_attention_ascend(attn, forward_batch):
 
 
 def _get_sum_extend_prefix_lens(forward_batch):
+    extend_prefix_lens_cpu = getattr(forward_batch, "extend_prefix_lens_cpu", None)
     return (
-        sum(forward_batch.extend_prefix_lens_cpu)
-        if forward_batch.extend_prefix_lens_cpu is not None
+        sum(extend_prefix_lens_cpu)
+        if extend_prefix_lens_cpu is not None
         else 0
     )
 
@@ -189,7 +190,8 @@ def handle_attention_aiter(attn, forward_batch):
         # K3 opts into the capture-safe chunked-MHA companion. Its prefix
         # gather/projection/attention/LSE merge run in one eager break.
         if getattr(attn, "prefix_bcg_capture_safe", False) and (
-            _get_sum_extend_prefix_lens(forward_batch) > 0
+            getattr(forward_batch, "prefix_bcg_capture", False)
+            or _get_sum_extend_prefix_lens(forward_batch) > 0
         ):
             return AttnForwardMethod.MHA_CHUNKED_KV
         return AttnForwardMethod.MHA
