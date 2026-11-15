@@ -188,7 +188,9 @@ def handle_attention_aiter(attn, forward_batch):
     if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         # K3 opts into the capture-safe chunked-MHA companion. Its prefix
         # gather/projection/attention/LSE merge run in one eager break.
-        if getattr(attn, "prefix_bcg_capture_safe", False):
+        if getattr(attn, "prefix_bcg_capture_safe", False) and (
+            _get_sum_extend_prefix_lens(forward_batch) > 0
+        ):
             return AttnForwardMethod.MHA_CHUNKED_KV
         return AttnForwardMethod.MHA
     if forward_batch.forward_mode.is_extend_without_speculative():
