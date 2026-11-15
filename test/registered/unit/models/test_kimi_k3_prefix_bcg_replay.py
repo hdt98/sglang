@@ -169,6 +169,53 @@ class TestPrefixBcgBreakBoundary(CustomTestCase):
         layer._chunked_prefix_attn_mha = chunked_prefix_attn_mha
         return layer
 
+    def test_no_capture_warmup_matches_captured_output_layout(self):
+        layer = self._layer()
+        fresh_tokens, heads, v_head_dim = 2, 3, 4
+        q = torch.randn(fresh_tokens, heads, v_head_dim + 2)
+        k = torch.randn(fresh_tokens, heads, v_head_dim + 2)
+        v = torch.randn(fresh_tokens, heads, v_head_dim)
+        capture_batch = SimpleNamespace(token=7, extend_prefix_lens_cpu=[30])
+        live_batch = SimpleNamespace(token=11, extend_prefix_lens_cpu=[30])
+        capture_batch.num_prefix_chunks = 0
+        live_batch.num_prefix_chunks = 0
+        capture_batch.mha_return_lse = False
+        live_batch.mha_return_lse = False
+        capture_batch.attn_attend_prefix_cache = None
+        live_batch.attn_attend_prefix_cache = None
+        capture_batch.set_attn_attend_prefix_cache = (
+            lambda value: setattr(capture_batch, "attn_attend_prefix_cache", value)
+        )
+        live_batch.set_attn_attend_prefix_cache = (
+            lambda value: setattr(live_batch, "attn_attend_prefix_cache", value)
+        )
+
+        with (
+            mock.patch.object(fm, "get_attn_backend", return_value=layer.backend),
+            mock.patch.object(
+                fm,
+                "get_parallel",
+                return_value=SimpleNamespace(dcp_enabled=False),
+            ),
+        ):
+            with set_forward_batch(live_batch):
+                eager_output = layer._bcg_mha_prefix_attention(q, k, v, live_batch)
+
+            with (
+                set_forward_batch(capture_batch),
+                _RecordingCapture() as capture,
+            ):
+                captured_output = layer._bcg_mha_prefix_attention(
+                    q, k, v, capture_batch
+                )
+
+            with set_forward_batch(live_batch):
+                capture.graph._break_fns[0]()
+
+        self.assertEqual(eager_output.shape, captured_output.shape)
+        self.assertEqual(eager_output.dtype, captured_output.dtype)
+        torch.testing.assert_close(eager_output, captured_output)
+
     def test_capture_allocates_only_fresh_output_and_replay_reads_live_batch(self):
         layer = self._layer()
         fresh_tokens, heads, v_head_dim = 2, 3, 4

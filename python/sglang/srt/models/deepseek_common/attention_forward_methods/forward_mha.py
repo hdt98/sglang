@@ -447,7 +447,8 @@ class DeepseekMHAForwardMixin:
         """Run all prefix-dependent MHA work in one BCG eager break."""
         live_batch = get_forward_batch()
         result = self._mha_prefix_attention(q, k, v, live_batch)
-        assert out is not None
+        if out is None:
+            out = _bcg_mha_prefix_output(self, q, k, v, forward_batch)
         out.copy_(result)
         return out
 
