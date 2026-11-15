@@ -2591,6 +2591,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             and self.dcp_size == 1
             and envs.SGLANG_ENABLE_K3_PREFIX_BCG_REPLAY.get()
         )
+        self.attn_mqa.prefix_bcg_capture_safe = self.prefix_bcg_capture_safe
         if split_gguf_kv_b:
             del self.fused_qkv_a_proj_with_mqa
             del self.kv_b_proj

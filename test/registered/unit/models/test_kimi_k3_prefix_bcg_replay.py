@@ -48,6 +48,7 @@ def _attention(*, dcp_size: int = 1):
     def fake_base_init(self, *args, **kwargs):
         torch.nn.Module.__init__(self)
         self.dcp_size = dcp_size
+        self.attn_mqa = SimpleNamespace(prefix_bcg_capture_safe=False)
         self.o_proj = torch.nn.Identity()
         self.all_reduce_fusion = False
         self.use_output_gate = False
@@ -86,6 +87,15 @@ class TestKimiK3PrefixBcgReplay(CustomTestCase):
 
         self.assertEqual(attention.dcp_size, 1)
         self.assertTrue(attention.prefix_bcg_capture_safe)
+
+    def test_dcp1_propagates_capture_safe_to_primary_radix(self):
+        with (
+            mock.patch.object(kimi_k3, "_is_hip", True),
+            envs.SGLANG_ENABLE_K3_PREFIX_BCG_REPLAY.override(True),
+        ):
+            attention = _attention(dcp_size=1)
+
+        self.assertTrue(attention.attn_mqa.prefix_bcg_capture_safe)
 
     def test_route_is_off_by_default(self):
         with (
