@@ -103,12 +103,16 @@ def use_fused_prefix_extend(backend, forward_batch: ForwardBatch) -> bool:
 def _bcg_mha_prefix_output(
     instance, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, forward_batch
 ):
-    """Allocate the fixed fresh-token output before a BCG attention break."""
+    """Allocate the fixed fresh-token output before a BCG attention break.
+
+    Backends return either [tokens, heads, v_head_dim] or the flattened
+    [tokens, heads * v_head_dim]; the break copies into this flat buffer.
+    """
     dtype = v.dtype if v is not None else q.dtype
     if dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
         dtype = torch.bfloat16
     return torch.empty(
-        (q.shape[0], q.shape[1], v.shape[-1]),
+        (q.shape[0], q.shape[1] * v.shape[-1]),
         dtype=dtype,
         device=q.device,
     )
@@ -449,7 +453,7 @@ class DeepseekMHAForwardMixin:
         result = self._mha_prefix_attention(q, k, v, live_batch)
         if out is None:
             out = _bcg_mha_prefix_output(self, q, k, v, forward_batch)
-        out.copy_(result)
+        out.copy_(result.reshape(out.shape))
         return out
 
     def forward_normal_one_shot_prepare(

@@ -155,7 +155,8 @@ class TestPrefixBcgBreakBoundary(CustomTestCase):
         )
         layer.fresh_output = torch.randn(2, 3, 4)
         layer.fresh_lse = torch.randn(2, 3)
-        layer.merged_output = torch.randn(2, 3, 4)
+        # AITER's chunked-prefix path returns [tokens, heads * v_head_dim].
+        layer.merged_output = torch.randn(2, 3 * 4)
 
         def attn_mha(q, k, v, forward_batch, save_kv_cache=False, **kwargs):
             return layer.fresh_output, layer.fresh_lse
@@ -251,7 +252,7 @@ class TestPrefixBcgBreakBoundary(CustomTestCase):
             output = layer._bcg_mha_prefix_attention(q, k, v, capture_batch)
 
         self.assertEqual(capture.events, ["end", "begin"])
-        self.assertEqual(output.shape, (fresh_tokens, heads, v_head_dim))
+        self.assertEqual(output.shape, (fresh_tokens, heads * v_head_dim))
         self.assertEqual(output.numel(), fresh_tokens * heads * v_head_dim)
         with (
             set_forward_batch(live_batch),
