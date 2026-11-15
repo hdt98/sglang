@@ -2588,8 +2588,8 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         )
         self.mla_pinned_under_bcg = (
             _is_hip
-            and self.dcp_size > 1
-            and envs.SGLANG_ENABLE_K3_DCP_PREFIX_BCG_REPLAY.get()
+            and self.dcp_size == 1
+            and envs.SGLANG_ENABLE_K3_PREFIX_BCG_REPLAY.get()
         )
         if split_gguf_kv_b:
             del self.fused_qkv_a_proj_with_mqa

@@ -186,9 +186,10 @@ def handle_attention_aiter(attn, forward_batch):
     # kernels; route through the MHA path (radix_attention swaps attn_mqa for
     # its attn_mha companion) so capture/replay use valid head/dim metadata.
     if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
-        # K3 DCP opts into absorbed MLA for the entire capture/replay so a
-        # prefix uses the live DCP metadata gather; switching only on the
-        # prefix replay would replay a graph captured through MHA.
+        # K3 opts into absorbed MLA for the entire capture/replay so a prefix
+        # uses the live metadata rebuilt before each eager attention break;
+        # switching only on the prefix replay would replay a graph captured
+        # through MHA.
         if getattr(attn, "mla_pinned_under_bcg", False):
             return AttnForwardMethod.MLA
         return AttnForwardMethod.MHA
