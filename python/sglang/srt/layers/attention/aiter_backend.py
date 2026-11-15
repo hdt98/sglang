@@ -4655,12 +4655,7 @@ class AiterAttnBackend(AttentionBackend):
                         softmax_scale=layer.scaling,
                         causal=True,
                     )
-                # Absorbed MLA (head dim kv_lora_rank + rope, 576 on K3) is
-                # past CK flash_attn's 256 limit, so it always takes
-                # mla_prefill_fwd below. Only a BCG-pinned layer reaches here
-                # without a prefix.
-                absorbed = layer.qk_head_dim == kv_lora_rank + qk_rope_head_dim
-                if not absorbed and (kv_indices.shape[0] == 0 or extend_no_prefix):
+                if kv_indices.shape[0] == 0 or extend_no_prefix:
                     if self.use_fp8_prefill_attn:
                         output = self.mla_fp8_prefill_attn(
                             q,

@@ -66,9 +66,9 @@ class TestDispatchMLASubtype(CustomTestCase):
 
 
 class TestAiterBreakableDispatch(CustomTestCase):
-    def test_k3_dcp_pin_uses_absorbed_mla_for_capture_and_replay(self):
+    def test_k3_capture_safe_route_uses_chunked_mha(self):
         batch = _fake_forward_batch(is_decode=False)
-        attn = SimpleNamespace(mla_pinned_under_bcg=True)
+        attn = SimpleNamespace(prefix_bcg_capture_safe=True)
 
         with (
             mock.patch.object(abh, "_is_hip", True),
@@ -76,15 +76,15 @@ class TestAiterBreakableDispatch(CustomTestCase):
             mock.patch.object(abh, "is_in_breakable_cuda_graph", return_value=True),
         ):
             method = abh.handle_attention_aiter(attn, batch)
-            self.assertEqual(method, AttnForwardMethod.MLA)
+            self.assertEqual(method, AttnForwardMethod.MHA_CHUNKED_KV)
             self.assertEqual(
                 abh.resolve_rocm_forward_method(method),
-                AttnForwardMethod.MLA_ROCM,
+                AttnForwardMethod.MHA_CHUNKED_KV_ROCM,
             )
 
     def test_default_aiter_bcg_stays_on_mha_companion(self):
         batch = _fake_forward_batch(is_decode=False)
-        attn = SimpleNamespace(mla_pinned_under_bcg=False)
+        attn = SimpleNamespace(prefix_bcg_capture_safe=False)
 
         with (
             mock.patch.object(abh, "_is_hip", True),

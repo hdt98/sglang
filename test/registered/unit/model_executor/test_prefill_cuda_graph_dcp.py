@@ -90,7 +90,7 @@ class TestDcpAdmission(CustomTestCase):
 
 
 class TestDcpMhaCompanionAdmission(CustomTestCase):
-    def _runner(self, *, mla_pinned_under_bcg: bool):
+    def _runner(self, *, prefix_bcg_capture_safe: bool):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._capture_req_slots = 4
         runner.enable_lora = False
@@ -102,7 +102,7 @@ class TestDcpMhaCompanionAdmission(CustomTestCase):
         runner.backend = SimpleNamespace()
         runner.prefill_backend_name = Backend.BREAKABLE
         runner.has_mha_companion_layers = True
-        runner.mla_pinned_under_bcg = mla_pinned_under_bcg
+        runner.prefix_bcg_capture_safe = prefix_bcg_capture_safe
         runner._is_full_backend = False
         runner._capture_chunked_prefix = False
         runner.use_captured_attn_metadata = False
@@ -110,27 +110,27 @@ class TestDcpMhaCompanionAdmission(CustomTestCase):
         runner.model_runner = SimpleNamespace(attn_backend=object())
         return runner
 
-    def test_prefix_replay_follows_absorbed_mla_pin(self):
+    def test_prefix_replay_follows_capture_safe_mha_route(self):
         prefix_hit = _batch(8, [4])
         with patch(
             "sglang.srt.model_executor.runner.prefill_cuda_graph_runner.is_cuda",
             return_value=False,
         ):
             self.assertFalse(
-                self._runner(mla_pinned_under_bcg=False).can_run_graph(prefix_hit)
+                self._runner(prefix_bcg_capture_safe=False).can_run_graph(prefix_hit)
             )
             self.assertTrue(
-                self._runner(mla_pinned_under_bcg=True).can_run_graph(prefix_hit)
+                self._runner(prefix_bcg_capture_safe=True).can_run_graph(prefix_hit)
             )
 
-    def test_fresh_extend_stays_replayable_without_pin(self):
+    def test_fresh_extend_stays_replayable_without_route(self):
         fresh_batch = _batch(8, [0])
         with patch(
             "sglang.srt.model_executor.runner.prefill_cuda_graph_runner.is_cuda",
             return_value=False,
         ):
             self.assertTrue(
-                self._runner(mla_pinned_under_bcg=False).can_run_graph(fresh_batch)
+                self._runner(prefix_bcg_capture_safe=False).can_run_graph(fresh_batch)
             )
 
 

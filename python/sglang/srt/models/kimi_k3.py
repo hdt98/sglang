@@ -2586,7 +2586,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             reduce_results=False,
             alt_stream=alt_stream,
         )
-        self.mla_pinned_under_bcg = (
+        self.prefix_bcg_capture_safe = (
             _is_hip
             and self.dcp_size == 1
             and envs.SGLANG_ENABLE_K3_PREFIX_BCG_REPLAY.get()

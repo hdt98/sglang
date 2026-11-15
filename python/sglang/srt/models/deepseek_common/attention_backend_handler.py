@@ -186,12 +186,10 @@ def handle_attention_aiter(attn, forward_batch):
     # kernels; route through the MHA path (radix_attention swaps attn_mqa for
     # its attn_mha companion) so capture/replay use valid head/dim metadata.
     if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
-        # K3 opts into absorbed MLA for the entire capture/replay so a prefix
-        # uses the live metadata rebuilt before each eager attention break;
-        # switching only on the prefix replay would replay a graph captured
-        # through MHA.
-        if getattr(attn, "mla_pinned_under_bcg", False):
-            return AttnForwardMethod.MLA
+        # K3 opts into the capture-safe chunked-MHA companion. Its prefix
+        # gather/projection/attention/LSE merge run in one eager break.
+        if getattr(attn, "prefix_bcg_capture_safe", False):
+            return AttnForwardMethod.MHA_CHUNKED_KV
         return AttnForwardMethod.MHA
     if forward_batch.forward_mode.is_extend_without_speculative():
         if not _support_mha_one_shot(attn, forward_batch, "aiter"):

@@ -22,6 +22,9 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.model_executor.forward_context import (
     get_kv_layers,
     get_token_to_kv_pool,
@@ -216,9 +219,14 @@ class DeepseekMHARocmForwardMixin:
         q[..., self.qk_nope_head_dim :] = q_pe
 
         self._set_mla_kv_buffer_rocm(latent_cache, kv_a, k_pe, forward_batch)
+        fresh_prepare_only = (
+            is_in_breakable_cuda_graph()
+            and getattr(self, "prefix_bcg_capture_safe", False)
+        )
         if (
             forward_batch.mha_one_shot
             and sum(forward_batch.extend_prefix_lens_cpu) != 0
+            and not fresh_prepare_only
         ):
             if (
                 self.use_dsa

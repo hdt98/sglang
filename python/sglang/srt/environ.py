@@ -2478,10 +2478,8 @@ class Envs:
     # TP4/TP8 GB300 and TP16 GB200/GB300 tuning; set 0/1 to override. See
     # srt/layers/communication/k3_sp_collective.py.
     SGLANG_K3_SP_COLLECTIVE = EnvBool(False)
-    # K3 prefix BCG (DCP1 only): pin absorbed MLA for prefill capture/replay
-    # so a cached prefix runs AITER mla_prefill_fwd at each eager attention
-    # break instead of the prefix-free MHA companion. Under DCP the extend
-    # path calls CK flash_attn, which rejects the 576-wide absorbed head.
+    # K3 prefix BCG (DCP1 only): capture the fresh-token MHA companion while
+    # gather/projection/prefix-attention/LSE merge run in one eager break.
     # Default off until the device gate passes.
     SGLANG_ENABLE_K3_PREFIX_BCG_REPLAY = EnvBool(False)
     # DCP MLA decode: push each peer's head partials straight into its

@@ -336,7 +336,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     _backend_vote_prefill_cuda_graph = None
     _captured_attn_metadata_max_bs: Optional[int] = None
     _dcp_extend_active = False
-    mla_pinned_under_bcg = False
+    prefix_bcg_capture_safe = False
     dllm_attention = None
 
     @property
@@ -524,8 +524,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.has_mha_companion_layers = any(
             layer is not None for layer in self.mha_companion_layers
         )
-        self.mla_pinned_under_bcg = any(
-            getattr(layer, "mla_pinned_under_bcg", False)
+        self.prefix_bcg_capture_safe = any(
+            getattr(layer, "prefix_bcg_capture_safe", False)
             for layer in self.attention_layers
         )
         self.moe_layers = self.model_runner.moe_layers
@@ -1495,7 +1495,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             and not is_cuda()
             and prefix_lens is not None
             and any(prefix_lens)
-            and not self.mla_pinned_under_bcg
+            and not self.prefix_bcg_capture_safe
             and not self._attn_backend_is_dsa
         ):
             return False
@@ -2188,7 +2188,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             isinstance(self.backend, BreakableCudaGraphBackend)
             and self.has_mha_companion_layers
             and not is_cuda()
-            and not self.mla_pinned_under_bcg
+            and not self.prefix_bcg_capture_safe
         ):
             self._restore_mha_capture_state(static_forward_batch)
 

@@ -20,12 +20,17 @@ from sglang.srt.layers.dcp import (
 from sglang.srt.layers.dcp.layout import dsa_shards_index_k
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_kv_layers,
     get_token_to_kv_pool,
 )
+from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
 from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_hip,
@@ -93,6 +98,20 @@ def use_fused_prefix_extend(backend, forward_batch: ForwardBatch) -> bool:
     return getattr(
         backend, "fuse_prefix_into_extend", False
     ) and use_packed_prefix_chunks(backend, forward_batch)
+
+
+def _bcg_mha_prefix_output(
+    instance, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, forward_batch
+):
+    """Allocate the fixed fresh-token output before a BCG attention break."""
+    dtype = v.dtype if v is not None else q.dtype
+    if dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        dtype = torch.bfloat16
+    return torch.empty(
+        (q.shape[0], q.shape[1], v.shape[-1]),
+        dtype=dtype,
+        device=q.device,
+    )
 
 
 def forward_dsa_indexer_for_mha(
@@ -349,6 +368,26 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
         gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if is_in_breakable_cuda_graph() and getattr(
+            self, "prefix_bcg_capture_safe", False
+        ):
+            attn_output = self._bcg_mha_prefix_attention(q, k, v, forward_batch)
+        else:
+            attn_output = self._mha_prefix_attention(q, k, v, forward_batch)
+
+        attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
+        if gate is not None:
+            attn_output = self._apply_gated(attn_output, gate)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    def _mha_prefix_attention(
+        self: DeepseekV2AttentionMLA,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
         has_extend_prefix = forward_batch.extend_prefix_lens_cpu is not None and any(
             forward_batch.extend_prefix_lens_cpu
         )
@@ -374,12 +413,9 @@ class DeepseekMHAForwardMixin:
 
         if fused_prefix:
             attn_output = self._fused_prefix_extend_attn_mha(q, k, v, forward_batch)
-            attn_output = attn_output.reshape(
-                -1, self.num_local_heads * self.v_head_dim
-            )
-            output, _ = self.o_proj(attn_output)
-            return output
+            return attn_output
 
+        forward_batch.mha_one_shot = False
         forward_batch.mha_return_lse = has_extend_prefix
         # Do mha for extended part without prefix
         forward_batch.set_attn_attend_prefix_cache(False)
@@ -396,11 +432,24 @@ class DeepseekMHAForwardMixin:
                 forward_batch=forward_batch,
             )
 
-        attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
-        if gate is not None:
-            attn_output = self._apply_gated(attn_output, gate)
-        output, _ = self.o_proj(attn_output)
-        return output
+        return attn_output
+
+    @eager_on_graph(True, output_factory=_bcg_mha_prefix_output, pass_output=True)
+    def _bcg_mha_prefix_attention(
+        self: DeepseekV2AttentionMLA,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run all prefix-dependent MHA work in one BCG eager break."""
+        live_batch = get_forward_batch()
+        result = self._mha_prefix_attention(q, k, v, live_batch)
+        assert out is not None
+        out.copy_(result)
+        return out
 
     def forward_normal_one_shot_prepare(
         self: DeepseekV2AttentionMLA,
