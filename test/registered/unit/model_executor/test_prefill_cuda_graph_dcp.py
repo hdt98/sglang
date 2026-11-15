@@ -10,6 +10,7 @@ so prefix hits replay too.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -23,6 +24,7 @@ from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_utils.forward_batch import set_forward_batch
 from sglang.srt.model_executor.runner_utils.prefill_graph import prefill_graph_scope
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -80,14 +82,59 @@ def _runner(dcp_active):
     return runner
 
 
-class TestDcpAdmission(unittest.TestCase):
+class TestDcpAdmission(CustomTestCase):
     def test_prefix_hits_replay_under_dcp(self):
         runner = _runner(dcp_active=True)
         self.assertTrue(runner.can_run_graph(_batch(8, [0])))
         self.assertTrue(runner.can_run_graph(_batch(8, [4])))
 
 
-class TestDcpReplayMetadata(unittest.TestCase):
+class TestDcpMhaCompanionAdmission(CustomTestCase):
+    def _runner(self, *, mla_pinned_under_bcg: bool):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner._capture_req_slots = 4
+        runner.enable_lora = False
+        runner.capture_hidden_mode = CaptureHiddenMode.NULL
+        runner.max_num_tokens = 32
+        runner.capture_num_tokens = [8]
+        runner.max_context_size = None
+        runner.max_seq_len = None
+        runner.backend = SimpleNamespace()
+        runner.prefill_backend_name = Backend.BREAKABLE
+        runner.has_mha_companion_layers = True
+        runner.mla_pinned_under_bcg = mla_pinned_under_bcg
+        runner._is_full_backend = False
+        runner._capture_chunked_prefix = False
+        runner.use_captured_attn_metadata = False
+        runner._dcp_extend_active = True
+        runner.model_runner = SimpleNamespace(attn_backend=object())
+        return runner
+
+    def test_prefix_replay_follows_absorbed_mla_pin(self):
+        prefix_hit = _batch(8, [4])
+        with patch(
+            "sglang.srt.model_executor.runner.prefill_cuda_graph_runner.is_cuda",
+            return_value=False,
+        ):
+            self.assertFalse(
+                self._runner(mla_pinned_under_bcg=False).can_run_graph(prefix_hit)
+            )
+            self.assertTrue(
+                self._runner(mla_pinned_under_bcg=True).can_run_graph(prefix_hit)
+            )
+
+    def test_fresh_extend_stays_replayable_without_pin(self):
+        fresh_batch = _batch(8, [0])
+        with patch(
+            "sglang.srt.model_executor.runner.prefill_cuda_graph_runner.is_cuda",
+            return_value=False,
+        ):
+            self.assertTrue(
+                self._runner(mla_pinned_under_bcg=False).can_run_graph(fresh_batch)
+            )
+
+
+class TestDcpReplayMetadata(CustomTestCase):
     def test_replay_uses_the_live_plan(self):
         runner = _runner(dcp_active=True)
         planned = []
@@ -120,7 +167,7 @@ class TestDcpReplayMetadata(unittest.TestCase):
         self.assertIs(static.attn_dcp_metadata, planned[0])
 
 
-class TestDcpExtendGatherBreak(unittest.TestCase):
+class TestDcpExtendGatherBreak(CustomTestCase):
     def test_gather_writes_the_forward_context_batch(self):
         from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
             bcg_dcp_extend_kv_gather,

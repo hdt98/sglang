@@ -65,6 +65,40 @@ class TestDispatchMLASubtype(CustomTestCase):
         self.assertEqual(method, AttnForwardMethod.MLA)
 
 
+class TestAiterBreakableDispatch(CustomTestCase):
+    def test_k3_dcp_pin_uses_absorbed_mla_for_capture_and_replay(self):
+        batch = _fake_forward_batch(is_decode=False)
+        attn = SimpleNamespace(mla_pinned_under_bcg=True)
+
+        with (
+            mock.patch.object(abh, "_is_hip", True),
+            mock.patch.object(abh, "is_in_tc_piecewise_cuda_graph", return_value=False),
+            mock.patch.object(abh, "is_in_breakable_cuda_graph", return_value=True),
+        ):
+            method = abh.handle_attention_aiter(attn, batch)
+            self.assertEqual(method, AttnForwardMethod.MLA)
+            self.assertEqual(
+                abh.resolve_rocm_forward_method(method),
+                AttnForwardMethod.MLA_ROCM,
+            )
+
+    def test_default_aiter_bcg_stays_on_mha_companion(self):
+        batch = _fake_forward_batch(is_decode=False)
+        attn = SimpleNamespace(mla_pinned_under_bcg=False)
+
+        with (
+            mock.patch.object(abh, "_is_hip", True),
+            mock.patch.object(abh, "is_in_tc_piecewise_cuda_graph", return_value=False),
+            mock.patch.object(abh, "is_in_breakable_cuda_graph", return_value=True),
+        ):
+            method = abh.handle_attention_aiter(attn, batch)
+            self.assertEqual(method, AttnForwardMethod.MHA)
+            self.assertEqual(
+                abh.resolve_rocm_forward_method(method),
+                AttnForwardMethod.MHA_ROCM,
+            )
+
+
 class TestResolveRocmForwardMethod(CustomTestCase):
     """The generic MHA/MLA methods must never reach the CUDA forward paths on
     ROCm: those were stripped of their AMD branches when the AITER kernels moved
