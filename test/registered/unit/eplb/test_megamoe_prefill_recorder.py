@@ -105,6 +105,20 @@ class TestMegaMoEPrefillRecorder(unittest.TestCase):
         recorder._on_forward_pass_end(2, {})
         recorder._accumulator.append.assert_called_once()
 
+    def test_hook_without_current_layer_is_not_recorded(self):
+        # Breakable prefill-graph capture runs layers without with_current_layer.
+        recorder = self._make_recorder()
+        recorder._record_current_pass = True
+        recorder._current_layer_idx = Withable()
+        recorder._on_hook("on_select_experts", topk_ids=torch.tensor([[0]]))
+        recorder._single_pass_gatherers["primary"].on_select_experts.assert_not_called()
+
+        with recorder._current_layer_idx.with_value(3):
+            recorder._on_hook("on_select_experts", topk_ids=torch.tensor([[0]]))
+        recorder._single_pass_gatherers[
+            "primary"
+        ].on_select_experts.assert_called_once()
+
     def test_eplb_counter_advances_only_on_global_prefill(self):
         manager = EPLBManager.__new__(EPLBManager)
         advances = []
