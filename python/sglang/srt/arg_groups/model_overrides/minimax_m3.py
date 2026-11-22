@@ -60,7 +60,7 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
         if cfg.speculative_algorithm not in (None, "DSPARK", "DFLASH"):
             raise ValueError("M3.1 NVFP4 only supports DSPARK or DFLASH speculation")
         if get_platform().is_hip:
-            _hip.validate_nvfp4(cfg)
+            _hip.validate_nvfp4(cfg, hf_config)
         if cfg.speculative_algorithm in ("DSPARK", "DFLASH"):
             algorithm = cfg.speculative_algorithm
             if not (get_platform().is_blackwell or get_platform().is_hip):
