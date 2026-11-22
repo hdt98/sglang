@@ -325,10 +325,13 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             self._recording or torch.get_device_module().is_current_stream_capturing()
         ):
             return
-        # Breakable prefill-graph capture runs layers without with_current_layer;
-        # such a pass has no layer to count against and is not traffic.
         if self._current_layer_idx.value is None:
-            return
+            raise RuntimeError(
+                f"expert-distribution hook {hook_name} ran with no current layer; "
+                "the model's layer loop must wrap each layer in "
+                "with_current_layer, including under graph capture, or the "
+                "captured graph records no counts"
+            )
         gatherer = self._single_pass_gatherers[
             self._accumulator.get_single_pass_gatherer_key(
                 self._current_debug_name.value

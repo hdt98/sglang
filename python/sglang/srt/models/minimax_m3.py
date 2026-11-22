@@ -1972,10 +1972,7 @@ class MiniMaxM3Model(nn.Module):
                 # NOTE: torch dynamo does not support graph break in context manager
                 ctx = (
                     nullcontext()
-                    if (
-                        check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-                        or is_in_breakable_cuda_graph()
-                    )
+                    if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
                     else get_global_expert_distribution_recorder().with_current_layer(i)
                 )
                 with ctx:
