@@ -431,7 +431,7 @@ def can_use_gluon_prefill(
             q.dim() == 3
             and q.shape[-1] == HEAD_DIM
             and q.dtype in (torch.bfloat16, torch.float16)
-            and k_cache.num_heads == 1
+            and q.shape[1] % k_cache.num_heads == 0
             and _unit_or_none(q_scale)
             and _unit_or_none(k_scale)
             and _unit_or_none(v_scale)
@@ -455,6 +455,11 @@ def can_use_gluon_prefill(
         and _unit_or_none(q_scale)
         and (fp8_kv or (_unit_or_none(k_scale) and _unit_or_none(v_scale)))
     )
+
+
+def _nvfp4_head(cache: Nvfp4Cache, head: int) -> Nvfp4Cache:
+    """One KV head of a multi-head NVFP4 cache, as a one-head view of the same pool."""
+    return Nvfp4Cache(payload=cache.payload[:, head], scales=cache.scales[:, head])
 
 
 def _pair_prefill_module(q: torch.Tensor, k_cache: torch.Tensor | Nvfp4Cache):
@@ -615,7 +620,32 @@ def gluon_sparse_prefill(
     """Run Gluon sparse prefill via the SHUFFLE scratch; raises GluonPrefillUnavailableError
     when the scratch cannot hold the context. An NVFP4 cache past the cap runs consecutive
     request groups of ``q_lens_cpu`` query rows instead, raising only for one oversized
-    request. ``out_quant`` may return O quantized for the o_proj, from a single group only."""
+    request. ``out_quant`` may return O quantized for the o_proj, from a single group of a
+    one-head cache only. An NVFP4 cache with several KV heads runs the one-head path once
+    per head on its GQA query slice and returns bf16 O."""
+    if isinstance(k_cache, Nvfp4Cache) and k_cache.num_heads > 1:
+        num_kv_heads = k_cache.num_heads
+        group = q.shape[1] // num_kv_heads
+        out = torch.empty_like(q)
+        for head in range(num_kv_heads):
+            out[:, head * group : (head + 1) * group] = gluon_sparse_prefill(
+                q=q[:, head * group : (head + 1) * group],
+                k_cache=_nvfp4_head(k_cache, head),
+                v_cache=_nvfp4_head(v_cache, head),
+                topk_idx=topk_idx[head : head + 1],
+                req_to_token=req_to_token,
+                req_pool_indices=req_pool_indices,
+                cu_seqlens=cu_seqlens,
+                seq_lens=seq_lens,
+                prefix_lens=prefix_lens,
+                seq_lens_cpu=seq_lens_cpu,
+                block_size_k=block_size_k,
+                sm_scale=sm_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                q_lens_cpu=q_lens_cpu,
+            )
+        return out
     run_group = functools.partial(
         _gluon_sparse_prefill_group,
         k_cache=k_cache,

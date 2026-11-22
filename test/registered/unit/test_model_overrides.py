@@ -3430,35 +3430,35 @@ class TestQwen3VLHopperServingOverrides(CustomTestCase):
 
 
 class TestMiniMaxM3HipNvfp4AttentionTP(CustomTestCase):
-    """M3.1 has 4 KV heads; the NVFP4 KV pool's Gluon prefill reads one per rank."""
+    """M3.1 has 4 KV heads; NVFP4 KV serves any attention TP within the --tp-size cap."""
 
-    def _validate(self, attn_dp_size: int, kv_format: str) -> None:
+    def _validate(self, tp_size: int, attn_dp_size: int, kv_format: str) -> None:
         from sglang.srt.arg_groups.model_overrides.minimax_m3_hip import (
             validate_nvfp4,
         )
 
         cfg = SimpleNamespace(
             speculative_algorithm="DSPARK",
-            tp_size=4,
+            tp_size=tp_size,
             attn_cp_size=1,
             attn_dp_size=attn_dp_size,
         )
-        hf = SimpleNamespace(text_config=SimpleNamespace(num_key_value_heads=4))
         with override_platform(is_hip=True, is_gfx95=True):
             with envs.SGLANG_MINIMAX_M3_AMD_KV_FORMAT.override(kv_format):
-                validate_nvfp4(cfg, hf)
+                validate_nvfp4(cfg)
 
-    def test_refuses_nvfp4_kv_at_attention_tp_1(self):
-        with self.assertRaisesRegex(
-            ValueError, "needs one KV head per rank, but attention TP 1 leaves 4 of 4"
-        ):
-            self._validate(attn_dp_size=4, kv_format="auto")
+    def test_accepts_nvfp4_kv_at_attention_tp_1(self):
+        self._validate(tp_size=4, attn_dp_size=4, kv_format="auto")
 
     def test_accepts_nvfp4_kv_at_attention_tp_4(self):
-        self._validate(attn_dp_size=1, kv_format="auto")
+        self._validate(tp_size=4, attn_dp_size=1, kv_format="auto")
 
     def test_accepts_fp8_kv_at_attention_tp_1(self):
-        self._validate(attn_dp_size=4, kv_format="fp8")
+        self._validate(tp_size=4, attn_dp_size=4, kv_format="fp8")
+
+    def test_still_refuses_tp_size_8(self):
+        with self.assertRaisesRegex(ValueError, "validated at --tp-size 4 or less"):
+            self._validate(tp_size=8, attn_dp_size=8, kv_format="auto")
 
 
 if __name__ == "__main__":

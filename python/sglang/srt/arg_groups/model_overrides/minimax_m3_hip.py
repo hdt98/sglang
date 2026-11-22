@@ -72,7 +72,7 @@ def uses_nvfp4_kv(
     return kv_format == "auto" and speculative_algorithm == "DSPARK"
 
 
-def validate_nvfp4(cfg: Any, hf_config: Any) -> None:
+def validate_nvfp4(cfg: Any) -> None:
     """The M3.1 NVFP4 checks of ROCm."""
     algorithm = cfg.speculative_algorithm
     if algorithm == "DFLASH" or (algorithm == "DSPARK" and not get_platform().is_gfx95):
@@ -81,21 +81,6 @@ def validate_nvfp4(cfg: Any, hf_config: Any) -> None:
     # TP8 with attention DP ran away on whitespace in 12% of GSM8K answers on MI350X
     if cfg.tp_size > 4:
         raise ValueError("M3.1 NVFP4 on ROCm is validated at --tp-size 4 or less")
-    # the NVFP4 KV pool's only prefill kernel (Gluon) reads one KV head per rank
-    if uses_nvfp4_kv("minimax_m3_nvfp4", speculative_algorithm=algorithm):
-        kv_heads = getattr(hf_config, "text_config", hf_config).num_key_value_heads
-        attn_tp = derive_attn_tp_size(
-            tp_size=cfg.tp_size,
-            attn_cp_size=cfg.attn_cp_size,
-            attn_dp_size=cfg.attn_dp_size,
-        )
-        if kv_heads // attn_tp > 1:
-            raise ValueError(
-                f"M3.1 NVFP4 KV needs one KV head per rank, but attention TP "
-                f"{attn_tp} leaves {kv_heads // attn_tp} of {kv_heads}: its prefill "
-                f"runs only on the Gluon kernel. Use an attention TP of {kv_heads}, "
-                "or serve with SGLANG_MINIMAX_M3_AMD_KV_FORMAT=fp8"
-            )
 
 
 def nvfp4_overrides(cfg: Any, overrides: dict) -> dict:
